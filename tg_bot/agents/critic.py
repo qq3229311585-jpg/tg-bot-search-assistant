@@ -3,7 +3,7 @@
 
 职责（只做这一件事）：
   输入：草稿文本 + sources
-  输出：CriticReport（pass / patch / rewrite + 问题列表）
+  输出：CriticReport（pass / patch / rewrite / unknown + 问题列表）
 
 不做的事：
   - 不重写文本（那是 Writer 的事）
@@ -150,9 +150,9 @@ def critique(
         return ""
 
     def _format_error_report(kind: str, reasoning: str) -> CriticReport:
-        log.warning(f"Critic {kind}，JSON 修复失败，转为 rewrite 而非默认 pass")
+        log.warning(f"Critic {kind}，JSON 修复失败，转为 unknown，不触发整篇重写")
         save_verifier_thinking(user_query, f"format_error({kind})", reasoning, attempt)
-        return CriticReport(verdict="rewrite", issues=[])
+        return CriticReport(verdict="unknown", issues=[])
 
     def _parse(raw: str, reasoning: str, repaired: bool = False) -> CriticReport:
         json_text = _extract_json_text(raw)
@@ -189,7 +189,7 @@ def critique(
             ))
 
         verdict = str(data.get("verdict", "pass")).lower()
-        if verdict not in ("pass", "patch", "rewrite"):
+        if verdict not in ("pass", "patch", "rewrite", "unknown"):
             verdict = "pass" if not issues else "patch"
 
         if issues:
@@ -223,5 +223,6 @@ def critique(
                     (msg2.get("reasoning_content") or "").strip(),
                 )
         except Exception as e2:
-            log.warning(f"Critic 重试也失败: {e2}，默认 pass")
-        return CriticReport(verdict="pass")
+            log.warning(f"Critic 重试也失败: {e2}，返回 unknown")
+        save_verifier_thinking(user_query, "unknown", f"critic_retry_failed: {e}", attempt)
+        return CriticReport(verdict="unknown")

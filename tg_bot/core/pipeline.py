@@ -20,6 +20,12 @@ from tg_bot.workers.facts_builder import build_minimal_facts_json
 
 log = logging.getLogger(__name__)
 
+_HIGH_RISK_RE = re.compile(
+    r"(医学|医疗|用药|药物|病|症状|诊断|治疗|法律|法规|合同|起诉|判刑|"
+    r"金融|投资|股票|基金|债券|保险|税|贷款|政策|签证|移民|合规|财报|财务)",
+    re.I,
+)
+
 
 def _trim_at_sentence_boundary(text: str, lo: int, hi: int) -> str:
     text = (text or "").strip()
@@ -70,6 +76,32 @@ def _enforce_short_length(reply: str, user_text: str, target_words: tuple[int, i
         reply = _trim_at_sentence_boundary(reply, lo, hi)
         log.info(f"✂️ 显式字数约束截断：{len(reply)} 字，目标 {lo}-{hi}")
     return reply
+
+
+def _critic_budget(user_text: str, write_req: WriteRequest, cfg: PipelineConfig) -> dict:
+    """Decide how much verification latency this request is allowed to spend."""
+    _lo, hi = write_req.target_words
+    is_single = "single_item" in (write_req.style_hints or [])
+    if is_single or hi <= 200:
+        return {
+            "level": "short",
+            "max_fix_cycles": min(cfg.max_rewrites, 1),
+            "reaudit_after_fix": False,
+            "allow_rewrite": False,
+        }
+    if _HIGH_RISK_RE.search(user_text or ""):
+        return {
+            "level": "high_risk",
+            "max_fix_cycles": min(cfg.max_rewrites, 2),
+            "reaudit_after_fix": True,
+            "allow_rewrite": True,
+        }
+    return {
+        "level": "normal",
+        "max_fix_cycles": min(cfg.max_rewrites, 1),
+        "reaudit_after_fix": True,
+        "allow_rewrite": True,
+    }
 
 
 def run_search_pipeline(
@@ -223,7 +255,15 @@ def run_search_pipeline(
     # ── Step 4: Critic + Patcher 循环（可选）──────────────────────────
     verify_status = "skip"
     if cfg.critic:
-        for attempt in range(cfg.max_rewrites + 1):
+        budget = _critic_budget(user_text, write_req, cfg)
+        log.info(
+            "🧪 Critic 预算: level=%s max_fix_cycles=%s reaudit=%s rewrite=%s",
+            budget["level"], budget["max_fix_cycles"],
+            budget["reaudit_after_fix"], budget["allow_rewrite"],
+        )
+        fix_cycles = 0
+        attempt = 0
+        while True:
             report = critique(reply, write_req.sources, user_text, attempt)
 
             if report.verdict == "pass":
@@ -231,24 +271,42 @@ def run_search_pipeline(
                 log.info(f"✅ Critic 通过（attempt={attempt}）")
                 break
 
-            if attempt >= cfg.max_rewrites:
-                # 最后一次：用 Patcher 做最小改动
-                if cfg.patcher:
-                    reply = patch(reply, report, write_req.sources, user_text)
-                    verify_status = "patched"
-                else:
-                    verify_status = "failed"
+            if report.verdict == "unknown":
+                verify_status = "unknown"
+                log.warning("⚠️ Critic 状态 unknown，保留 Writer 草稿并记录，不触发重写")
+                break
+
+            if fix_cycles >= budget["max_fix_cycles"]:
+                verify_status = f"limit_{report.verdict}"
+                log.warning(
+                    "⚠️ Critic 修正预算已用尽: level=%s verdict=%s fixes=%s",
+                    budget["level"], report.verdict, fix_cycles,
+                )
                 break
 
             if report.verdict == "patch" and cfg.patcher:
                 # 小问题：Patcher 直接改
                 reply = patch(reply, report, write_req.sources, user_text)
                 reply = _enforce_short_length(reply, user_text, write_req.target_words)
-                verify_status = f"patched_attempt_{attempt}"
-                # 改完再过一次 Critic
+                fix_cycles += 1
+                verify_status = f"patched_once" if fix_cycles == 1 else f"patched_{fix_cycles}"
+                if not budget["reaudit_after_fix"]:
+                    log.info("🧪 短回答已 patch 一次，跳过二次 Critic")
+                    break
+                attempt += 1
                 continue
 
             if report.verdict == "rewrite":
+                if not budget["allow_rewrite"]:
+                    if cfg.patcher and report.issues:
+                        reply = patch(reply, report, write_req.sources, user_text)
+                        reply = _enforce_short_length(reply, user_text, write_req.target_words)
+                        fix_cycles += 1
+                        verify_status = "patched_instead_of_rewrite"
+                    else:
+                        verify_status = "rewrite_blocked_short"
+                    log.info("🧪 短回答禁止整篇 rewrite，已走最小处理")
+                    break
                 # 大问题：Writer 重写
                 feedback = "\n".join(
                     f"[{iss.severity}] {iss.sentence[:80]} | {iss.reason}"
@@ -265,8 +323,15 @@ def run_search_pipeline(
                 reply, reasoning = write(write_req)
                 meta["write_reasoning"] = reasoning or meta.get("write_reasoning", "")
                 reply = _enforce_short_length(reply, user_text, write_req.target_words)
-                verify_status = f"rewrite_attempt_{attempt}"
+                fix_cycles += 1
+                verify_status = f"rewrite_once" if fix_cycles == 1 else f"rewrite_{fix_cycles}"
+                if not budget["reaudit_after_fix"]:
+                    break
+                attempt += 1
                 continue
+
+            verify_status = f"unhandled_{report.verdict}"
+            break
 
     reply = _enforce_short_length(reply, user_text, write_req.target_words)
 

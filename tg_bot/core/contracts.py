@@ -73,11 +73,12 @@ class Issue:
 
 @dataclass
 class CriticReport:
-    verdict: Literal["pass", "patch", "rewrite"]
+    verdict: Literal["pass", "patch", "rewrite", "unknown"]
     issues: list[Issue] = field(default_factory=list)
     # pass: 无问题，直接发送
     # patch: 有 SOFT/HARD 问题，交 Patcher 做最小改动
     # rewrite: 问题太多，交 Writer 重写
+    # unknown: 审核模型/JSON 格式失败，记录但不强制重写
 
 
 # ── 补丁指令（Critic → Patcher）────────────────────────────────────────────
@@ -98,7 +99,7 @@ class PipelineConfig:
     critic: bool = True         # False = Writer 出稿直接发
     patcher: bool = True        # False = Critic REJECT → 重新跑 Writer
     cache: bool = True          # False = 不用今日索引缓存
-    max_rewrites: int = 3       # Writer 最大重写次数
+    max_rewrites: int = 2       # 审核修正轮次上限；pipeline 会按风险进一步收紧
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -111,5 +112,5 @@ class PipelineConfig:
             critic=_bool("PIPELINE_CRITIC"),
             patcher=_bool("PIPELINE_PATCHER"),
             cache=_bool("PIPELINE_CACHE"),
-            max_rewrites=int(os.environ.get("PIPELINE_MAX_REWRITES", "3")),
+            max_rewrites=int(os.environ.get("PIPELINE_MAX_REWRITES", "2")),
         )

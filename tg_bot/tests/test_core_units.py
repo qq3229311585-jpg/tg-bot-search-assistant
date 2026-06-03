@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import unittest
 
-from tg_bot.core.pipeline import _enforce_short_length
+from tg_bot.core.pipeline import _critic_budget, _enforce_short_length
 from tg_bot.lanes.router import decide_lane
 from tg_bot.search_policy import decide_search_policy
 from tg_bot.workers.source_utils import (
@@ -21,7 +21,7 @@ from tg_bot.workers.gather_tools import (
 from tg_bot.workers.display import clean_reply_for_user
 from tg_bot.workers.facts_builder import build_minimal_facts_json
 from tg_bot.agents.curator import curate
-from tg_bot.core.contracts import Source
+from tg_bot.core.contracts import PipelineConfig, Source, WriteRequest
 import tg_bot.workers.gather_executor as gather_executor
 from tg_bot.workers.gather_executor import GatherExecContext, execute_gather_tool
 from tg_bot.workers.gather_fallback import finalize_round_limit, parse_gather_completion
@@ -122,6 +122,27 @@ class LengthGuardTests(unittest.TestCase):
     def test_long_length_guard_does_not_touch_long_targets(self):
         text = "这是正常长文。"
         self.assertEqual(_enforce_short_length(text, "详细介绍", (600, 1200)), text)
+
+    def test_critic_budget_short_single_item(self):
+        req = WriteRequest("搜一个冷知识", [], (80, 200), style_hints=["single_item"])
+        b = _critic_budget("搜一个冷知识", req, PipelineConfig(max_rewrites=2))
+        self.assertEqual(b["level"], "short")
+        self.assertFalse(b["reaudit_after_fix"])
+        self.assertFalse(b["allow_rewrite"])
+        self.assertEqual(b["max_fix_cycles"], 1)
+
+    def test_critic_budget_normal_one_fix_cycle(self):
+        req = WriteRequest("讲讲苏格兰独角兽", [], (500, 1200))
+        b = _critic_budget("讲讲苏格兰独角兽", req, PipelineConfig(max_rewrites=2))
+        self.assertEqual(b["level"], "normal")
+        self.assertTrue(b["reaudit_after_fix"])
+        self.assertEqual(b["max_fix_cycles"], 1)
+
+    def test_critic_budget_high_risk_two_fix_cycles(self):
+        req = WriteRequest("这个药物治疗方案可靠吗", [], (500, 1200))
+        b = _critic_budget("这个药物治疗方案可靠吗", req, PipelineConfig(max_rewrites=3))
+        self.assertEqual(b["level"], "high_risk")
+        self.assertEqual(b["max_fix_cycles"], 2)
 
 
 class SourceUtilsTests(unittest.TestCase):
