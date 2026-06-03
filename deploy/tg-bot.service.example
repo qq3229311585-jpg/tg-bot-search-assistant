@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram AI Search Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/tg-bot.env
+WorkingDirectory=/opt/tg-bot-search-assistant
+ExecStart=/usr/bin/python3 /opt/tg-bot-search-assistant/scripts/tg-bot-new.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
