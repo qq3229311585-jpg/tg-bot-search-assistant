@@ -138,6 +138,8 @@ journalctl -u tg-bot -n 50 --no-pager
 
 应用默认只监听 `127.0.0.1:7799`。远程访问请使用仓库中的
 `deploy/nginx/tg-bot.conf.example` 做 HTTPS 反向代理，不要直接暴露明文端口。
+使用该代理时，将 `ASK_API_TRUST_PROXY=true` 写入 `/etc/tg-bot.env`；模板会清洗
+`X-Forwarded-For`，限流才能按真实客户端地址隔离。
 
 **兼容地址：** `POST /ask`、`POST /v1/ask`
 

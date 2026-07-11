@@ -36,6 +36,8 @@ SERVICE_VERSION = os.getenv("TG_BOT_VERSION", "1.3.0")
 _ask_lock = threading.Lock()  # pipeline remains single-flight for file safety
 _rate_lock = threading.Lock()
 _rate_state: dict[str, tuple[float, int]] = {}
+ASK_SERVER_READY = threading.Event()
+ASK_SERVER_ERROR = None
 
 ASK_API_TOKEN = CONFIG_API_TOKEN or None  # main() fills this when using a file token
 
@@ -48,8 +50,14 @@ def _load_or_create_ask_token():
         ensure_data_dir()
         with open(ASK_TOKEN_FILE, encoding="utf-8") as f:
             tok = f.read().strip()
-            if tok:
+            if tok and len(tok) >= 16:
+                try:
+                    os.chmod(ASK_TOKEN_FILE, 0o600)
+                except OSError:
+                    pass
                 return tok
+            if tok:
+                log.warning("已有 ASK_TOKEN 太短，将重新生成")
     except Exception:
         pass
     tok = hashlib.sha256(os.urandom(32)).hexdigest()
@@ -158,9 +166,9 @@ class _AskHandler(BaseHTTPRequestHandler):
                         "errors": [f"数据目录不可用：{exc}"],
                     }
             if diagnostics["ok"]:
-                self._json(200, _payload(request_id, ok=True, details=diagnostics))
+                self._json(200, _payload(request_id, ok=True, ready=True))
             else:
-                self._error(503, "not_ready", request_id, details=diagnostics)
+                self._error(503, "not_ready", request_id)
             return
         if path == "/version":
             self._json(200, _payload(request_id, ok=True, version=SERVICE_VERSION))
@@ -179,7 +187,13 @@ class _AskHandler(BaseHTTPRequestHandler):
                         "/version",
                         "/capabilities",
                     ],
-                    methods={"ask": ["POST"], "health": ["GET"]},
+                    methods={
+                        "ask": ["POST"],
+                        "health": ["GET"],
+                        "readyz": ["GET"],
+                        "version": ["GET"],
+                        "capabilities": ["GET"],
+                    },
                 ),
             )
             return
@@ -197,6 +211,14 @@ class _AskHandler(BaseHTTPRequestHandler):
         if not _authenticate(self):
             self._error(401, "invalid_token", request_id)
             return
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._error(411, "chunked_not_supported", request_id)
+            return
+        if self.headers.get("Content-Length") is None:
+            self.close_connection = True
+            self._error(411, "content_length_required", request_id)
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -210,12 +232,16 @@ class _AskHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(length).decode("utf-8")
             data = json.loads(body) if body else {}
         except Exception as exc:
-            self._error(400, "invalid_json", request_id, details=str(exc))
+            self._error(400, "invalid_json", request_id)
             return
         if not isinstance(data, dict):
             self._error(400, "invalid_json", request_id)
             return
-        query = (data.get("query") or "").strip()
+        raw_query = data.get("query")
+        if not isinstance(raw_query, str):
+            self._error(400, "invalid_query", request_id)
+            return
+        query = raw_query.strip()
         brief = bool(data.get("brief", False))
         if not query:
             self._error(400, "missing_query", request_id)
@@ -240,9 +266,13 @@ class _AskHandler(BaseHTTPRequestHandler):
 
 
 def _run_ask_server():
+    global ASK_SERVER_ERROR
     try:
         srv = HTTPServer((ASK_API_HOST, ASK_API_PORT), _AskHandler)
         log.info("🌐 HTTP API 监听 %s:%s（/ask 与 /v1/ask）", ASK_API_HOST, ASK_API_PORT)
+        ASK_SERVER_READY.set()
         srv.serve_forever()
     except Exception as e:
-        log.error("HTTP /ask 服务启动失败: %s", e)
+        ASK_SERVER_ERROR = e
+        ASK_SERVER_READY.set()
+        log.error("HTTP /ask 服务启动失败: %s", e, exc_info=True)

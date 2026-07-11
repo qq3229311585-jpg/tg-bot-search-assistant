@@ -1144,9 +1144,18 @@ def main():
     auto_cleanup()   # 启动时清理一次过期文件
 
     # 启动 HTTP /ask 接口（后台线程，供 OpenHuman 等外部系统调用）
+    _ask_server_mod.ASK_SERVER_READY.clear()
+    _ask_server_mod.ASK_SERVER_ERROR = None
     _ask_server_mod.ASK_API_TOKEN = _load_or_create_ask_token()
-    log.info(f"🔑 /ask Bearer Token: {_ask_server_mod.ASK_API_TOKEN[:8]}…{_ask_server_mod.ASK_API_TOKEN[-4:]}（完整 token 在 {ASK_TOKEN_FILE}）")
     threading.Thread(target=_run_ask_server, daemon=True, name="ask-http").start()
+    if not _ask_server_mod.ASK_SERVER_READY.wait(timeout=5):
+        raise RuntimeError("HTTP API 启动超时")
+    if _ask_server_mod.ASK_SERVER_ERROR:
+        raise RuntimeError(f"HTTP API 启动失败：{_ask_server_mod.ASK_SERVER_ERROR}")
+    if _cfg.ASK_API_TOKEN:
+        log.info("🔑 /ask 使用 ASK_API_TOKEN 环境变量")
+    else:
+        log.info("🔑 /ask token 已保存到 %s", ASK_TOKEN_FILE)
 
     _cleanup_counter = 0
     offset = _load_offset()

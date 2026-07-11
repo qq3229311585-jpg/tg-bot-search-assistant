@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -116,6 +117,13 @@ class ConfigTests(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_short_api_token_is_rejected_by_validation(self):
+        with temporary_env(**required_env(ASK_API_TOKEN="short")):
+            cfg = reload_config()
+            diagnostics = cfg.validate_config()
+            self.assertFalse(diagnostics["ok"])
+            self.assertTrue(any("ASK_API_TOKEN" in item for item in diagnostics["errors"]))
+
 
 class SearchProviderTests(unittest.TestCase):
     def test_serper_without_key_is_explicitly_unavailable(self):
@@ -126,12 +134,30 @@ class SearchProviderTests(unittest.TestCase):
             self.assertEqual(search._execute_serper("test", "general"), "Serper 未配置")
 
 
+class TokenTests(unittest.TestCase):
+    def test_existing_token_file_is_tightened_to_private_mode(self):
+        temp_dir = tempfile.mkdtemp(prefix="tg-bot-token-")
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=temp_dir, ASK_API_TOKEN=None)):
+                cfg = reload_config()
+                cfg.ensure_data_dir()
+                with open(cfg.ASK_TOKEN_FILE, "w", encoding="utf-8") as f:
+                    f.write("existing-token-value")
+                os.chmod(cfg.ASK_TOKEN_FILE, 0o644)
+                sys.modules.pop("tg_bot.ask_server", None)
+                api = importlib.import_module("tg_bot.ask_server")
+                self.assertEqual(api._load_or_create_ask_token(), "existing-token-value")
+                self.assertEqual(stat.S_IMODE(os.stat(cfg.ASK_TOKEN_FILE).st_mode), 0o600)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 class ApiServerTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp(prefix="tg-bot-api-")
         env = required_env(
             TG_BOT_DATA_DIR=self.temp_dir,
-            ASK_API_TOKEN="test-api-token",
+            ASK_API_TOKEN="test-api-token-123",
             ASK_API_RATE_LIMIT="10",
             ASK_API_RATE_WINDOW_SECONDS="60",
             ASK_API_MAX_BODY_BYTES="65536",
@@ -142,7 +168,7 @@ class ApiServerTests(unittest.TestCase):
         sys.modules.pop("tg_bot.ask_server", None)
         sys.modules.pop("tg_bot.config", None)
         self.api = importlib.import_module("tg_bot.ask_server")
-        self.api.ASK_API_TOKEN = "test-api-token"
+        self.api.ASK_API_TOKEN = "test-api-token-123"
         self.api._rate_state.clear()
         self.fake_bot = types.ModuleType("tg_bot.bot")
         self.fake_bot.handle = lambda chat_id, text, http_mode, brief: f"echo:{text}:{brief}"
@@ -176,8 +202,27 @@ class ApiServerTests(unittest.TestCase):
         conn.close()
         return response.status, json.loads(raw.decode("utf-8"))
 
+    def raw_request(self, method, path, headers):
+        sock = socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3)
+        try:
+            lines = [f"{method} {path} HTTP/1.1", "Host: 127.0.0.1", "Connection: close"]
+            lines.extend(f"{key}: {value}" for key, value in headers.items())
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+            chunks = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            sock.close()
+        raw = b"".join(chunks)
+        head, body = raw.split(b"\r\n\r\n", 1)
+        status = int(head.splitlines()[0].split()[1])
+        return status, json.loads(body.decode("utf-8"))
+
     def auth_headers(self, **extra):
-        headers = {"Authorization": "Bearer test-api-token"}
+        headers = {"Authorization": "Bearer test-api-token-123"}
         headers.update(extra)
         return headers
 
@@ -196,6 +241,13 @@ class ApiServerTests(unittest.TestCase):
             self.assertTrue(data["ok"])
         status, data = self.request("GET", "/capabilities")
         self.assertIn("/v1/ask", data["endpoints"])
+        self.assertEqual(data["methods"]["capabilities"], ["GET"])
+
+    def test_readyz_success_does_not_expose_runtime_details(self):
+        status, data = self.request("GET", "/readyz")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ready"])
+        self.assertNotIn("details", data)
 
     def test_readyz_reports_configuration_failure(self):
         old = self.api.validate_config
@@ -206,16 +258,24 @@ class ApiServerTests(unittest.TestCase):
             self.api.validate_config = old
         self.assertEqual(status, 503)
         self.assertEqual(data["error"], "not_ready")
-        self.assertIn("bad config", data["details"]["errors"])
+        self.assertNotIn("details", data)
 
     def test_bearer_and_x_api_key_are_accepted(self):
         for headers in (
-            {"Authorization": "Bearer test-api-token"},
-            {"X-API-Key": "test-api-token"},
+            {"Authorization": "Bearer test-api-token-123"},
+            {"X-API-Key": "test-api-token-123"},
         ):
             status, data = self.request("POST", "/v1/ask", {"query": "auth"}, headers)
             self.assertEqual(status, 200)
             self.assertTrue(data["ok"])
+
+    def test_invalid_token_returns_stable_401(self):
+        status, data = self.request(
+            "POST", "/v1/ask", {"query": "auth"}, {"Authorization": "Bearer wrong"}
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(data["error"], "invalid_token")
+        self.assertNotIn("test-api-token-123", json.dumps(data))
 
     def test_request_body_and_query_limits_return_413(self):
         old_body = self.api.ASK_API_MAX_BODY_BYTES
@@ -236,6 +296,51 @@ class ApiServerTests(unittest.TestCase):
         finally:
             self.api.ASK_API_MAX_BODY_BYTES = old_body
             self.api.ASK_API_MAX_QUERY_CHARS = old_query
+
+    def test_non_string_query_returns_400(self):
+        status, data = self.request("POST", "/ask", {"query": 123}, self.auth_headers())
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"], "invalid_query")
+
+    def test_missing_or_chunked_content_length_is_rejected(self):
+        status, data = self.raw_request("POST", "/ask", self.auth_headers())
+        self.assertEqual(status, 411)
+        self.assertEqual(data["error"], "content_length_required")
+        status, data = self.request(
+            "POST", "/ask", None,
+            self.auth_headers(**{"Transfer-Encoding": "chunked"}),
+        )
+        self.assertEqual(status, 411)
+        self.assertEqual(data["error"], "chunked_not_supported")
+
+    def test_pipeline_error_does_not_leak_exception_details(self):
+        self.fake_bot.handle = lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("secret internal detail")
+        )
+        with patch.object(self.api.log, "error"):
+            status, data = self.request(
+                "POST", "/ask", {"query": "fail"}, self.auth_headers()
+            )
+        self.assertEqual(status, 500)
+        self.assertEqual(data["error"], "pipeline_failed")
+        self.assertNotIn("secret internal detail", json.dumps(data))
+
+    def test_bind_failure_is_reported_to_startup(self):
+        old_server = self.api.HTTPServer
+        old_error = self.api.ASK_SERVER_ERROR
+        self.api.HTTPServer = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("bind failed")
+        )
+        self.api.ASK_SERVER_READY.clear()
+        self.api.ASK_SERVER_ERROR = None
+        try:
+            with patch.object(self.api.log, "error"):
+                self.api._run_ask_server()
+            self.assertTrue(self.api.ASK_SERVER_READY.is_set())
+            self.assertIn("bind failed", str(self.api.ASK_SERVER_ERROR))
+        finally:
+            self.api.HTTPServer = old_server
+            self.api.ASK_SERVER_ERROR = old_error
 
     def test_rate_limit_returns_429_after_threshold(self):
         old_limit = self.api.ASK_API_RATE_LIMIT

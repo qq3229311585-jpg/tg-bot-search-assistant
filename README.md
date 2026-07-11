@@ -211,7 +211,8 @@ systemctl enable --now tg-bot
 
 需要给 Apple Watch、n8n 或其他外部客户端访问时，请使用
 [`deploy/nginx/tg-bot.conf.example`](deploy/nginx/tg-bot.conf.example) 做 HTTPS 反向代理，
-不要直接把 Python HTTP 端口暴露到公网。
+不要直接把 Python HTTP 端口暴露到公网。使用该代理时，将
+`ASK_API_TRUST_PROXY=true` 写入 `/etc/tg-bot.env`，让限流按真实客户端地址隔离。
 
 ## 测试
 

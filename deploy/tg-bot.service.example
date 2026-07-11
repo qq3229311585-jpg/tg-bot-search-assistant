@@ -9,8 +9,8 @@ User=tgbot
 Group=tgbot
 UMask=0077
 EnvironmentFile=/etc/tg-bot.env
-Environment=TG_BOT_DATA_DIR=/var/lib/morning-report
-Environment=ASK_API_HOST=127.0.0.1
+# TG_BOT_DATA_DIR and ASK_API_HOST are configured in /etc/tg-bot.env.
+# If TG_BOT_DATA_DIR is customized, update ReadWritePaths below as well.
 WorkingDirectory=/opt/tg-bot-search-assistant
 ExecStart=/usr/bin/python3 /opt/tg-bot-search-assistant/scripts/tg-bot-new.py
 Restart=on-failure

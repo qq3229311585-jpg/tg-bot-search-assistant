@@ -200,6 +200,8 @@ def validate_config():
         errors.append("DEEPSEEK_KEY_0 未配置")
     if _verify_key_fallback:
         warnings.append("DEEPSEEK_VERIFY_KEY_0 未配置，将复用写作 key")
+    if ASK_API_TOKEN and len(ASK_API_TOKEN) < 16:
+        errors.append("ASK_API_TOKEN 至少需要 16 个字符")
     if not TAVILY_KEYS:
         warnings.append("TAVILY_KEY_0 未配置，Tavily 搜索/抓取不可用")
     if not SERPER_KEYS:
