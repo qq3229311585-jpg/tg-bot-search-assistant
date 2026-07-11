@@ -302,4 +302,3 @@ Confirm no real secrets, server IPs, or generated runtime data were added; confi
 - [ ] **Step 3: Report exact verification evidence**
 
 Provide the local repository path, commit list, test count, interface list, and any deployment steps that still require the user’s server-specific values. Do not claim remote publication.
-
