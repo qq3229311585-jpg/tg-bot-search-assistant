@@ -12,6 +12,7 @@ from tg_bot.config import (
     QUOTA_FILE, API_FREE_LIMITS,
     _quota_warnings,
     SOURCES_DIR,
+    ensure_data_dir, validate_config,
 )
 from tg_bot.bot_utils import tg, send, typing, md_to_html
 from tg_bot.file_io import atomic_write_text
@@ -1134,6 +1135,12 @@ def _save_offset(off):
 
 def main():
     log.info("Bot v2 启动（含搜索能力），开始监听...")
+    diagnostics = validate_config()
+    if not diagnostics["ok"]:
+        raise RuntimeError("配置检查失败：" + "；".join(diagnostics["errors"]))
+    ensure_data_dir()
+    for warning in diagnostics["warnings"]:
+        log.warning("配置提示：%s", warning)
     auto_cleanup()   # 启动时清理一次过期文件
 
     # 启动 HTTP /ask 接口（后台线程，供 OpenHuman 等外部系统调用）

@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+import contextlib
+import importlib
+import os
+import shutil
+import stat
+import sys
+import tempfile
 import unittest
 
 from tg_bot.core.pipeline import _critic_budget, _enforce_short_length
@@ -26,6 +33,81 @@ import tg_bot.workers.gather_executor as gather_executor
 from tg_bot.workers.gather_executor import GatherExecContext, execute_gather_tool
 from tg_bot.workers.gather_fallback import finalize_round_limit, parse_gather_completion
 from tg_bot.workers.source_backfill import complete_source_index, dedupe_source_index
+
+
+@contextlib.contextmanager
+def temporary_env(**updates):
+    """Temporarily update env vars and restore the process exactly afterward."""
+    sentinel = object()
+    original = {key: os.environ.get(key, sentinel) for key in updates}
+    try:
+        for key, value in updates.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in original.items():
+            if value is sentinel:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def reload_config():
+    sys.modules.pop("tg_bot.config", None)
+    return importlib.import_module("tg_bot.config")
+
+
+def required_env(**overrides):
+    values = {
+        "BOT_TOKEN": "test-bot-token",
+        "ALLOWED_CHAT": "1",
+        "DEEPSEEK_KEY_0": "test-writing-key",
+        "DEEPSEEK_VERIFY_KEY_0": "test-verify-key",
+        "BRAVE_KEY": "test-brave-key",
+        "TAVILY_KEY_0": "test-tavily-key",
+        "SERPER_KEY_0": "test-serper-key",
+    }
+    values.update(overrides)
+    return values
+
+
+class ConfigTests(unittest.TestCase):
+    def test_config_uses_custom_data_dir_without_import_side_effect(self):
+        temp_dir = tempfile.mkdtemp(prefix="tg-bot-config-")
+        shutil.rmtree(temp_dir)
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=temp_dir)):
+                cfg = reload_config()
+                self.assertEqual(cfg.DATA_DIR, temp_dir)
+                self.assertFalse(os.path.exists(temp_dir))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_config_reports_missing_deepseek_key(self):
+        with temporary_env(**required_env(DEEPSEEK_KEY_0=None)):
+            with self.assertRaisesRegex(RuntimeError, "DEEPSEEK_KEY_0"):
+                reload_config()
+
+    def test_config_allows_search_provider_keys_to_be_empty(self):
+        with temporary_env(**required_env(TAVILY_KEY_0=None, SERPER_KEY_0=None)):
+            cfg = reload_config()
+            self.assertEqual(cfg.TAVILY_KEYS, [])
+            self.assertEqual(cfg.SERPER_KEYS, [])
+
+    def test_ensure_data_dir_creates_private_directory(self):
+        temp_dir = tempfile.mkdtemp(prefix="tg-bot-config-")
+        shutil.rmtree(temp_dir)
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=temp_dir)):
+                cfg = reload_config()
+                cfg.ensure_data_dir()
+                mode = stat.S_IMODE(os.stat(temp_dir).st_mode)
+                self.assertEqual(mode, 0o700)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class SearchPolicyTests(unittest.TestCase):
