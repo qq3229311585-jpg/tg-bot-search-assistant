@@ -143,10 +143,10 @@ chmod 600 /etc/tg-bot.env
 BOT_TOKEN=...
 ALLOWED_CHAT=...
 DEEPSEEK_KEY_0=...
-DEEPSEEK_VERIFY_KEY_0=...
+DEEPSEEK_VERIFY_KEY_0=...   # 可选；不填时复用 DEEPSEEK_KEY_0
 BRAVE_KEY=...
-TAVILY_KEY_0=...
-SERPER_KEY_0=...
+TAVILY_KEY_0=...            # 可选；没有时跳过 Tavily 降级
+SERPER_KEY_0=...            # 可选；没有时跳过 Serper 兜底
 ```
 
 运行时数据默认写入：
@@ -156,6 +156,20 @@ SERPER_KEY_0=...
 ```
 
 包括对话历史、工具日志、来源存档、worklog、HTTP `/ask` token 等。这些运行时数据不要提交到 GitHub。
+
+运行目录和 HTTP API 均可通过环境变量调整：
+
+```bash
+TG_BOT_DATA_DIR=/var/lib/morning-report
+ASK_API_HOST=127.0.0.1
+ASK_API_PORT=7799
+ASK_API_TOKEN=                 # 留空则自动生成并保存为 0600 文件
+ASK_API_MAX_BODY_BYTES=65536
+ASK_API_MAX_QUERY_CHARS=4000
+ASK_API_RATE_LIMIT=30
+ASK_API_RATE_WINDOW_SECONDS=60
+ASK_API_TRUST_PROXY=false      # 仅在可信反向代理后开启
+```
 
 ## 启动
 
@@ -168,10 +182,23 @@ set +a
 PYTHONPATH=. python3 scripts/tg-bot-new.py
 ```
 
+启动前建议先运行只读自检（不会启动 Telegram 轮询）：
+
+```bash
+PYTHONPATH=. python3 scripts/tg-bot-check.py
+```
+
 systemd 示例在：
 
 ```text
 deploy/tg-bot.service.example
+```
+
+模板默认使用专用 `tgbot` 用户、`UMask=0077`，并让 HTTP API 只监听本机。准备目录和服务用户：
+
+```bash
+useradd --system --home /opt/tg-bot-search-assistant --shell /usr/sbin/nologin tgbot
+install -d -o tgbot -g tgbot -m 700 /var/lib/morning-report
 ```
 
 部署时可复制为：
@@ -182,11 +209,46 @@ systemctl daemon-reload
 systemctl enable --now tg-bot
 ```
 
+需要给 Apple Watch、n8n 或其他外部客户端访问时，请使用
+[`deploy/nginx/tg-bot.conf.example`](deploy/nginx/tg-bot.conf.example) 做 HTTPS 反向代理，
+不要直接把 Python HTTP 端口暴露到公网。
+
 ## 测试
 
 ```bash
 PYTHONPATH=. python3 -m unittest tg_bot.tests.test_core_units
 ```
+
+## HTTP 接口
+
+现有 `POST /ask` 保持兼容，同时提供版本化入口 `POST /v1/ask`。两个入口都接受：
+
+```json
+{"query": "今天有什么新闻", "brief": false}
+```
+
+成功响应保留 `reply`、`ok`，并增加 `api_version`、`request_id`。鉴权支持
+`Authorization: Bearer <token>` 和 `X-API-Key: <token>`。
+
+公开的发现/探活接口：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/health` | 存活检查 |
+| GET | `/readyz` | 配置和数据目录就绪检查 |
+| GET | `/version` | 版本信息 |
+| GET | `/capabilities` | 接口能力发现 |
+
+本机调用示例：
+
+```bash
+curl -X POST http://127.0.0.1:7799/v1/ask \
+  -H "Authorization: Bearer $(cat /var/lib/morning-report/ask_api_token)" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"今天有什么新闻","brief":true}'
+```
+
+服务内置请求体、查询长度和进程内限流；多实例部署时仍应在 Nginx 或上游网关做全局限流。
 
 ## 安全说明
 

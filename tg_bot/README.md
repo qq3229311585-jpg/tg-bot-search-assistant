@@ -86,6 +86,7 @@ ALLOWED_CHAT=允许的_Chat_ID（只响应这一个）
 # DeepSeek（支持多个 key 轮换）
 DEEPSEEK_KEY_0=sk-...
 DEEPSEEK_KEY_1=sk-...        # 可选，第二个 key
+DEEPSEEK_VERIFY_KEY_0=sk-...  # 可选；不填时复用写作 key
 
 # 搜索 API（三路自动回退：Tavily → Brave → Serper）
 TAVILY_KEY_0=你的_Tavily_Key
@@ -93,6 +94,17 @@ TAVILY_KEY_1=你的_Tavily_Key_2        # 可选
 BRAVE_KEY=BSA...
 SERPER_KEY_0=...
 SERPER_KEY_1=...             # 可选
+
+# 运行目录和 HTTP API
+TG_BOT_DATA_DIR=/var/lib/morning-report
+ASK_API_HOST=127.0.0.1
+ASK_API_PORT=7799
+ASK_API_TOKEN=                 # 留空则生成并保存为 0600 文件
+ASK_API_MAX_BODY_BYTES=65536
+ASK_API_MAX_QUERY_CHARS=4000
+ASK_API_RATE_LIMIT=30
+ASK_API_RATE_WINDOW_SECONDS=60
+ASK_API_TRUST_PROXY=false      # 仅在可信反向代理后开启
 
 # OpenHuman 记忆集成（可选）
 OPENHUMAN_RPC_TOKEN=...
@@ -108,6 +120,9 @@ systemctl start tg-bot
 systemctl stop tg-bot
 systemctl restart tg-bot
 
+# 启动前自检（不会启动 Telegram 轮询）
+PYTHONPATH=/opt/tg-bot-search-assistant python3 /opt/tg-bot-search-assistant/scripts/tg-bot-check.py
+
 # 查看日志（实时）
 journalctl -u tg-bot -f
 
@@ -121,9 +136,13 @@ journalctl -u tg-bot -n 50 --no-pager
 
 供外部系统（Apple Watch 快捷指令、n8n、Home Assistant 等）直接调用。
 
-**地址：** `http://<服务器IP>:7799/ask`
+应用默认只监听 `127.0.0.1:7799`。远程访问请使用仓库中的
+`deploy/nginx/tg-bot.conf.example` 做 HTTPS 反向代理，不要直接暴露明文端口。
 
-**鉴权：** Bearer Token（存在 `/var/lib/morning-report/ask_api_token`）
+**兼容地址：** `POST /ask`、`POST /v1/ask`
+
+**鉴权：** `Authorization: Bearer <token>` 或 `X-API-Key: <token>`。
+token 默认存在 `/var/lib/morning-report/ask_api_token`，也可以用 `ASK_API_TOKEN` 环境变量显式提供。
 
 ```bash
 # 查看当前 Token
@@ -137,7 +156,7 @@ systemctl restart tg-bot
 **请求示例：**
 
 ```bash
-curl -X POST http://<服务器IP>:7799/ask \
+curl -X POST http://127.0.0.1:7799/v1/ask \
   -H "Authorization: Bearer 你的token" \
   -H "Content-Type: application/json" \
   -d '{"query": "今天有什么新闻", "brief": false}'
@@ -146,7 +165,7 @@ curl -X POST http://<服务器IP>:7799/ask \
 **返回格式：**
 
 ```json
-{"reply": "AI 的回复内容", "ok": true}
+{"reply": "AI 的回复内容", "ok": true, "api_version": "v1", "request_id": "..."}
 ```
 
 **参数说明：**
@@ -157,6 +176,9 @@ curl -X POST http://<服务器IP>:7799/ask \
 | brief | bool | true = 回复压缩到80字内（适合小屏幕）；false = 完整回复 |
 
 > `/ask` 接口不保存对话历史，每次独立处理，用完即走。
+
+**探活和能力发现：** `GET /health`、`GET /readyz`、`GET /version`、`GET /capabilities`。
+服务端还会限制请求体、查询长度并进行进程内限流；多实例部署时请在反向代理处做全局限流。
 
 ---
 
