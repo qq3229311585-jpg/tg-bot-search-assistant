@@ -100,6 +100,9 @@ def _check_rate_limit(identity: str) -> bool:
 
 
 def _expected_token() -> str:
+    global ASK_API_TOKEN
+    if not ASK_API_TOKEN and not CONFIG_API_TOKEN:
+        ASK_API_TOKEN = _load_or_create_ask_token()
     return (ASK_API_TOKEN or CONFIG_API_TOKEN or "").strip()
 
 
@@ -200,6 +203,7 @@ class _AskHandler(BaseHTTPRequestHandler):
             self._error(400, "invalid_content_length", request_id)
             return
         if length < 0 or length > ASK_API_MAX_BODY_BYTES:
+            self.close_connection = True
             self._error(413, "request_too_large", request_id)
             return
         try:
@@ -228,7 +232,7 @@ class _AskHandler(BaseHTTPRequestHandler):
                 self._json(200, _payload(request_id, reply=reply, ok=True))
             except Exception as exc:
                 log.error("HTTP %s 流水线失败: %s", path, exc, exc_info=True)
-                self._error(500, "pipeline_failed", request_id, details=str(exc))
+                self._error(500, "pipeline_failed", request_id)
 
     def log_message(self, fmt, *args):
         # 静默 BaseHTTPRequestHandler 默认日志（避免和我们的 log 重复）
