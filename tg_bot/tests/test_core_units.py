@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
+import contextlib
+import http.client
+import importlib
+import json
+import os
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import types
 import unittest
+from unittest.mock import patch
 
 from tg_bot.core.pipeline import _critic_budget, _enforce_short_length
 from tg_bot.lanes.router import decide_lane
@@ -27,6 +41,366 @@ from tg_bot.workers.gather_executor import GatherExecContext, execute_gather_too
 from tg_bot.workers.gather_fallback import finalize_round_limit, parse_gather_completion
 from tg_bot.workers.source_backfill import complete_source_index, dedupe_source_index
 
+
+@contextlib.contextmanager
+def temporary_env(**updates):
+    """Temporarily update env vars and restore the process exactly afterward."""
+    sentinel = object()
+    original = {key: os.environ.get(key, sentinel) for key in updates}
+    try:
+        for key, value in updates.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in original.items():
+            if value is sentinel:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def reload_config():
+    sys.modules.pop("tg_bot.config", None)
+    return importlib.import_module("tg_bot.config")
+
+
+def required_env(**overrides):
+    values = {
+        "BOT_TOKEN": "test-bot-token",
+        "ALLOWED_CHAT": "1",
+        "DEEPSEEK_KEY_0": "test-writing-key",
+        "DEEPSEEK_VERIFY_KEY_0": "test-verify-key",
+        "BRAVE_KEY": "test-brave-key",
+        "TAVILY_KEY_0": "test-tavily-key",
+        "SERPER_KEY_0": "test-serper-key",
+    }
+    values.update(overrides)
+    return values
+
+
+class ConfigTests(unittest.TestCase):
+    def test_config_uses_custom_data_dir_without_import_side_effect(self):
+        temp_dir = tempfile.mkdtemp(prefix="tg-bot-config-")
+        shutil.rmtree(temp_dir)
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=temp_dir)):
+                cfg = reload_config()
+                self.assertEqual(cfg.DATA_DIR, temp_dir)
+                self.assertFalse(os.path.exists(temp_dir))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+    def test_config_reports_missing_deepseek_key(self):
+        with temporary_env(**required_env(DEEPSEEK_KEY_0=None)):
+            with self.assertRaisesRegex(RuntimeError, "DEEPSEEK_KEY_0"):
+                reload_config()
+
+    def test_config_allows_search_provider_keys_to_be_empty(self):
+        with temporary_env(**required_env(TAVILY_KEY_0=None, SERPER_KEY_0=None)):
+            cfg = reload_config()
+            self.assertEqual(cfg.TAVILY_KEYS, [])
+            self.assertEqual(cfg.SERPER_KEYS, [])
+
+    def test_ensure_data_dir_creates_private_directory(self):
+        temp_dir = tempfile.mkdtemp(prefix="tg-bot-config-")
+        shutil.rmtree(temp_dir)
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=temp_dir)):
+                cfg = reload_config()
+                cfg.ensure_data_dir()
+                mode = stat.S_IMODE(os.stat(temp_dir).st_mode)
+                self.assertEqual(mode, 0o700)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_short_api_token_is_rejected_by_validation(self):
+        with temporary_env(**required_env(ASK_API_TOKEN="short")):
+            cfg = reload_config()
+            diagnostics = cfg.validate_config()
+            self.assertFalse(diagnostics["ok"])
+            self.assertTrue(any("ASK_API_TOKEN" in item for item in diagnostics["errors"]))
+
+
+class SearchProviderTests(unittest.TestCase):
+    def test_serper_without_key_is_explicitly_unavailable(self):
+        with temporary_env(**required_env(TAVILY_KEY_0=None, SERPER_KEY_0=None)):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            self.assertEqual(search._execute_serper("test", "general"), "Serper 未配置")
+
+
+class TokenTests(unittest.TestCase):
+    def test_existing_token_file_is_tightened_to_private_mode(self):
+        temp_dir = tempfile.mkdtemp(prefix="tg-bot-token-")
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=temp_dir, ASK_API_TOKEN=None)):
+                cfg = reload_config()
+                cfg.ensure_data_dir()
+                with open(cfg.ASK_TOKEN_FILE, "w", encoding="utf-8") as f:
+                    f.write("existing-token-value")
+                os.chmod(cfg.ASK_TOKEN_FILE, 0o644)
+                sys.modules.pop("tg_bot.ask_server", None)
+                api = importlib.import_module("tg_bot.ask_server")
+                self.assertEqual(api._load_or_create_ask_token(), "existing-token-value")
+                self.assertEqual(stat.S_IMODE(os.stat(cfg.ASK_TOKEN_FILE).st_mode), 0o600)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class ApiServerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="tg-bot-api-")
+        env = required_env(
+            TG_BOT_DATA_DIR=self.temp_dir,
+            ASK_API_TOKEN="test-api-token-123",
+            ASK_API_RATE_LIMIT="10",
+            ASK_API_RATE_WINDOW_SECONDS="60",
+            ASK_API_MAX_BODY_BYTES="65536",
+            ASK_API_MAX_QUERY_CHARS="4000",
+        )
+        self.env_context = temporary_env(**env)
+        self.env_context.__enter__()
+        sys.modules.pop("tg_bot.ask_server", None)
+        sys.modules.pop("tg_bot.config", None)
+        self.api = importlib.import_module("tg_bot.ask_server")
+        self.api.ASK_API_TOKEN = "test-api-token-123"
+        self.api._rate_state.clear()
+        self.fake_bot = types.ModuleType("tg_bot.bot")
+        self.fake_bot.handle = lambda chat_id, text, http_mode, brief: f"echo:{text}:{brief}"
+        self.old_bot = sys.modules.get("tg_bot.bot")
+        sys.modules["tg_bot.bot"] = self.fake_bot
+        self.server = self.api.HTTPServer(("127.0.0.1", 0), self.api._AskHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        if self.old_bot is None:
+            sys.modules.pop("tg_bot.bot", None)
+        else:
+            sys.modules["tg_bot.bot"] = self.old_bot
+        self.env_context.__exit__(None, None, None)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def request(self, method, path, payload=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        body = None
+        req_headers = dict(headers or {})
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8") if isinstance(payload, dict) else payload
+            req_headers.setdefault("Content-Type", "application/json")
+        conn.request(method, path, body=body, headers=req_headers)
+        response = conn.getresponse()
+        raw = response.read()
+        conn.close()
+        return response.status, json.loads(raw.decode("utf-8"))
+
+    def raw_request(self, method, path, headers):
+        sock = socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3)
+        try:
+            lines = [f"{method} {path} HTTP/1.1", "Host: 127.0.0.1", "Connection: close"]
+            lines.extend(f"{key}: {value}" for key, value in headers.items())
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+            chunks = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            sock.close()
+        raw = b"".join(chunks)
+        head, body = raw.split(b"\r\n\r\n", 1)
+        status = int(head.splitlines()[0].split()[1])
+        return status, json.loads(body.decode("utf-8"))
+
+    def auth_headers(self, **extra):
+        headers = {"Authorization": "Bearer test-api-token-123"}
+        headers.update(extra)
+        return headers
+
+    def test_v1_ask_alias_preserves_reply_shape(self):
+        for path in ("/ask", "/v1/ask"):
+            status, data = self.request("POST", path, {"query": "hello"}, self.auth_headers())
+            self.assertEqual(status, 200)
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["reply"], "echo:hello:False")
+            self.assertEqual(data["api_version"], "v1")
+
+    def test_health_version_and_capabilities_are_public(self):
+        for path in ("/health", "/version", "/capabilities"):
+            status, data = self.request("GET", path)
+            self.assertEqual(status, 200)
+            self.assertTrue(data["ok"])
+        status, data = self.request("GET", "/capabilities")
+        self.assertIn("/v1/ask", data["endpoints"])
+        self.assertEqual(data["methods"]["capabilities"], ["GET"])
+
+    def test_readyz_success_does_not_expose_runtime_details(self):
+        status, data = self.request("GET", "/readyz")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ready"])
+        self.assertNotIn("details", data)
+
+    def test_readyz_reports_configuration_failure(self):
+        old = self.api.validate_config
+        self.api.validate_config = lambda: {"ok": False, "errors": ["bad config"], "warnings": []}
+        try:
+            status, data = self.request("GET", "/readyz")
+        finally:
+            self.api.validate_config = old
+        self.assertEqual(status, 503)
+        self.assertEqual(data["error"], "not_ready")
+        self.assertNotIn("details", data)
+
+    def test_bearer_and_x_api_key_are_accepted(self):
+        for headers in (
+            {"Authorization": "Bearer test-api-token-123"},
+            {"X-API-Key": "test-api-token-123"},
+        ):
+            status, data = self.request("POST", "/v1/ask", {"query": "auth"}, headers)
+            self.assertEqual(status, 200)
+            self.assertTrue(data["ok"])
+
+    def test_invalid_token_returns_stable_401(self):
+        status, data = self.request(
+            "POST", "/v1/ask", {"query": "auth"}, {"Authorization": "Bearer wrong"}
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(data["error"], "invalid_token")
+        self.assertNotIn("test-api-token-123", json.dumps(data))
+
+    def test_request_body_and_query_limits_return_413(self):
+        old_body = self.api.ASK_API_MAX_BODY_BYTES
+        old_query = self.api.ASK_API_MAX_QUERY_CHARS
+        self.api.ASK_API_MAX_BODY_BYTES = 64
+        self.api.ASK_API_MAX_QUERY_CHARS = 4
+        try:
+            status, data = self.request(
+                "POST", "/ask", {"query": "x" * 100}, self.auth_headers()
+            )
+            self.assertEqual(status, 413)
+            self.assertEqual(data["error"], "request_too_large")
+            status, data = self.request(
+                "POST", "/ask", {"query": "hello"}, self.auth_headers()
+            )
+            self.assertEqual(status, 413)
+            self.assertEqual(data["error"], "query_too_large")
+        finally:
+            self.api.ASK_API_MAX_BODY_BYTES = old_body
+            self.api.ASK_API_MAX_QUERY_CHARS = old_query
+
+    def test_non_string_query_returns_400(self):
+        status, data = self.request("POST", "/ask", {"query": 123}, self.auth_headers())
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"], "invalid_query")
+
+    def test_missing_or_chunked_content_length_is_rejected(self):
+        status, data = self.raw_request("POST", "/ask", self.auth_headers())
+        self.assertEqual(status, 411)
+        self.assertEqual(data["error"], "content_length_required")
+        status, data = self.request(
+            "POST", "/ask", None,
+            self.auth_headers(**{"Transfer-Encoding": "chunked"}),
+        )
+        self.assertEqual(status, 411)
+        self.assertEqual(data["error"], "chunked_not_supported")
+
+    def test_pipeline_error_does_not_leak_exception_details(self):
+        self.fake_bot.handle = lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("secret internal detail")
+        )
+        with patch.object(self.api.log, "error"):
+            status, data = self.request(
+                "POST", "/ask", {"query": "fail"}, self.auth_headers()
+            )
+        self.assertEqual(status, 500)
+        self.assertEqual(data["error"], "pipeline_failed")
+        self.assertNotIn("secret internal detail", json.dumps(data))
+
+    def test_bind_failure_is_reported_to_startup(self):
+        old_server = self.api.HTTPServer
+        old_error = self.api.ASK_SERVER_ERROR
+        self.api.HTTPServer = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("bind failed")
+        )
+        self.api.ASK_SERVER_READY.clear()
+        self.api.ASK_SERVER_ERROR = None
+        try:
+            with patch.object(self.api.log, "error"):
+                self.api._run_ask_server()
+            self.assertTrue(self.api.ASK_SERVER_READY.is_set())
+            self.assertIn("bind failed", str(self.api.ASK_SERVER_ERROR))
+        finally:
+            self.api.HTTPServer = old_server
+            self.api.ASK_SERVER_ERROR = old_error
+
+    def test_rate_limit_returns_429_after_threshold(self):
+        old_limit = self.api.ASK_API_RATE_LIMIT
+        self.api.ASK_API_RATE_LIMIT = 1
+        self.api._rate_state.clear()
+        try:
+            status, _ = self.request("POST", "/ask", {"query": "one"}, self.auth_headers())
+            self.assertEqual(status, 200)
+            status, data = self.request("POST", "/ask", {"query": "two"}, self.auth_headers())
+            self.assertEqual(status, 429)
+            self.assertEqual(data["error"], "rate_limited")
+        finally:
+            self.api.ASK_API_RATE_LIMIT = old_limit
+            self.api._rate_state.clear()
+
+    def test_request_id_is_echoed_or_generated(self):
+        status, data = self.request(
+            "POST", "/v1/ask", {"query": "id"},
+            self.auth_headers(**{"X-Request-ID": "client-123"}),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["request_id"], "client-123")
+        status, data = self.request("POST", "/v1/ask", {"query": "id"}, self.auth_headers())
+        self.assertEqual(status, 200)
+        self.assertTrue(data["request_id"])
+
+
+class DeploymentCheckTests(unittest.TestCase):
+    def run_check(self, values):
+        env = os.environ.copy()
+        for key, value in values.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = str(value)
+        return subprocess.run(
+            [sys.executable, "scripts/tg-bot-check.py"],
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_check_script_accepts_complete_environment(self):
+        temp_dir = tempfile.mkdtemp(prefix="tg-bot-check-")
+        shutil.rmtree(temp_dir)
+        try:
+            result = self.run_check(required_env(TG_BOT_DATA_DIR=temp_dir))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("OK", result.stdout)
+            self.assertTrue(os.path.isdir(temp_dir))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_check_script_reports_missing_required_key(self):
+        values = required_env(TG_BOT_DATA_DIR=tempfile.mkdtemp(prefix="tg-bot-check-"))
+        values["DEEPSEEK_KEY_0"] = None
+        result = self.run_check(values)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DEEPSEEK_KEY_0", result.stderr + result.stdout)
 
 class SearchPolicyTests(unittest.TestCase):
     def test_emotion_with_today_stays_fast(self):
@@ -115,7 +489,8 @@ class LaneRouterTests(unittest.TestCase):
 class LengthGuardTests(unittest.TestCase):
     def test_short_length_guard_trims_overlong_reply(self):
         text = "。".join([f"事实{i}" for i in range(80)]) + "。"
-        trimmed = _enforce_short_length(text, "写一个300字的介绍", (255, 345))
+        with patch("tg_bot.pipeline.gather.fast_chat", return_value=""):
+            trimmed = _enforce_short_length(text, "写一个300字的介绍", (255, 345))
         self.assertLessEqual(len(trimmed), 345)
         self.assertGreater(len(trimmed), 0)
 
