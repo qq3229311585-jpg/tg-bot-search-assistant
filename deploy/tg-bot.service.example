@@ -5,11 +5,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=tgbot
+Group=tgbot
+UMask=0077
 EnvironmentFile=/etc/tg-bot.env
+# TG_BOT_DATA_DIR and ASK_API_HOST are configured in /etc/tg-bot.env.
+# If TG_BOT_DATA_DIR is customized, update ReadWritePaths below as well.
 WorkingDirectory=/opt/tg-bot-search-assistant
 ExecStart=/usr/bin/python3 /opt/tg-bot-search-assistant/scripts/tg-bot-new.py
-Restart=always
+Restart=on-failure
 RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/morning-report
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

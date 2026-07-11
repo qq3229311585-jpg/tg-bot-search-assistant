@@ -12,6 +12,7 @@ from tg_bot.config import (
     QUOTA_FILE, API_FREE_LIMITS,
     _quota_warnings,
     SOURCES_DIR,
+    ensure_data_dir, validate_config,
 )
 from tg_bot.bot_utils import tg, send, typing, md_to_html
 from tg_bot.file_io import atomic_write_text
@@ -1134,12 +1135,27 @@ def _save_offset(off):
 
 def main():
     log.info("Bot v2 启动（含搜索能力），开始监听...")
+    diagnostics = validate_config()
+    if not diagnostics["ok"]:
+        raise RuntimeError("配置检查失败：" + "；".join(diagnostics["errors"]))
+    ensure_data_dir()
+    for warning in diagnostics["warnings"]:
+        log.warning("配置提示：%s", warning)
     auto_cleanup()   # 启动时清理一次过期文件
 
     # 启动 HTTP /ask 接口（后台线程，供 OpenHuman 等外部系统调用）
+    _ask_server_mod.ASK_SERVER_READY.clear()
+    _ask_server_mod.ASK_SERVER_ERROR = None
     _ask_server_mod.ASK_API_TOKEN = _load_or_create_ask_token()
-    log.info(f"🔑 /ask Bearer Token: {_ask_server_mod.ASK_API_TOKEN[:8]}…{_ask_server_mod.ASK_API_TOKEN[-4:]}（完整 token 在 {ASK_TOKEN_FILE}）")
     threading.Thread(target=_run_ask_server, daemon=True, name="ask-http").start()
+    if not _ask_server_mod.ASK_SERVER_READY.wait(timeout=5):
+        raise RuntimeError("HTTP API 启动超时")
+    if _ask_server_mod.ASK_SERVER_ERROR:
+        raise RuntimeError(f"HTTP API 启动失败：{_ask_server_mod.ASK_SERVER_ERROR}")
+    if _cfg.ASK_API_TOKEN:
+        log.info("🔑 /ask 使用 ASK_API_TOKEN 环境变量")
+    else:
+        log.info("🔑 /ask token 已保存到 %s", ASK_TOKEN_FILE)
 
     _cleanup_counter = 0
     offset = _load_offset()

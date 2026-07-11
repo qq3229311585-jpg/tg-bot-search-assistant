@@ -1,84 +1,264 @@
 #!/usr/bin/env python3
-"""ask_server.py — HTTP /ask 接口（供 OpenHuman 等外部系统调用）"""
+"""Small, dependency-free HTTP API for Telegram bot integrations."""
 
-import json, hashlib, os, logging, threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from __future__ import annotations
 
-from tg_bot.config import ASK_API_PORT, ASK_TOKEN_FILE, DATA_DIR
+import hashlib
+import hmac
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
+from urllib.parse import urlsplit
+
+from tg_bot.config import (
+    ASK_API_HOST,
+    ASK_API_MAX_BODY_BYTES,
+    ASK_API_MAX_QUERY_CHARS,
+    ASK_API_PORT,
+    ASK_API_RATE_LIMIT,
+    ASK_API_RATE_WINDOW_SECONDS,
+    ASK_API_TOKEN as CONFIG_API_TOKEN,
+    ASK_API_TRUST_PROXY,
+    ASK_TOKEN_FILE,
+    ensure_data_dir,
+    validate_config,
+)
 from tg_bot.file_io import atomic_write_text
 
 log = logging.getLogger(__name__)
 
-_ask_lock = threading.Lock()  # 同一时间只让一个 HTTP 请求跑流水线，避免文件竞态
+API_VERSION = "v1"
+SERVICE_VERSION = os.getenv("TG_BOT_VERSION", "1.3.0")
+_ask_lock = threading.Lock()  # pipeline remains single-flight for file safety
+_rate_lock = threading.Lock()
+_rate_state: dict[str, tuple[float, int]] = {}
+ASK_SERVER_READY = threading.Event()
+ASK_SERVER_ERROR = None
 
-ASK_API_TOKEN = None  # main() 启动时填充
+ASK_API_TOKEN = CONFIG_API_TOKEN or None  # main() fills this when using a file token
 
 
 def _load_or_create_ask_token():
+    """Use an explicit token when provided, otherwise persist a random token."""
+    if CONFIG_API_TOKEN:
+        return CONFIG_API_TOKEN
     try:
-        with open(ASK_TOKEN_FILE) as f:
+        ensure_data_dir()
+        with open(ASK_TOKEN_FILE, encoding="utf-8") as f:
             tok = f.read().strip()
-            if tok:
+            if tok and len(tok) >= 16:
+                try:
+                    os.chmod(ASK_TOKEN_FILE, 0o600)
+                except OSError:
+                    pass
                 return tok
+            if tok:
+                log.warning("已有 ASK_TOKEN 太短，将重新生成")
     except Exception:
         pass
     tok = hashlib.sha256(os.urandom(32)).hexdigest()
     try:
+        ensure_data_dir()
         atomic_write_text(ASK_TOKEN_FILE, tok, mode=0o600)
     except Exception as e:
-        log.warning(f"无法保存 ASK_TOKEN：{e}")
+        log.warning("无法保存 ASK_TOKEN：%s", e)
     return tok
 
 
+def _request_id(handler: BaseHTTPRequestHandler) -> str:
+    """Return a safe client request id or generate one."""
+    candidate = (handler.headers.get("X-Request-ID") or "").strip()
+    if 0 < len(candidate) <= 128 and all(
+        ch.isalnum() or ch in "._:-" for ch in candidate
+    ):
+        return candidate
+    return uuid.uuid4().hex
+
+
+def _client_identity(handler: BaseHTTPRequestHandler) -> str:
+    """Use forwarded identity only when explicitly trusted by deployment config."""
+    if ASK_API_TRUST_PROXY:
+        forwarded = (handler.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+        if forwarded:
+            return forwarded[:128]
+    return (handler.client_address[0] if handler.client_address else "unknown")[:128]
+
+
+def _check_rate_limit(identity: str) -> bool:
+    """Apply a small in-process fixed-window limit; zero disables it."""
+    if ASK_API_RATE_LIMIT <= 0:
+        return True
+    now = time.monotonic()
+    with _rate_lock:
+        start, count = _rate_state.get(identity, (now, 0))
+        if now - start >= ASK_API_RATE_WINDOW_SECONDS:
+            start, count = now, 0
+        count += 1
+        _rate_state[identity] = (start, count)
+        if len(_rate_state) > 2048:
+            cutoff = now - ASK_API_RATE_WINDOW_SECONDS
+            for key, (window_start, _count) in list(_rate_state.items()):
+                if window_start < cutoff:
+                    _rate_state.pop(key, None)
+        return count <= ASK_API_RATE_LIMIT
+
+
+def _expected_token() -> str:
+    global ASK_API_TOKEN
+    if not ASK_API_TOKEN and not CONFIG_API_TOKEN:
+        ASK_API_TOKEN = _load_or_create_ask_token()
+    return (ASK_API_TOKEN or CONFIG_API_TOKEN or "").strip()
+
+
+def _authenticate(handler: BaseHTTPRequestHandler) -> bool:
+    expected = _expected_token()
+    if not expected:
+        return False
+    bearer = handler.headers.get("Authorization", "")
+    if bearer.startswith("Bearer "):
+        supplied = bearer[7:].strip()
+    else:
+        supplied = (handler.headers.get("X-API-Key") or "").strip()
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+
+def _payload(request_id: str, **values):
+    return {"api_version": API_VERSION, "request_id": request_id, **values}
+
+
 class _AskHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def _json(self, status, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode()
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def _error(self, status, error, request_id, *, details=None):
+        values = {"ok": False, "error": error}
+        if details is not None:
+            values["details"] = details
+        self._json(status, _payload(request_id, **values))
+
     def do_GET(self):
-        if self.path in ("/health", "/"):
-            self._json(200, {"ok": True, "service": "tg-bot /ask"})
-        else:
-            self._json(404, {"error": "not found"})
+        request_id = _request_id(self)
+        path = urlsplit(self.path).path
+        if path in ("/", "/health"):
+            self._json(200, _payload(request_id, ok=True, service="tg-bot /ask"))
+            return
+        if path == "/readyz":
+            diagnostics = validate_config()
+            if diagnostics["ok"]:
+                try:
+                    ensure_data_dir()
+                except OSError as exc:
+                    diagnostics = {
+                        **diagnostics,
+                        "ok": False,
+                        "errors": [f"数据目录不可用：{exc}"],
+                    }
+            if diagnostics["ok"]:
+                self._json(200, _payload(request_id, ok=True, ready=True))
+            else:
+                self._error(503, "not_ready", request_id)
+            return
+        if path == "/version":
+            self._json(200, _payload(request_id, ok=True, version=SERVICE_VERSION))
+            return
+        if path == "/capabilities":
+            self._json(
+                200,
+                _payload(
+                    request_id,
+                    ok=True,
+                    endpoints=[
+                        "/ask",
+                        "/v1/ask",
+                        "/health",
+                        "/readyz",
+                        "/version",
+                        "/capabilities",
+                    ],
+                    methods={
+                        "ask": ["POST"],
+                        "health": ["GET"],
+                        "readyz": ["GET"],
+                        "version": ["GET"],
+                        "capabilities": ["GET"],
+                    },
+                ),
+            )
+            return
+        self._error(404, "not_found", request_id)
 
     def do_POST(self):
-        if self.path != "/ask":
-            self._json(404, {"error": "use POST /ask"})
+        request_id = _request_id(self)
+        path = urlsplit(self.path).path
+        if path not in ("/ask", "/v1/ask"):
+            self._error(404, "not_found", request_id)
             return
-        # 鉴权
-        auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:].strip() != ASK_API_TOKEN:
-            self._json(401, {"error": "invalid bearer token"})
+        if not _check_rate_limit(_client_identity(self)):
+            self._error(429, "rate_limited", request_id)
             return
-        # 读取请求体
+        if not _authenticate(self):
+            self._error(401, "invalid_token", request_id)
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._error(411, "chunked_not_supported", request_id)
+            return
+        if self.headers.get("Content-Length") is None:
+            self.close_connection = True
+            self._error(411, "content_length_required", request_id)
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            body   = self.rfile.read(length).decode("utf-8")
-            data   = json.loads(body) if body else {}
-            query  = (data.get("query") or "").strip()
-            brief  = bool(data.get("brief", False))
-        except Exception as e:
-            self._json(400, {"error": f"bad request body: {e}"})
+        except ValueError:
+            self._error(400, "invalid_content_length", request_id)
             return
+        if length < 0 or length > ASK_API_MAX_BODY_BYTES:
+            self.close_connection = True
+            self._error(413, "request_too_large", request_id)
+            return
+        try:
+            body = self.rfile.read(length).decode("utf-8")
+            data = json.loads(body) if body else {}
+        except Exception as exc:
+            self._error(400, "invalid_json", request_id)
+            return
+        if not isinstance(data, dict):
+            self._error(400, "invalid_json", request_id)
+            return
+        raw_query = data.get("query")
+        if not isinstance(raw_query, str):
+            self._error(400, "invalid_query", request_id)
+            return
+        query = raw_query.strip()
+        brief = bool(data.get("brief", False))
         if not query:
-            self._json(400, {"error": "missing query"})
+            self._error(400, "missing_query", request_id)
             return
-        # 跑流水线（延迟导入避免循环依赖）
+        if len(query) > ASK_API_MAX_QUERY_CHARS:
+            self._error(413, "query_too_large", request_id)
+            return
         from tg_bot.bot import handle
+
         with _ask_lock:
-            log.info(f"📥 HTTP /ask: {query[:60]}")
+            log.info("📥 HTTP %s: %s", path, query[:60])
             try:
-                reply = handle(chat_id=0, text=query, http_mode=True, brief=brief)
-                if reply is None:
-                    reply = ""
-                self._json(200, {"reply": reply, "ok": True})
-            except Exception as e:
-                log.error(f"HTTP /ask 流水线失败: {e}", exc_info=True)
-                self._json(500, {"error": str(e), "ok": False})
+                reply = handle(chat_id=0, text=query, http_mode=True, brief=brief) or ""
+                self._json(200, _payload(request_id, reply=reply, ok=True))
+            except Exception as exc:
+                log.error("HTTP %s 流水线失败: %s", path, exc, exc_info=True)
+                self._error(500, "pipeline_failed", request_id)
 
     def log_message(self, fmt, *args):
         # 静默 BaseHTTPRequestHandler 默认日志（避免和我们的 log 重复）
@@ -86,9 +266,13 @@ class _AskHandler(BaseHTTPRequestHandler):
 
 
 def _run_ask_server():
+    global ASK_SERVER_ERROR
     try:
-        srv = HTTPServer(("0.0.0.0", ASK_API_PORT), _AskHandler)
-        log.info(f"🌐 HTTP /ask 接口监听 0.0.0.0:{ASK_API_PORT}（Bearer Token 鉴权）")
+        srv = HTTPServer((ASK_API_HOST, ASK_API_PORT), _AskHandler)
+        log.info("🌐 HTTP API 监听 %s:%s（/ask 与 /v1/ask）", ASK_API_HOST, ASK_API_PORT)
+        ASK_SERVER_READY.set()
         srv.serve_forever()
     except Exception as e:
-        log.error(f"HTTP /ask 服务启动失败: {e}")
+        ASK_SERVER_ERROR = e
+        ASK_SERVER_READY.set()
+        log.error("HTTP /ask 服务启动失败: %s", e, exc_info=True)

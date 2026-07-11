@@ -177,6 +177,8 @@ def _serper_fallback(query, search_type):
 def _execute_serper(query, search_type):
     """Serper.dev 实际执行函数（被备用链和独立工具共用）"""
     import tg_bot.config as _cfg
+    if not _cfg.SERPER_KEYS or not _cfg.SERPER_KEY:
+        return "Serper 未配置"
     log.info(f"🔍 Serper [{search_type}]: {query}")
     try:
         endpoint = "https://google.serper.dev/news" if search_type == "news" else "https://google.serper.dev/search"
