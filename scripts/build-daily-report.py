@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 import json
 import os
 import re
@@ -23,12 +24,20 @@ from tg_bot.daily_report import (  # noqa: E402
     render_daily_report,
     select_events,
 )
+from tg_bot.report_sections import (  # noqa: E402
+    DEFAULT_REPORT_SECTIONS,
+    EVENT_SECTION_IDS,
+    get_section_collector,
+    register_section_collector,
+    resolve_sections,
+    split_external_sections,
+)
 
 
 _CATEGORY_QUERIES = {
-    "china": "中国 今日 重大新闻",
-    "global": "全球 今日 重大新闻",
-    "ai_tech": "AI 人工智能 技术 今日 新闻",
+    section.id: section.query
+    for section in DEFAULT_REPORT_SECTIONS
+    if section.kind == "event" and section.query
 }
 
 
@@ -63,7 +72,13 @@ def collect_candidates(categories: Iterable[str] | None = None):
 
     candidates = []
     diagnostics = []
-    for category in categories or _CATEGORY_QUERIES:
+    requested = tuple(categories or EVENT_SECTION_IDS)
+    for category in requested:
+        # Snapshot lanes are intentionally not sent through a news provider;
+        # they are supplied by native/external collectors and preserved below.
+        if category not in _CATEGORY_QUERIES:
+            diagnostics.append(f"{category}: snapshot_or_no_news_collector")
+            continue
         query = _CATEGORY_QUERIES.get(category, f"{category} 今日 新闻")
         try:
             raw_items, provider_diagnostics = execute_news_candidates(query)
@@ -79,6 +94,31 @@ def collect_candidates(categories: Iterable[str] | None = None):
         except Exception as exc:
             diagnostics.append(f"{category}: provider_error:{type(exc).__name__}")
     return candidates, diagnostics
+
+
+def _has_provider_failure(diagnostics: Iterable[str]) -> bool:
+    """Return true only for failures that make a fresh event report unsafe."""
+    return any(
+        "provider_error" in str(item) or "unavailable" in str(item)
+        for item in diagnostics
+    )
+
+
+def _has_fresh_event(events, now):
+    """Mirror the report freshness window to explain cooldown placeholders."""
+    for event in events:
+        published = [
+            _parse_timestamp(item.published_at)
+            for item in event.sources
+            if item.published_at
+        ]
+        if not published:
+            return True
+        latest = max(published)
+        age_hours = (now.astimezone(timezone.utc) - latest.astimezone(timezone.utc)).total_seconds() / 3600
+        if age_hours <= 24:
+            return True
+    return False
 
 
 def _serialize_event(event):
@@ -128,21 +168,50 @@ def _prune_state(state, now, retention_days):
     state["events"] = kept
 
 
-def build_report(candidates, *, now=None, state=None, per_category=4, cooldown_days=14, timezone_name="Asia/Shanghai"):
-    """Cluster, select, render, and return a serializable report result."""
-    now = now or datetime.now(timezone.utc)
-    current_state = dict(state or {})
-    current_state["schema_version"] = 1
-    current_state["events"] = dict(current_state.get("events") or {})
-    _prune_state(current_state, now, max(cooldown_days, 14))
-    events = cluster_candidates(candidates)
-    selected = select_events(
-        events,
-        current_state,
-        now=now,
-        per_category=per_category,
-        cooldown_days=cooldown_days,
-    )
+def load_legacy_report(path):
+    """Read the previous report for external/legacy section preservation."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def register_builtin_snapshot_collectors(enabled=True):
+    """Install lazy native adapters without importing/networking at module load."""
+    if not enabled:
+        return
+
+    def weather_collector():
+        from tg_bot.tools.native import execute_weather
+        return execute_weather()
+
+    register_section_collector("weather", weather_collector)
+
+
+def collect_snapshot_sections(section_specs, legacy_report_text, diagnostics=None):
+    """Merge registered snapshot collectors over legacy section text."""
+    sections = split_external_sections(legacy_report_text, section_specs)
+    diagnostics = diagnostics if diagnostics is not None else []
+    for section in section_specs:
+        if section.kind != "snapshot":
+            continue
+        collector = get_section_collector(section.id)
+        if collector is None:
+            continue
+        try:
+            raw = str(collector() or "").strip()
+        except Exception as exc:
+            diagnostics.append(f"{section.id}: collector_error:{type(exc).__name__}")
+            continue
+        if not raw or raw.startswith("天气查询失败"):
+            diagnostics.append(f"{section.id}: collector_empty")
+            continue
+        sections[section.id] = f"【{section.title}】\n{raw}"
+    return sections
+
+
+def _record_selected_events(current_state, selected, now):
     for event in selected:
         previous = current_state["events"].get(event.event_id, {})
         current_state["events"][event.event_id] = {
@@ -154,6 +223,103 @@ def build_report(candidates, *, now=None, state=None, per_category=4, cooldown_d
             "sources": sorted({item.domain for item in event.sources if item.domain}),
             "heat_score": event.heat_score,
         }
+
+
+def build_report(
+    candidates,
+    *,
+    now=None,
+    state=None,
+    per_category=None,
+    cooldown_days=None,
+    timezone_name="Asia/Shanghai",
+    section_specs=None,
+    legacy_report_text="",
+    preserved_sections=None,
+):
+    """Cluster, select, render, and return a serializable report result.
+
+    ``section_specs`` enables the full report registry. Leaving it unset keeps
+    the original three-category API and output contract for older callers.
+    """
+    now = now or datetime.now(timezone.utc)
+    default_per_category = 4 if per_category is None else int(per_category)
+    default_cooldown_days = 14 if cooldown_days is None else int(cooldown_days)
+    resolved_specs = None
+    if section_specs is not None:
+        resolved_specs = resolve_sections(getattr(item, "id", item) for item in section_specs)
+    retention_days = default_cooldown_days
+    if resolved_specs:
+        retention_days = max(
+            retention_days,
+            *(int(section.cooldown_days) for section in resolved_specs if section.kind == "event"),
+        )
+    current_state = dict(state or {})
+    current_state["schema_version"] = 1
+    current_state["events"] = dict(current_state.get("events") or {})
+    _prune_state(current_state, now, max(retention_days, 14))
+
+    if section_specs is not None:
+        specs = resolved_specs
+        selected = []
+        repeated_sections = set()
+        suppressed_sections = set()
+        all_events = []
+        for section in specs:
+            if section.kind != "event":
+                continue
+            section_candidates = [item for item in candidates if item.category == section.id]
+            events = cluster_candidates(section_candidates)
+            all_events.extend(events)
+            chosen = select_events(
+                events,
+                current_state,
+                now=now,
+                per_category=default_per_category if per_category is not None else section.items,
+                cooldown_days=default_cooldown_days if cooldown_days is not None else section.cooldown_days,
+                strict_category=True,
+            )
+            selected.extend(chosen)
+            if section_candidates and not chosen:
+                suppressed_sections.add(section.id)
+                if _has_fresh_event(events, now):
+                    repeated_sections.add(section.id)
+        _record_selected_events(current_state, selected, now)
+        preserved = dict(
+            split_external_sections(legacy_report_text, specs)
+            if preserved_sections is None else preserved_sections
+        )
+        report_text = render_daily_report(
+            selected,
+            now,
+            timezone_name=timezone_name,
+            section_specs=specs,
+            preserved_sections=preserved,
+            repeated_sections=repeated_sections,
+            suppressed_sections=suppressed_sections,
+        )
+        return {
+            "generated_at": now.isoformat(),
+            "selected": selected,
+            "events": all_events,
+            "state": current_state,
+            "report_text": report_text,
+            "diagnostics": [],
+            "sections": [section.id for section in specs],
+            "preserved_sections": sorted(preserved),
+            "repeated_sections": sorted(repeated_sections),
+            "suppressed_sections": sorted(suppressed_sections),
+        }
+
+    events = cluster_candidates(candidates)
+    selected = select_events(
+        events,
+        current_state,
+        now=now,
+        per_category=default_per_category,
+        cooldown_days=default_cooldown_days,
+    )
+    _record_selected_events(current_state, selected, now)
     return {
         "generated_at": now.isoformat(),
         "selected": selected,
@@ -173,6 +339,10 @@ def write_report_files(result, *, report_file, json_file, state_file, status_fil
         "schema_version": 1,
         "generated_at": result["generated_at"],
         "events": [_serialize_event(event) for event in result["selected"]],
+        "sections": list(result.get("sections") or []),
+        "preserved_sections": list(result.get("preserved_sections") or []),
+        "repeated_sections": list(result.get("repeated_sections") or []),
+        "suppressed_sections": list(result.get("suppressed_sections") or []),
         "diagnostics": list(result.get("diagnostics") or []),
     }
     atomic_write_json(json_file, payload)
@@ -184,6 +354,9 @@ def write_report_files(result, *, report_file, json_file, state_file, status_fil
             "status": "fresh",
             "generated_at": result["generated_at"],
             "event_count": len(result["selected"]),
+            "sections": list(result.get("sections") or []),
+            "repeated_sections": list(result.get("repeated_sections") or []),
+            "suppressed_sections": list(result.get("suppressed_sections") or []),
             "diagnostics": list(result.get("diagnostics") or []),
         })
 
@@ -197,8 +370,24 @@ def main(argv=None) -> int:
     config = importlib.import_module("tg_bot.config")
     load_daily_report_state = importlib.import_module("tg_bot.storage").load_daily_report_state
 
-    candidates, diagnostics = collect_candidates(config.DAILY_REPORT_CATEGORIES)
-    if not candidates:
+    section_specs = resolve_sections(config.DAILY_REPORT_SECTIONS)
+    if not config.DAILY_REPORT_SECTIONS_EXPLICIT and config.DAILY_REPORT_CATEGORIES_EXPLICIT:
+        legacy_categories = set(config.DAILY_REPORT_CATEGORIES)
+        section_specs = tuple(
+            section for section in section_specs
+            if section.kind == "snapshot" or section.id in legacy_categories
+        )
+    section_specs = tuple(
+        replace(
+            section,
+            items=config.DAILY_REPORT_ITEMS_PER_SECTION,
+            cooldown_days=config.DAILY_REPORT_EVENT_COOLDOWN_DAYS,
+        )
+        for section in section_specs
+    )
+    event_sections = [section.id for section in section_specs if section.kind == "event"]
+    candidates, diagnostics = collect_candidates(event_sections)
+    if not candidates and _has_provider_failure(diagnostics):
         from tg_bot.file_io import atomic_write_json
         for item in diagnostics:
             print(f"ERROR {item}", file=sys.stderr)
@@ -215,12 +404,18 @@ def main(argv=None) -> int:
         print("ERROR daily_report_no_candidates: previous report was kept", file=sys.stderr)
         return 1
 
+    legacy_report_text = load_legacy_report(config.REPORT_FILE)
+    register_builtin_snapshot_collectors(config.DAILY_REPORT_NATIVE_SNAPSHOTS)
+    snapshot_diagnostics = []
+    preserved_sections = collect_snapshot_sections(section_specs, legacy_report_text, snapshot_diagnostics)
+    diagnostics.extend(snapshot_diagnostics)
     result = build_report(
         candidates,
         state=load_daily_report_state(config.DAILY_REPORT_STATE_FILE),
-        per_category=config.DAILY_REPORT_ITEMS_PER_CATEGORY,
-        cooldown_days=config.DAILY_REPORT_COOLDOWN_DAYS,
         timezone_name=config.DAILY_REPORT_TIMEZONE,
+        section_specs=section_specs,
+        legacy_report_text=legacy_report_text,
+        preserved_sections=preserved_sections,
     )
     result["diagnostics"] = diagnostics
     if args.dry_run:

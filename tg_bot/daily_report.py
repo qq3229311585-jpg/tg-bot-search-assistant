@@ -30,6 +30,11 @@ _CATEGORY_LABELS = {
     "china": "中国要闻",
     "global": "全球要闻",
     "ai_tech": "AI / 技术",
+    "proxy": "代理圈动态",
+    "hackernews": "圈子热议",
+    "github": "GitHub 热榜",
+    "steam": "Steam 优惠",
+    "cold_knowledge": "今日冷知识",
 }
 
 
@@ -307,9 +312,13 @@ def _is_material_update(event: ReportEvent, previous: Mapping[str, object], now:
     )
 
 
-def _find_history_match(event: ReportEvent, history_events: Mapping[str, object]):
+def _find_history_match(event: ReportEvent, history_events: Mapping[str, object], *, strict_category: bool = False):
     """Match rewritten headlines to a prior event before applying cooldown."""
     direct = history_events.get(event.event_id)
+    if strict_category and direct is not None:
+        direct_category = direct.get("category") if isinstance(direct, Mapping) else None
+        if str(direct_category or "").lower() != event.category:
+            direct = None
     if direct is not None:
         return event.event_id, direct
     best = None
@@ -320,7 +329,10 @@ def _find_history_match(event: ReportEvent, history_events: Mapping[str, object]
     for event_id, previous in history_events.items():
         if not isinstance(previous, Mapping):
             continue
-        category = str(previous.get("category") or event.category).lower()
+        raw_category = previous.get("category")
+        if strict_category and not raw_category:
+            continue
+        category = str(raw_category or event.category).lower()
         if category != event.category:
             continue
         old_tokens = _title_tokens(str(previous.get("title") or ""))
@@ -338,6 +350,7 @@ def select_events(
     now: datetime | None = None,
     per_category: int = 4,
     cooldown_days: int = 14,
+    strict_category: bool = False,
 ) -> list[ReportEvent]:
     now = now or datetime.now(timezone.utc)
     history_events = (history or {}).get("events", {}) or {}
@@ -347,7 +360,9 @@ def select_events(
         if freshness <= 0:
             continue
         score, basis = score_event(event, now)
-        matched_id, previous = _find_history_match(event, history_events)
+        matched_id, previous = _find_history_match(
+            event, history_events, strict_category=strict_category
+        )
         status = "new"
         if previous:
             last = _parse_datetime(previous.get("last_published"))
@@ -387,10 +402,64 @@ def _report_zone(timezone_name: str):
         return timezone(timedelta(hours=8))
 
 
-def render_daily_report(events: Iterable[ReportEvent], generated_at: datetime, timezone_name: str = "Asia/Shanghai") -> str:
+def render_daily_report(
+    events: Iterable[ReportEvent],
+    generated_at: datetime,
+    timezone_name: str = "Asia/Shanghai",
+    *,
+    section_specs: Iterable[object] | None = None,
+    preserved_sections: Mapping[str, str] | None = None,
+    repeated_sections: Iterable[str] | None = None,
+    suppressed_sections: Iterable[str] | None = None,
+) -> str:
+    """Render the report, optionally using the full legacy section registry.
+
+    The original three-category renderer remains the default for callers that
+    do not pass ``section_specs``. Sectioned mode keeps snapshot/external text,
+    renders fresh event candidates, and emits a clear placeholder when a
+    section had candidates but all were suppressed by cooldown.
+    """
     rows = list(events)
     stamp = generated_at.astimezone(_report_zone(timezone_name)).strftime("%Y-%m-%d %H:%M")
     lines = [f"📰 今日热点日报 · {stamp}", ""]
+    if section_specs is not None:
+        specs = tuple(section_specs)
+        preserved = dict(preserved_sections or {})
+        repeated = set(repeated_sections or ())
+        suppressed = set(suppressed_sections or ())
+        buckets: dict[str, list[ReportEvent]] = {}
+        for event in rows:
+            buckets.setdefault(event.category, []).append(event)
+        index = 1
+        for section in specs:
+            section_id = getattr(section, "id", "")
+            section_kind = getattr(section, "kind", "event")
+            matched = buckets.get(section_id, [])
+            if matched:
+                lines.extend((f"【{getattr(section, 'title', _CATEGORY_LABELS.get(section_id, section_id))}】", ""))
+                for event in matched:
+                    status = "（更新）" if event.status == "update" else ""
+                    lines.append(f"{index}. {event.title}{status}")
+                    lines.append(f"   发生了什么：{event.summary or '来源尚未提供足够摘要。'}")
+                    lines.append(f"   热度：{event.heat_score:.2f}/100（{'；'.join(event.heat_basis)}）")
+                    source_lines = [f"{source.domain} — {source.url}" for source in event.sources[:3]]
+                    lines.append(f"   来源：{'；'.join(source_lines)}")
+                    lines.append("")
+                    index += 1
+                continue
+            if section_id in suppressed:
+                empty = "今日没有新的高价值事件，已跳过重复内容。" if section_id in repeated else "今日暂无可验证的新内容。"
+                lines.extend((f"【{getattr(section, 'title', _CATEGORY_LABELS.get(section_id, section_id))}】", "", empty, ""))
+                continue
+            if section_id in preserved:
+                lines.extend((preserved[section_id], ""))
+                continue
+            if section_kind == "snapshot":
+                empty = "今日快照采集器暂未提供数据。"
+            else:
+                empty = "今日暂无可验证的新内容。"
+            lines.extend((f"【{getattr(section, 'title', _CATEGORY_LABELS.get(section_id, section_id))}】", "", empty, ""))
+        return "\n".join(lines).rstrip()
     if not rows:
         return "\n".join(lines + ["今日新鲜事件不足，暂不填充旧闻。"])
     current = None

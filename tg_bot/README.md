@@ -29,6 +29,7 @@
 │   ├── fetch.py               # 抓取工具：Jina Reader 抓正文
 │   ├── native.py              # 原生工具：天气、VPS 流量、GitHub Trending
 │   └── definitions.py        # 工具 JSON Schema 定义（TOOLS 列表，传给 DeepSeek）
+├── report_sections.py         # 日报板块注册表、legacy 解析和采集器接口
 └── commands/
     ├── control.py             # 控制命令：/restart /clear 等
     ├── info.py                # 信息命令：/status /quota /diary /thinking 等
@@ -97,7 +98,11 @@ SERPER_KEY_1=...             # 可选
 
 # 运行目录和 HTTP API
 TG_BOT_DATA_DIR=/var/lib/morning-report
+DAILY_REPORT_SECTIONS=weather,exchange,market,china,global,ai_tech,proxy,hackernews,github,steam,cold_knowledge
 DAILY_REPORT_CATEGORIES=china,global,ai_tech
+DAILY_REPORT_ITEMS_PER_SECTION=4
+DAILY_REPORT_EVENT_COOLDOWN_DAYS=14
+DAILY_REPORT_NATIVE_SNAPSHOTS=true
 DAILY_REPORT_ITEMS_PER_CATEGORY=4
 DAILY_REPORT_COOLDOWN_DAYS=14
 DAILY_REPORT_TIMEZONE=Asia/Shanghai
@@ -252,7 +257,8 @@ curl -X POST http://127.0.0.1:7799/v1/ask \
 
 以下覆盖写文件已走原子写：`chat_history.json`、`chat_summary.json`、`context_summary.json`、`thinking.json`、`tool_log.json`、`api_quota.json`、`api_limits.json`、`tg_offset.txt`、`ask_api_token`、`daily_report.json`、`daily_report_state.json`、`daily_report_status.json`、`today_report.txt`、`sources/*/*.json`、`sources/*/index.json`。
 
-日报生成由 `scripts/build-daily-report.py` 完成。它按 `DAILY_REPORT_CATEGORIES` 调用新闻搜索，生成事件级 JSON 和兼容的 `today_report.txt`；所有供应商失败时不会覆盖上一份有效日报。
+日报生成由 `scripts/build-daily-report.py` 完成。它按 `DAILY_REPORT_SECTIONS` 调用事件板块搜索，快照和未接入采集器的旧板块从现有 `today_report.txt` 兼容保留，生成带板块元数据的事件级 JSON 和新的 `today_report.txt`。事件板块各自冷却，重复候选会被跳过；所有供应商失败时不会覆盖上一份有效日报。
+旧环境若只设置 `DAILY_REPORT_CATEGORIES` 会自动兼容为对应事件子集；新部署建议显式设置 `DAILY_REPORT_SECTIONS`。
 
 这样在服务重启、进程异常或 VPS 瞬断时，上述文件不会留下半截 JSON/文本；最坏情况是保留旧版本。`daily_logs/*.jsonl` 和 `worklog/*.jsonl` 属于追加日志，仍保持逐行 append。
 

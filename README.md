@@ -82,6 +82,8 @@ tg_bot/
   ask_server.py           # HTTP /ask 接口
   search_policy.py        # 代码级搜索策略
   prompts.py              # 各 AI 的系统提示词
+  report_sections.py      # 日报板块注册表与可插拔采集器接口
+  daily_report.py         # 日报事件指纹、热度与冷却选择
 
   agents/
     query_fixer.py        # 查询改写
@@ -175,7 +177,11 @@ ASK_API_TRUST_PROXY=false      # 仅在可信反向代理后开启
 日报控制项：
 
 ```bash
+DAILY_REPORT_SECTIONS=weather,exchange,market,china,global,ai_tech,proxy,hackernews,github,steam,cold_knowledge
 DAILY_REPORT_CATEGORIES=china,global,ai_tech
+DAILY_REPORT_ITEMS_PER_SECTION=4
+DAILY_REPORT_EVENT_COOLDOWN_DAYS=14
+DAILY_REPORT_NATIVE_SNAPSHOTS=true
 DAILY_REPORT_ITEMS_PER_CATEGORY=4
 DAILY_REPORT_COOLDOWN_DAYS=14
 DAILY_REPORT_TIMEZONE=Asia/Shanghai
@@ -183,7 +189,9 @@ DAILY_REPORT_STATE_FILE=/var/lib/morning-report/daily_report_state.json
 DAILY_REPORT_STATUS_FILE=/var/lib/morning-report/daily_report_status.json
 ```
 
-日报先按事件指纹合并不同媒体报道，再按新鲜度、独立来源覆盖、权威性和相关性排序；没有真实互动字段时只显示“多源关注”，不会把搜索排名冒充为全网热度。相同事件在 14 天内不会重复出现，超过 24 小时的旧闻不会重新填充，除非出现至少间隔 24 小时的官方或关键事实更新。所有供应商失败时保留旧日报，并在 `daily_report_status.json` 写入 `stale_previous`。
+日报按注册表保留天气、汇率、行情、中国/全球/AI、代理工具、Hacker News、GitHub、Steam 优惠和冷知识等板块。天气/汇率/行情属于每天刷新的快照；其余事件板块各自按事件指纹和 14 天冷却轮换，因此相近板块可以出现同一事件，但同一板块不会每天重复。事件优先按新鲜度、独立来源覆盖、权威性和相关性排序；没有真实互动字段时只显示“多源关注”，不会把搜索排名冒充为全网热度。若事件候选存在但都在冷却期，板块会保留并明确标记已跳过重复；如果专用采集器暂不可用，则兼容保留旧 `today_report.txt` 板块。所有供应商失败时保留旧日报，并在 `daily_report_status.json` 写入 `stale_previous`。
+
+旧部署若只配置 `DAILY_REPORT_CATEGORIES` 仍可继续运行；要启用全部板块和 Steam/代理等新事件搜索，请迁移到 `DAILY_REPORT_SECTIONS`。
 
 ## 启动
 

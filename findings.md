@@ -27,3 +27,9 @@
 
 - `http_post`、`send`、`atomic_write_json` 是高扇入热点；变更日报/回复时优先复用现有存储和发送边界。
 - 知识图谱项目已索引：728 nodes / 2540 edges，状态 ready。
+
+## 板块保留与轮换补充发现
+
+- `scripts/build-daily-report.py` 当前只查询 `china`、`global`、`ai_tech` 三个类别，并会重新写完整 `today_report.txt`；因此直接扩展类别会丢掉原有天气、汇率、行情、代理、Hacker News、GitHub、冷知识等外部板块。
+- 仓库内已有 `execute_weather` 和 `execute_github_trending` 原生工具，但没有 Steam、代理更新、Hacker News、汇率或行情的专用日报采集器；这些板块原本依赖外部写入的 `today_report.txt`。
+- 采用板块注册表：快照板块不应用事件冷却，事件板块按自身 section id + 事件指纹保存历史。新采集候选为空时保留旧板块文本；候选存在但全部因冷却被过滤时只保留板块标题并明确跳过重复内容。

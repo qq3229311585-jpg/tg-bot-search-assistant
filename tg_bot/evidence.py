@@ -137,10 +137,12 @@ def _report_section_summary(report):
         ("天气预报", r"(天气预报|天气)"),
         ("汇率", r"(汇率|USD/CNY|美元|人民币)"),
         ("行情速览", r"(行情速览|BTC|ETH|比特币|以太坊)"),
+        ("中国/全球要闻", r"(中国要闻|全球要闻|重大新闻|今日要闻)"),
         ("AI 速报", r"(AI速报|AI 速报|人工智能速报|人工智能)"),
         ("代理圈动态", r"(代理圈动态|sing-box|Xray|代理)"),
         ("圈子热议", r"(圈子在聊|圈子热议|HackerNews|HN)"),
         ("GitHub 热榜", r"(GitHub热榜|GitHub 热榜|star|仓库)"),
+        ("Steam 降价优惠", r"(Steam 降价优惠|Steam优惠|Steam折扣|Steam)"),
         ("今日冷知识", r"(今日冷知识|冷知识)"),
     ]
     lines = [l.strip() for l in (report or "").splitlines() if l.strip()]

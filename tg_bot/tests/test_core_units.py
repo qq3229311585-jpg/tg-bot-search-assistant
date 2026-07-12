@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import contextlib
+from dataclasses import replace
 import http.client
 import importlib
 import json
@@ -842,6 +843,193 @@ class DailyReportTests(unittest.TestCase):
         self.assertEqual(sum(event.category == "global" for event in selected), 2)
         self.assertLessEqual(sum(event.sources[0].domain == "reuters.com" for event in selected), 2)
 
+    def test_report_section_registry_keeps_legacy_and_steam_sections(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        ids = {item.id for item in sections.DEFAULT_REPORT_SECTIONS}
+        self.assertTrue({
+            "weather", "exchange", "market", "ai_tech", "proxy",
+            "hackernews", "github", "steam", "cold_knowledge",
+        }.issubset(ids))
+        self.assertEqual(sections.section_spec("weather").kind, "snapshot")
+        self.assertEqual(sections.section_spec("steam").kind, "event")
+
+        def fake_collector(*_args, **_kwargs):
+            return "ok"
+
+        sections.register_section_collector("steam", fake_collector)
+        self.assertIs(sections.get_section_collector("steam"), fake_collector)
+
+    def test_same_event_is_cooldown_scoped_to_each_section(self):
+        first_ai = self._candidate("A new proxy tool release", category="ai_tech")
+        first_proxy = self._candidate("A new proxy tool release", category="proxy")
+        events = self.daily.cluster_candidates([first_ai, first_proxy])
+        selected = self.daily.select_events(
+            events, {"events": {}}, now=self.now, per_category=1
+        )
+        self.assertEqual({event.category for event in selected}, {"ai_tech", "proxy"})
+
+    def test_sectioned_report_skips_repeated_event_but_keeps_heading(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_sections", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        candidate = module.NewsCandidate(
+            category="steam",
+            title="Steam discount event",
+            summary="A game is discounted.",
+            url="https://store.steampowered.com/app/1",
+            domain="steampowered.com",
+            published_at="2026-07-12T11:00:00+00:00",
+            relevance=0.9,
+            source="fixture",
+        )
+        first = module.build_report(
+            [candidate], now=self.now, state={"schema_version": 1, "events": {}},
+            section_specs=module.DEFAULT_REPORT_SECTIONS,
+        )
+        updated = module.NewsCandidate(
+            category=candidate.category, title=candidate.title, summary=candidate.summary,
+            url=candidate.url, domain=candidate.domain,
+            published_at=(self.now + module.timedelta(days=1, hours=-2)).isoformat(),
+            relevance=candidate.relevance, source=candidate.source,
+        )
+        self.assertIn("Steam", first["report_text"])
+        second = module.build_report(
+            [updated], now=self.now + module.timedelta(days=1), state=first["state"],
+            section_specs=module.DEFAULT_REPORT_SECTIONS,
+        )
+        self.assertIn("Steam", second["report_text"])
+        self.assertIn("跳过重复", second["report_text"])
+        self.assertNotIn("1. Steam discount event", second["report_text"])
+
+    def test_repeated_event_does_not_restore_stale_external_section(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_repeated_external", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        candidate = module.NewsCandidate(
+            category="steam", title="Steam discount event", summary="A game is discounted.",
+            url="https://store.steampowered.com/app/1", domain="steampowered.com",
+            published_at="2026-07-12T11:00:00+00:00", relevance=0.9, source="fixture",
+        )
+        first = module.build_report(
+            [candidate], now=self.now, state={"schema_version": 1, "events": {}},
+            section_specs=module.DEFAULT_REPORT_SECTIONS,
+        )
+        legacy = "【Steam 优惠】\n昨日重复内容\n"
+        updated = module.NewsCandidate(
+            category=candidate.category, title=candidate.title, summary=candidate.summary,
+            url=candidate.url, domain=candidate.domain,
+            published_at=(self.now + module.timedelta(days=1, hours=-2)).isoformat(),
+            relevance=candidate.relevance, source=candidate.source,
+        )
+        second = module.build_report(
+            [updated], now=self.now + module.timedelta(days=1), state=first["state"],
+            section_specs=module.DEFAULT_REPORT_SECTIONS, legacy_report_text=legacy,
+        )
+        self.assertIn("跳过重复", second["report_text"])
+        self.assertNotIn("昨日重复内容", second["report_text"])
+
+    def test_stale_event_is_not_described_as_duplicate(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_stale_event", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        candidate = module.NewsCandidate(
+            category="steam", title="Old Steam event", summary="old", url="https://store.steampowered.com/app/2",
+            domain="steampowered.com", published_at="2026-07-10T11:00:00+00:00", relevance=0.9,
+            source="fixture",
+        )
+        result = module.build_report(
+            [candidate], now=self.now, state={"schema_version": 1, "events": {}},
+            section_specs=module.DEFAULT_REPORT_SECTIONS,
+            legacy_report_text="【Steam 降价优惠】\n昨日旧活动",
+        )
+        self.assertIn("今日暂无可验证的新内容", result["report_text"])
+        self.assertNotIn("跳过重复", result["report_text"])
+        self.assertNotIn("昨日旧活动", result["report_text"])
+
+    def test_external_sections_are_preserved_when_no_new_candidates(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_external_sections", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        candidate = module.NewsCandidate(
+            category="ai_tech",
+            title="Fresh AI event",
+            summary="A fresh event.",
+            url="https://openai.com/news/fresh",
+            domain="openai.com",
+            published_at="2026-07-12T11:00:00+00:00",
+            relevance=0.9,
+            source="fixture",
+        )
+        legacy = "【天气预报】\n安阳 25°C\n\n【代理圈动态】\nsing-box 更新\n"
+        result = module.build_report(
+            [candidate], now=self.now, state={"schema_version": 1, "events": {}},
+            section_specs=module.DEFAULT_REPORT_SECTIONS, legacy_report_text=legacy,
+        )
+        self.assertIn("安阳 25°C", result["report_text"])
+        self.assertIn("sing-box 更新", result["report_text"])
+
+    def test_legacy_circle_heading_starts_a_new_hackernews_section(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        legacy = "🛠 GitHub 热榜\n仓库正文\n\n🔒 代理圈动态\n代理正文\n\n🗣️ 圈子在聊\nHN 正文"
+        found = sections.split_external_sections(legacy)
+        self.assertEqual(found["proxy"], "🔒 代理圈动态\n代理正文")
+        self.assertEqual(found["hackernews"], "🗣️ 圈子在聊\nHN 正文")
+
+    def test_daily_report_query_registry_covers_event_sections(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_queries", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for section_id in ("ai_tech", "proxy", "hackernews", "github", "steam", "cold_knowledge"):
+            self.assertTrue(module._CATEGORY_QUERIES[section_id])
+
+    def test_strict_section_history_does_not_cross_match_missing_category(self):
+        event = self.daily.cluster_candidates([
+            self._candidate("Proxy tool release", category="proxy", domain="example.com"),
+        ])[0]
+        history = {"events": {"old": {
+            "last_published": "2026-07-02T13:00:00+00:00",
+            "title": event.title,
+            # Missing category is a malformed/legacy record.
+        }}}
+        selected = self.daily.select_events(
+            [event], history, now=self.now, per_category=4, strict_category=True
+        )
+        self.assertEqual(len(selected), 1)
+
+    def test_snapshot_collector_can_override_legacy_section(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_snapshot_adapter", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.register_section_collector("weather", lambda: "安阳当前 26°C")
+        diagnostics = []
+        sections = module.collect_snapshot_sections(
+            module.DEFAULT_REPORT_SECTIONS,
+            "【天气预报】\n昨日 20°C",
+            diagnostics,
+        )
+        self.assertIn("安阳当前 26°C", sections["weather"])
+        self.assertEqual(diagnostics, [])
+
+    def test_section_cooldown_controls_state_retention(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        steam = replace(sections.section_spec("steam"), cooldown_days=30)
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_retention", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        result = module.build_report(
+            [], now=self.now, state={"schema_version": 1, "events": {
+                "old": {"last_published": "2026-06-30T13:00:00+00:00"},
+            }}, section_specs=[steam],
+        )
+        self.assertIn("old", result["state"]["events"])
+
 
 class DailyReportStorageTests(unittest.TestCase):
     def _reload_storage(self, data_dir):
@@ -961,6 +1149,30 @@ class DailyReportStorageTests(unittest.TestCase):
                 with patch.object(module, "collect_candidates", return_value=([], ["global: provider_error:TimeoutError"])):
                     self.assertEqual(module.main(["--dry-run"]), 1)
                 self.assertFalse(os.path.exists(os.path.join(data_dir, "daily_report_status.json")))
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_empty_event_candidates_still_render_snapshot_sections(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-empty-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config"):
+                    sys.modules.pop(module_name, None)
+                script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+                spec = importlib.util.spec_from_file_location("build_daily_report_empty", script_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                with patch.object(module, "collect_candidates", return_value=([], ["global: no_candidates"])):
+                    self.assertEqual(module.main([]), 0)
+                with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
+                    status = json.load(handle)
+                self.assertEqual(status["status"], "fresh")
+                with open(os.path.join(data_dir, "today_report.txt"), encoding="utf-8") as handle:
+                    report = handle.read()
+                self.assertIn("【天气预报】", report)
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 

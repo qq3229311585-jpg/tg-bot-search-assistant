@@ -5,6 +5,7 @@ import json, os, ssl
 from tg_bot.file_io import atomic_write_json
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from tg_bot.report_sections import DEFAULT_REPORT_SECTION_IDS, SUPPORTED_REPORT_SECTION_IDS
 
 def _require(key):
     v = os.getenv(key)
@@ -121,12 +122,26 @@ DAILY_REPORT_CATEGORIES = _parse_csv_env(
     ("china", "global", "ai_tech"),
     {"china", "global", "ai_tech"},
 )
+DAILY_REPORT_CATEGORIES_EXPLICIT = "DAILY_REPORT_CATEGORIES" in os.environ
+DAILY_REPORT_SECTIONS = _parse_csv_env(
+    "DAILY_REPORT_SECTIONS",
+    DEFAULT_REPORT_SECTION_IDS,
+    SUPPORTED_REPORT_SECTION_IDS,
+)
+DAILY_REPORT_SECTIONS_EXPLICIT = "DAILY_REPORT_SECTIONS" in os.environ
 DAILY_REPORT_ITEMS_PER_CATEGORY = _parse_int_env(
     "DAILY_REPORT_ITEMS_PER_CATEGORY", 4, minimum=1, maximum=10
 )
 DAILY_REPORT_COOLDOWN_DAYS = _parse_int_env(
     "DAILY_REPORT_COOLDOWN_DAYS", 14, minimum=1, maximum=60
 )
+DAILY_REPORT_ITEMS_PER_SECTION = _parse_int_env(
+    "DAILY_REPORT_ITEMS_PER_SECTION", DAILY_REPORT_ITEMS_PER_CATEGORY, minimum=1, maximum=10
+)
+DAILY_REPORT_EVENT_COOLDOWN_DAYS = _parse_int_env(
+    "DAILY_REPORT_EVENT_COOLDOWN_DAYS", DAILY_REPORT_COOLDOWN_DAYS, minimum=1, maximum=60
+)
+DAILY_REPORT_NATIVE_SNAPSHOTS = _env_bool("DAILY_REPORT_NATIVE_SNAPSHOTS", True)
 DAILY_REPORT_TIMEZONE = os.getenv("DAILY_REPORT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
 try:
     ZoneInfo(DAILY_REPORT_TIMEZONE)

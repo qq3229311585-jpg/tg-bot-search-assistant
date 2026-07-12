@@ -6,7 +6,7 @@
 
 把现有 Telegram 回复升级为稳定、清晰、可追溯的输出；把日报从“读取外部单份文本”升级为可生成、可去重、可解释排序的事件报告。
 
-默认日报范围为中国要闻、全球要闻、AI/技术；每天北京时间 13:00 生成，每栏 3–5 条。若用户通过环境变量调整范围或条数，仍受安全上限约束。
+默认日报保留天气、汇率、行情、中国/全球/AI、代理工具、Hacker News、GitHub、Steam 优惠和冷知识板块；每天北京时间 13:00 生成。天气/汇率/行情是每天刷新的快照，其余板块按独立事件指纹和冷却窗口轮换。若用户通过环境变量调整板块或条数，仍受安全上限约束。
 
 ## 当前问题
 
@@ -109,7 +109,11 @@ def render_daily_report(events, generated_at: datetime) -> str: ...
 新增配置：
 
 ```text
+DAILY_REPORT_SECTIONS=weather,exchange,market,china,global,ai_tech,proxy,hackernews,github,steam,cold_knowledge
 DAILY_REPORT_CATEGORIES=china,global,ai_tech
+DAILY_REPORT_ITEMS_PER_SECTION=4
+DAILY_REPORT_EVENT_COOLDOWN_DAYS=14
+DAILY_REPORT_NATIVE_SNAPSHOTS=true
 DAILY_REPORT_ITEMS_PER_CATEGORY=4
 DAILY_REPORT_COOLDOWN_DAYS=14
 DAILY_REPORT_TIMEZONE=Asia/Shanghai
@@ -136,7 +140,7 @@ DAILY_REPORT_STATUS_FILE=<data_dir>/daily_report_status.json
 
 `daily_report_status.json` 单独记录 `fresh` 或 `stale_previous`、生成时间、事件数量和供应商诊断；全供应商失败时不覆盖上一次 TXT/JSON，但会写入 `stale_previous`，便于监控发现日报已过期。
 
-旧 `today_report.txt` 继续作为 `/recap` 和 `read_today_report` 的兼容产物；新增 `daily_report.json` 保存机器可读候选与热度依据。状态文件采用原子写入，损坏时备份为 `.corrupt.<timestamp>` 并从空状态恢复，同时记录告警。
+旧 `today_report.txt` 继续作为 `/recap` 和 `read_today_report` 的兼容产物；板块注册表保留尚未迁移到本仓库的外部采集结果，避免新生成器覆盖天气、汇率、行情、代理、Steam 等板块。新增 `daily_report.json` 保存机器可读候选、板块列表和热度依据。状态文件采用原子写入，损坏时备份为 `.corrupt.<timestamp>` 并从空状态恢复，同时记录告警。
 
 ### E. 运行入口与失败策略
 
