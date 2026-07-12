@@ -585,6 +585,35 @@ class DisplayAndFactsTests(unittest.TestCase):
         self.assertIn("Giraffes", excerpt)
 
 
+class ReplyStructureTests(unittest.TestCase):
+    def setUp(self):
+        self.response = importlib.import_module("tg_bot.response")
+
+    def test_empty_conclusion_uses_safe_fallback(self):
+        envelope = self.response.ReplyEnvelope(conclusion="", evidence=("事实 A",))
+        text = self.response.render_reply(envelope)
+        self.assertTrue(text.startswith("目前资料不足，无法确认"))
+        self.assertIn("关键依据", text)
+
+    def test_normalize_reply_preserves_first_paragraph_as_conclusion(self):
+        envelope = self.response.normalize_reply("第一段结论。\n\n第二段事实。")
+        self.assertEqual(envelope.conclusion, "第一段结论。")
+        self.assertEqual(envelope.evidence, ("第二段事实。",))
+
+    def test_sources_are_hidden_for_answer_but_visible_for_search(self):
+        source = {"title": "来源标题", "domain": "example.com", "url": "https://example.com/a"}
+        hidden = self.response.render_reply(self.response.ReplyEnvelope("结论", sources=(source,)))
+        visible = self.response.render_reply(self.response.ReplyEnvelope("结论", sources=(source,), mode="search"))
+        self.assertNotIn("example.com", hidden)
+        self.assertIn("example.com", visible)
+
+    def test_render_reply_does_not_emit_reasoning_and_respects_limit(self):
+        envelope = self.response.ReplyEnvelope("结论", evidence=("x" * 2000,), actions=("下一步",))
+        text = self.response.render_reply(envelope, max_chars=240)
+        self.assertLessEqual(len(text), 240)
+        self.assertNotIn("reasoning", text.lower())
+
+
 class GatherToolWorkerTests(unittest.TestCase):
     def test_parse_search_entries(self):
         seq = iter(["R001"])
