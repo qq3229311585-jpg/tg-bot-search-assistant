@@ -9,7 +9,7 @@ import json
 import os
 import re
 import sys
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -120,8 +120,10 @@ def _prune_state(state, now, retention_days):
     cutoff = now.astimezone(timezone.utc) - timedelta(days=max(1, int(retention_days)))
     kept = {}
     for event_id, record in state.get("events", {}).items():
-        last = _parse_timestamp((record or {}).get("last_published"))
-        if last is None or last.astimezone(timezone.utc) >= cutoff:
+        if not isinstance(record, Mapping):
+            continue
+        last = _parse_timestamp(record.get("last_published"))
+        if last is not None and last.astimezone(timezone.utc) >= cutoff:
             kept[event_id] = record
     state["events"] = kept
 
@@ -200,15 +202,16 @@ def main(argv=None) -> int:
         from tg_bot.file_io import atomic_write_json
         for item in diagnostics:
             print(f"ERROR {item}", file=sys.stderr)
-        try:
-            atomic_write_json(config.DAILY_REPORT_STATUS_FILE, {
-                "schema_version": 1,
-                "status": "stale_previous",
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "diagnostics": diagnostics,
-            })
-        except Exception as exc:
-            print(f"ERROR daily_report_status_write: {type(exc).__name__}", file=sys.stderr)
+        if not args.dry_run:
+            try:
+                atomic_write_json(config.DAILY_REPORT_STATUS_FILE, {
+                    "schema_version": 1,
+                    "status": "stale_previous",
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "diagnostics": diagnostics,
+                })
+            except Exception as exc:
+                print(f"ERROR daily_report_status_write: {type(exc).__name__}", file=sys.stderr)
         print("ERROR daily_report_no_candidates: previous report was kept", file=sys.stderr)
         return 1
 

@@ -161,6 +161,33 @@ class SearchProviderTests(unittest.TestCase):
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
+    def test_structured_news_candidates_rotates_serper_keys(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-search-serper-")
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=data_dir, TAVILY_KEY_0=None, SERPER_KEY_0="k1", SERPER_KEY_1="k2")):
+                reload_config()
+                sys.modules.pop("tg_bot.storage", None)
+                sys.modules.pop("tg_bot.tools.search", None)
+                search = importlib.import_module("tg_bot.tools.search")
+                cfg = importlib.import_module("tg_bot.config")
+                search.BRAVE_KEY = ""
+                search.TAVILY_KEYS = []
+
+                class FakeResponse:
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *_args):
+                        return False
+                    def read(self):
+                        return json.dumps({"news": [{"title": "Serper event", "link": "https://example.com/1", "date": "1 hour ago"}]}).encode()
+
+                with patch.object(search, "urlopen", side_effect=[OSError("first key"), FakeResponse()]):
+                    items, diagnostics = search.execute_news_candidates("event")
+                self.assertEqual(items[0]["source"], "serper")
+                self.assertEqual(cfg._serper_idx, 1)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
 
 class TokenTests(unittest.TestCase):
     def test_existing_token_file_is_tightened_to_private_mode(self):
@@ -881,6 +908,24 @@ class DailyReportStorageTests(unittest.TestCase):
         result = module.build_report([], now=now, state=state)
         self.assertNotIn("old", result["state"]["events"])
 
+    def test_build_report_discards_invalid_state_records(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_invalid_state", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        now = module.datetime(2026, 7, 12, 13, 0, tzinfo=module.timezone.utc)
+        result = module.build_report([], now=now, state={"schema_version": 1, "events": {"bad": "corrupt"}})
+        self.assertNotIn("bad", result["state"]["events"])
+
+    def test_build_report_discards_state_without_publish_timestamp(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_missing_timestamp", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        now = module.datetime(2026, 7, 12, 13, 0, tzinfo=module.timezone.utc)
+        result = module.build_report([], now=now, state={"schema_version": 1, "events": {"missing": {"title": "old"}}})
+        self.assertNotIn("missing", result["state"]["events"])
+
     def test_main_provider_failure_keeps_previous_report(self):
         data_dir = tempfile.mkdtemp(prefix="tg-bot-report-cli-")
         try:
@@ -900,6 +945,22 @@ class DailyReportStorageTests(unittest.TestCase):
                     self.assertEqual(handle.read(), "previous report")
                 with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
                     self.assertEqual(json.load(handle)["status"], "stale_previous")
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_dry_run_does_not_write_status_when_no_candidates(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-dry-run-")
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=data_dir)):
+                for module_name in ("tg_bot.storage", "tg_bot.config"):
+                    sys.modules.pop(module_name, None)
+                script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+                spec = importlib.util.spec_from_file_location("build_daily_report_dry_run", script_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                with patch.object(module, "collect_candidates", return_value=([], ["global: provider_error:TimeoutError"])):
+                    self.assertEqual(module.main(["--dry-run"]), 1)
+                self.assertFalse(os.path.exists(os.path.join(data_dir, "daily_report_status.json")))
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 

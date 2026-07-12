@@ -209,31 +209,36 @@ def execute_news_candidates(query):
     else:
         diagnostics.append("tavily: unavailable")
 
-    if SERPER_KEY:
-        try:
-            endpoint = "https://google.serper.dev/news"
-            body = json.dumps({"q": query, "num": 8}).encode()
-            req = Request(endpoint, data=body, headers={"Content-Type": "application/json", "X-API-KEY": SERPER_KEY})
-            with urlopen(req, context=_ctx, timeout=15) as response:
-                data = json.loads(response.read())
-            items = data.get("news", [])
-            if items:
-                inc_quota("serper")
-                return [
-                    {
-                        "title": item.get("title", ""),
-                        "summary": item.get("snippet", ""),
-                        "url": item.get("link", ""),
-                        "published_at": item.get("date"),
-                        "relevance": item.get("score"),
-                        "source": "serper",
-                    }
-                    for item in items
-                    if item.get("title") and item.get("link")
-                ], diagnostics
-            diagnostics.append("serper: empty")
-        except Exception as exc:
-            diagnostics.append(f"serper: provider_error:{type(exc).__name__}")
+    import tg_bot.config as _cfg
+    if _cfg.SERPER_KEYS:
+        endpoint = "https://google.serper.dev/news"
+        for _attempt in range(len(_cfg.SERPER_KEYS)):
+            key = _cfg.SERPER_KEYS[_cfg._serper_idx % len(_cfg.SERPER_KEYS)]
+            try:
+                body = json.dumps({"q": query, "num": 8}).encode()
+                req = Request(endpoint, data=body, headers={"Content-Type": "application/json", "X-API-KEY": key})
+                with urlopen(req, context=_ctx, timeout=15) as response:
+                    data = json.loads(response.read())
+                items = data.get("news", [])
+                if items:
+                    inc_quota("serper")
+                    return [
+                        {
+                            "title": item.get("title", ""),
+                            "summary": item.get("snippet", ""),
+                            "url": item.get("link", ""),
+                            "published_at": item.get("date"),
+                            "relevance": item.get("score"),
+                            "source": "serper",
+                        }
+                        for item in items
+                        if item.get("title") and item.get("link")
+                    ], diagnostics
+                diagnostics.append("serper: empty")
+                break
+            except Exception as exc:
+                diagnostics.append(f"serper[{_attempt}]: provider_error:{type(exc).__name__}")
+                _cfg._next_serper_key()
     else:
         diagnostics.append("serper: unavailable")
     return [], diagnostics
