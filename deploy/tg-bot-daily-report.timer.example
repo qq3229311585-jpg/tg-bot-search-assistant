@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Telegram AI daily report at 13:00 Beijing time
+
+[Timer]
+OnCalendar=*-*-* 13:00:00 Asia/Shanghai
+Persistent=true
+Unit=tg-bot-daily-report.service
+
+[Install]
+WantedBy=timers.target

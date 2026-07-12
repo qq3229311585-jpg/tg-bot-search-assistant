@@ -71,6 +71,7 @@
 - 快速路径标记：纯模型回复可显示 `AI-no references`
 - 今日缓存和来源追问：可以回答“刚才查了吗”“用了什么来源”
 - 本地工具扩展：天气、VPS 流量、GitHub Trending、日历等
+- 稳定回复结构：结论 → 关键依据 → 下一步 → 来源；闲聊自动压缩，搜索和日报保留可追溯来源
 
 ## 项目结构
 
@@ -171,6 +172,18 @@ ASK_API_RATE_WINDOW_SECONDS=60
 ASK_API_TRUST_PROXY=false      # 仅在可信反向代理后开启
 ```
 
+日报控制项：
+
+```bash
+DAILY_REPORT_CATEGORIES=china,global,ai_tech
+DAILY_REPORT_ITEMS_PER_CATEGORY=4
+DAILY_REPORT_COOLDOWN_DAYS=14
+DAILY_REPORT_TIMEZONE=Asia/Shanghai
+DAILY_REPORT_STATE_FILE=/var/lib/morning-report/daily_report_state.json
+```
+
+日报先按事件指纹合并不同媒体报道，再按新鲜度、独立来源覆盖、权威性和相关性排序；没有真实互动字段时只显示“多源关注”，不会把搜索排名冒充为全网热度。相同事件在 14 天内不会重复出现，除非出现至少间隔 24 小时的官方或关键事实更新。
+
 ## 启动
 
 本地测试：
@@ -207,6 +220,22 @@ install -d -o tgbot -g tgbot -m 700 /var/lib/morning-report
 cp deploy/tg-bot.service.example /etc/systemd/system/tg-bot.service
 systemctl daemon-reload
 systemctl enable --now tg-bot
+```
+
+启用日报定时任务：
+
+```bash
+cp deploy/tg-bot-daily-report.service.example /etc/systemd/system/tg-bot-daily-report.service
+cp deploy/tg-bot-daily-report.timer.example /etc/systemd/system/tg-bot-daily-report.timer
+systemctl daemon-reload
+systemctl enable --now tg-bot-daily-report.timer
+```
+
+手动试跑（不写运行时文件）：
+
+```bash
+set -a; source /etc/tg-bot.env; set +a
+PYTHONPATH=. python3 scripts/build-daily-report.py --dry-run
 ```
 
 需要给 Apple Watch、n8n 或其他外部客户端访问时，请使用

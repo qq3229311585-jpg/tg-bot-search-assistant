@@ -741,6 +741,7 @@ class DailyReportStorageTests(unittest.TestCase):
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
+
     def test_corrupt_state_is_backed_up_and_replaced(self):
         data_dir = tempfile.mkdtemp(prefix="tg-bot-report-state-")
         try:
@@ -794,6 +795,30 @@ class DailyReportStorageTests(unittest.TestCase):
                     self.assertEqual(handle.read(), "previous report")
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
+
+
+class DeploymentDocsTests(unittest.TestCase):
+    def setUp(self):
+        self.root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+    def test_daily_report_deployment_examples_document_timer_and_state(self):
+        service_path = os.path.join(self.root, "deploy", "tg-bot-daily-report.service.example")
+        timer_path = os.path.join(self.root, "deploy", "tg-bot-daily-report.timer.example")
+        with open(service_path, encoding="utf-8") as handle:
+            service = handle.read()
+        with open(timer_path, encoding="utf-8") as handle:
+            timer = handle.read()
+        self.assertIn("build-daily-report.py", service)
+        self.assertIn("DAILY_REPORT_STATE_FILE", service)
+        self.assertIn("OnCalendar=*-*-* 13:00:00 Asia/Shanghai", timer)
+        self.assertIn("Persistent=true", timer)
+
+    def test_env_and_readmes_document_report_controls(self):
+        for relative in (".env.example", "README.md", os.path.join("tg_bot", "README.md")):
+            with open(os.path.join(self.root, relative), encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("DAILY_REPORT_COOLDOWN_DAYS", text)
+            self.assertIn("daily_report_state.json", text)
 
 
 class GatherToolWorkerTests(unittest.TestCase):

@@ -175,7 +175,7 @@ def _same_event(left: NewsCandidate, right: NewsCandidate) -> bool:
     if left.category != right.category:
         return False
     left_url, right_url = _canonical_url(left.url), _canonical_url(right.url)
-    if left_url and right_url and urlsplit(left_url).path == urlsplit(right_url).path:
+    if left_url and right_url and left_url == right_url:
         return True
     return _token_jaccard(_title_tokens(left.title), _title_tokens(right.title)) >= 0.65
 
