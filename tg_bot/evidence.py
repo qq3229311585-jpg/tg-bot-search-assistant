@@ -212,6 +212,7 @@ def build_today_report_pack(user_text, report_text=None):
 
     return {
         "reference_mode": "evidence_backed",
+        "reply_mode": "report",
         "evidence_flags": ["read_today_report"],
         "tool_calls_summary": ["read_today_report"],
         "tool_results": [{"tool": "read_today_report", "query": user_text[:40], "snippet": raw[:400]}],

@@ -40,6 +40,7 @@ from tg_bot.evidence import (
     should_use_today_report, build_today_report_pack,
 )
 from tg_bot.workers.display import clean_reply_for_user
+from tg_bot.response import normalize_reply, render_reply
 from tg_bot.lanes.router import decide_lane
 from tg_bot.commands.info import (
     handle_thinking, handle_tools, handle_sources,
@@ -68,6 +69,17 @@ def _mark_no_references(reply):
     if not reply or _NO_REFERENCES_MARK in reply:
         return reply
     return reply + "\n\n" + _NO_REFERENCES_MARK
+
+
+def _render_display_reply(raw_reply, *, meta=None, mode="answer"):
+    """Render a stable user reply while keeping raw text for audit logs."""
+    meta = meta or {}
+    envelope = normalize_reply(
+        clean_reply_for_user(raw_reply or ""),
+        sources=meta.get("source_index") or (),
+        mode=mode,
+    )
+    return render_reply(envelope)
 
 
 _BLOCKED_SOURCE_DOMAINS = {"baike.baidu.com", "www.baike.baidu.com"}
@@ -641,6 +653,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
                 "fetched_pages": local_evidence_pack.get("fetched_pages", []),
                 "source_index": local_evidence_pack.get("source_index", []),
                 "facts_json": local_evidence_pack.get("facts_json", {}),
+                "reply_mode": local_evidence_pack.get("reply_mode", "report"),
             }
             fact_list = local_evidence_pack.get("fact_list", "")
             reference_mode = local_evidence_pack.get("reference_mode", "evidence_backed")
@@ -712,7 +725,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
         )
         write_reasoning = ""
         reply = _mark_no_references(reply)
-        display_reply = clean_reply_for_user(reply)
+        display_reply = _render_display_reply(reply, meta=meta, mode="answer")
 
         history.append({"role": "user", "content": text, "ts": _now_ts()})
         history.append({"role": "assistant", "content": display_reply, "ts": _now_ts()})
@@ -992,7 +1005,11 @@ def handle(chat_id, text, http_mode=False, brief=False):
     if reference_mode == "pure_model":
         reply = _mark_no_references(reply)
     raw_reply = reply
-    display_reply = clean_reply_for_user(raw_reply)
+    display_mode = (
+        "report" if local_evidence_kind == "today_report" or meta.get("reply_mode") == "report"
+        else "search" if evidence_flags else "answer"
+    )
+    display_reply = _render_display_reply(raw_reply, meta=meta, mode=display_mode)
 
     history.append({"role": "assistant", "content": display_reply, "ts": _now_ts()})
     if not http_mode:

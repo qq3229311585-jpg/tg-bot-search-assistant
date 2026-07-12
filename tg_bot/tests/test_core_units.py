@@ -614,6 +614,23 @@ class ReplyStructureTests(unittest.TestCase):
         self.assertNotIn("reasoning", text.lower())
 
 
+class ReplyIntegrationTests(unittest.TestCase):
+    def test_writer_prompt_declares_stable_sections(self):
+        writer = importlib.import_module("tg_bot.agents.writer")
+        for heading in ("结论", "关键依据", "下一步", "来源"):
+            self.assertIn(heading, writer._SYS_WRITER)
+
+    def test_today_report_pack_declares_report_mode(self):
+        with temporary_env(**required_env()):
+            for module_name in ("tg_bot.evidence", "tg_bot.storage", "tg_bot.config"):
+                sys.modules.pop(module_name, None)
+            evidence = importlib.import_module("tg_bot.evidence")
+            pack = evidence.build_today_report_pack(
+                "今天午报有什么", report_text="AI 新闻\n来源：example.com"
+            )
+        self.assertEqual(pack["reply_mode"], "report")
+
+
 class GatherToolWorkerTests(unittest.TestCase):
     def test_parse_search_entries(self):
         seq = iter(["R001"])
