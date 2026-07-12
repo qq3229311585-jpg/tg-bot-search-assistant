@@ -631,6 +631,96 @@ class ReplyIntegrationTests(unittest.TestCase):
         self.assertEqual(pack["reply_mode"], "report")
 
 
+class DailyReportTests(unittest.TestCase):
+    def setUp(self):
+        self.daily = importlib.import_module("tg_bot.daily_report")
+        self.now = self.daily.datetime(2026, 7, 12, 13, 0, tzinfo=self.daily.timezone.utc)
+
+    def _candidate(self, title, *, domain="reuters.com", category="global", hours=2, score=0.8, url=None):
+        return self.daily.NewsCandidate(
+            category=category,
+            title=title,
+            summary=f"{title} 的事实摘要。",
+            url=url or f"https://{domain}/story/{title.replace(' ', '-').lower()}",
+            domain=domain,
+            published_at=(self.now - self.daily.timedelta(hours=hours)).isoformat(),
+            relevance=score,
+            source="fixture",
+        )
+
+    def test_tracking_parameters_do_not_change_fingerprint(self):
+        left = self._candidate(
+            "New AI model released",
+            domain="example.com",
+            url="https://example.com/story?id=1&utm_source=x",
+        )
+        right = self._candidate(
+            "New AI model released",
+            domain="other.example",
+            url="https://example.com/story?id=1&utm_medium=social",
+        )
+        self.assertEqual(self.daily.event_fingerprint(left), self.daily.event_fingerprint(right))
+
+    def test_similar_titles_from_independent_domains_cluster(self):
+        candidates = [
+            self._candidate("OpenAI releases new model for developers", domain="reuters.com"),
+            self._candidate("OpenAI released a new model for developers", domain="apnews.com"),
+        ]
+        events = self.daily.cluster_candidates(candidates)
+        self.assertEqual(len(events), 1)
+        self.assertEqual({item.domain for item in events[0].sources}, {"reuters.com", "apnews.com"})
+
+    def test_cooldown_filters_event_seen_within_fourteen_days(self):
+        event = self.daily.cluster_candidates([self._candidate("Old event")])[0]
+        history = {"events": {event.event_id: {"last_published": "2026-07-02T13:00:00+00:00"}}}
+        selected = self.daily.select_events([event], history, now=self.now, per_category=4, cooldown_days=14)
+        self.assertEqual(selected, [])
+
+    def test_official_update_after_one_day_can_reappear_as_update(self):
+        candidate = self._candidate(
+            "Government announces new AI safety rule",
+            domain="gov.cn",
+            hours=2,
+            url="https://gov.cn/notice/ai-safety-v2",
+        )
+        event = self.daily.cluster_candidates([candidate])[0]
+        history = {
+            "events": {
+                event.event_id: {
+                    "last_published": "2026-07-10T13:00:00+00:00",
+                    "title": "Government announces AI safety rule",
+                    "sources": ["reuters.com"],
+                }
+            }
+        }
+        selected = self.daily.select_events([event], history, now=self.now, per_category=4, cooldown_days=14)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].status, "update")
+
+    def test_missing_explicit_heat_is_reported_as_multi_source_attention(self):
+        event = self.daily.cluster_candidates([
+            self._candidate("Breaking global event", domain="reuters.com"),
+            self._candidate("Breaking global event", domain="apnews.com"),
+        ])[0]
+        score, basis = self.daily.score_event(event, self.now)
+        self.assertGreater(score, 0)
+        self.assertIn("多源关注", basis)
+
+    def test_selection_keeps_category_quota_and_domain_diversity(self):
+        events = []
+        for index in range(4):
+            events.extend(self.daily.cluster_candidates([
+                self._candidate(f"Global event {index}", domain="reuters.com", category="global"),
+                self._candidate(f"Global event {index}", domain="apnews.com", category="global"),
+            ]))
+        events.extend(self.daily.cluster_candidates([
+            self._candidate("China event", domain="gov.cn", category="china"),
+        ]))
+        selected = self.daily.select_events(events, {"events": {}}, now=self.now, per_category=2)
+        self.assertEqual(sum(event.category == "global" for event in selected), 2)
+        self.assertLessEqual(sum(event.sources[0].domain == "reuters.com" for event in selected), 2)
+
+
 class GatherToolWorkerTests(unittest.TestCase):
     def test_parse_search_entries(self):
         seq = iter(["R001"])
