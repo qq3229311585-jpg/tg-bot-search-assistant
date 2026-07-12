@@ -180,9 +180,10 @@ DAILY_REPORT_ITEMS_PER_CATEGORY=4
 DAILY_REPORT_COOLDOWN_DAYS=14
 DAILY_REPORT_TIMEZONE=Asia/Shanghai
 DAILY_REPORT_STATE_FILE=/var/lib/morning-report/daily_report_state.json
+DAILY_REPORT_STATUS_FILE=/var/lib/morning-report/daily_report_status.json
 ```
 
-日报先按事件指纹合并不同媒体报道，再按新鲜度、独立来源覆盖、权威性和相关性排序；没有真实互动字段时只显示“多源关注”，不会把搜索排名冒充为全网热度。相同事件在 14 天内不会重复出现，除非出现至少间隔 24 小时的官方或关键事实更新。
+日报先按事件指纹合并不同媒体报道，再按新鲜度、独立来源覆盖、权威性和相关性排序；没有真实互动字段时只显示“多源关注”，不会把搜索排名冒充为全网热度。相同事件在 14 天内不会重复出现，超过 24 小时的旧闻不会重新填充，除非出现至少间隔 24 小时的官方或关键事实更新。所有供应商失败时保留旧日报，并在 `daily_report_status.json` 写入 `stale_previous`。
 
 ## 启动
 

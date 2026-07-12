@@ -139,6 +139,105 @@ def execute_search(query, search_type="general"):
         log.warning(f"execute_search Brave 异常: {e}")
         return _tavily_search_fallback(query, search_type)
 
+
+def execute_news_candidates(query):
+    """Return structured news candidates with provider diagnostics.
+
+    The legacy ``execute_search`` function remains text-based for existing
+    prompts.  Daily-report generation uses this boundary so publication time
+    and relevance are not lost while formatting search results for an LLM.
+    """
+    from tg_bot.tools.fetch import http_get
+    from urllib.parse import quote_plus
+
+    diagnostics = []
+    if BRAVE_KEY:
+        try:
+            raw = http_get(
+                "https://api.search.brave.com/res/v1/news/search"
+                f"?q={quote_plus(query)}&count=9&freshness=pd",
+                headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_KEY},
+            )
+            data = json.loads(raw) if raw else {}
+            items = data.get("results", [])
+            if items:
+                inc_quota("brave")
+                return [
+                    {
+                        "title": item.get("title", ""),
+                        "summary": item.get("description", ""),
+                        "url": item.get("url", ""),
+                        "published_at": item.get("page_age") or item.get("age") or item.get("published"),
+                        "relevance": item.get("score"),
+                        "source": "brave",
+                    }
+                    for item in items
+                    if item.get("title") and item.get("url")
+                ], diagnostics
+            diagnostics.append("brave: empty")
+        except Exception as exc:
+            diagnostics.append(f"brave: provider_error:{type(exc).__name__}")
+    else:
+        diagnostics.append("brave: unavailable")
+
+    if TAVILY_KEYS:
+        try:
+            data = _tavily_request("https://api.tavily.com/search", {
+                "query": query,
+                "search_depth": "basic",
+                "topic": "news",
+                "time_range": "day",
+                "max_results": 8,
+            }) or {}
+            items = data.get("results", [])
+            if items:
+                return [
+                    {
+                        "title": item.get("title", ""),
+                        "summary": item.get("content", ""),
+                        "url": item.get("url", ""),
+                        "published_at": item.get("published_date"),
+                        "relevance": item.get("score"),
+                        "source": "tavily",
+                    }
+                    for item in items
+                    if item.get("title") and item.get("url")
+                ], diagnostics
+            diagnostics.append("tavily: empty")
+        except Exception as exc:
+            diagnostics.append(f"tavily: provider_error:{type(exc).__name__}")
+    else:
+        diagnostics.append("tavily: unavailable")
+
+    if SERPER_KEY:
+        try:
+            endpoint = "https://google.serper.dev/news"
+            body = json.dumps({"q": query, "num": 8}).encode()
+            req = Request(endpoint, data=body, headers={"Content-Type": "application/json", "X-API-KEY": SERPER_KEY})
+            with urlopen(req, context=_ctx, timeout=15) as response:
+                data = json.loads(response.read())
+            items = data.get("news", [])
+            if items:
+                inc_quota("serper")
+                return [
+                    {
+                        "title": item.get("title", ""),
+                        "summary": item.get("snippet", ""),
+                        "url": item.get("link", ""),
+                        "published_at": item.get("date"),
+                        "relevance": item.get("score"),
+                        "source": "serper",
+                    }
+                    for item in items
+                    if item.get("title") and item.get("link")
+                ], diagnostics
+            diagnostics.append("serper: empty")
+        except Exception as exc:
+            diagnostics.append(f"serper: provider_error:{type(exc).__name__}")
+    else:
+        diagnostics.append("serper: unavailable")
+    return [], diagnostics
+
 def _tavily_search_fallback(query, search_type):
     """搜索降级：Tavily → Serper"""
     log.info(f"🔍 Tavily 降级 [{search_type}]: {query}")

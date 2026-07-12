@@ -161,7 +161,7 @@ Add bounded config values for categories, per-category items, cooldown days, tim
 
 - [ ] **Step 4: 实现 CLI**
 
-`build-daily-report.py` must expose `build_report(candidates, now, state)` for tests and a `main()` that queries each configured category through `execute_search(query, search_type="news")`, converts result records into candidates, calls `cluster_candidates`/`select_events`, writes `daily_report.json`, then atomically writes `today_report.txt`. A provider exception is collected in a diagnostics list; if all providers fail, keep the previous TXT and return exit code 1.
+`build-daily-report.py` must expose `build_report(candidates, now, state)` for tests and a `main()` that queries each configured category through the structured `execute_news_candidates(query)` boundary, preserving provider, publication time and relevance. It converts result records into candidates, calls `cluster_candidates`/`select_events`, writes `daily_report.json`, then atomically writes `today_report.txt`. A provider exception is collected in a diagnostics list; if all providers fail, keep the previous TXT/JSON, write `daily_report_status.json` with `status=stale_previous`, and return exit code 1.
 
 - [ ] **Step 5: 运行绿灯测试**
 

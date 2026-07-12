@@ -4,6 +4,7 @@
 import json, os, ssl
 from tg_bot.file_io import atomic_write_json
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 def _require(key):
     v = os.getenv(key)
@@ -114,6 +115,7 @@ SUMMARY_FILE = DATA_DIR + "/chat_summary.json"
 REPORT_FILE  = DATA_DIR + "/today_report.txt"
 DAILY_REPORT_JSON_FILE = DATA_DIR + "/daily_report.json"
 DAILY_REPORT_STATE_FILE = os.getenv("DAILY_REPORT_STATE_FILE", DATA_DIR + "/daily_report_state.json").strip() or (DATA_DIR + "/daily_report_state.json")
+DAILY_REPORT_STATUS_FILE = os.getenv("DAILY_REPORT_STATUS_FILE", DATA_DIR + "/daily_report_status.json").strip() or (DATA_DIR + "/daily_report_status.json")
 DAILY_REPORT_CATEGORIES = _parse_csv_env(
     "DAILY_REPORT_CATEGORIES",
     ("china", "global", "ai_tech"),
@@ -126,6 +128,10 @@ DAILY_REPORT_COOLDOWN_DAYS = _parse_int_env(
     "DAILY_REPORT_COOLDOWN_DAYS", 14, minimum=1, maximum=60
 )
 DAILY_REPORT_TIMEZONE = os.getenv("DAILY_REPORT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
+try:
+    ZoneInfo(DAILY_REPORT_TIMEZONE)
+except Exception as exc:
+    raise RuntimeError(f"环境变量 DAILY_REPORT_TIMEZONE 不是有效时区：{DAILY_REPORT_TIMEZONE}") from exc
 THINKING_FILE = DATA_DIR + "/thinking.json"
 TOOLLOG_FILE  = DATA_DIR + "/tool_log.json"
 CONTEXT_FILE  = DATA_DIR + "/context_summary.json"

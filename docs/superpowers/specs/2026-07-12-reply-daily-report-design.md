@@ -114,6 +114,7 @@ DAILY_REPORT_ITEMS_PER_CATEGORY=4
 DAILY_REPORT_COOLDOWN_DAYS=14
 DAILY_REPORT_TIMEZONE=Asia/Shanghai
 DAILY_REPORT_STATE_FILE=<data_dir>/daily_report_state.json
+DAILY_REPORT_STATUS_FILE=<data_dir>/daily_report_status.json
 ```
 
 `daily_report_state.json` 使用版本化结构：
@@ -133,13 +134,15 @@ DAILY_REPORT_STATE_FILE=<data_dir>/daily_report_state.json
 }
 ```
 
+`daily_report_status.json` 单独记录 `fresh` 或 `stale_previous`、生成时间、事件数量和供应商诊断；全供应商失败时不覆盖上一次 TXT/JSON，但会写入 `stale_previous`，便于监控发现日报已过期。
+
 旧 `today_report.txt` 继续作为 `/recap` 和 `read_today_report` 的兼容产物；新增 `daily_report.json` 保存机器可读候选与热度依据。状态文件采用原子写入，损坏时备份为 `.corrupt.<timestamp>` 并从空状态恢复，同时记录告警。
 
 ### E. 运行入口与失败策略
 
 新增 `scripts/build-daily-report.py`：读取环境变量、调用候选采集器、生成 JSON/TXT 并原子替换。systemd timer 示例每天 13:00 运行；失败时不覆盖上一份有效日报，并向 stderr 返回结构化错误。
 
-如果某一搜索供应商失败，继续使用其他供应商；如果所有供应商失败，生成“今日采集失败，沿用上一份报告供回顾”的明确状态，不伪造新事件。没有足够新鲜事件时宁缺毋滥。
+如果某一搜索供应商失败，继续使用其他供应商；新闻采集层返回结构化的发布时间、相关性、供应商和诊断，不从展示文本反解析热度。若所有供应商失败，生成“今日采集失败，沿用上一份报告供回顾”的状态记录，不覆盖旧文件、不伪造新事件。没有足够新鲜事件时宁缺毋滥。
 
 ## 测试策略
 

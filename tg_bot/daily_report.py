@@ -8,6 +8,7 @@ import hashlib
 import re
 from typing import Iterable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 
 _TRACKING_KEYS = {"gclid", "fbclid", "ref", "source", "from"}
@@ -20,6 +21,10 @@ _AUTHORITY_DOMAINS = {
     "reuters.com", "apnews.com", "bbc.com", "ft.com", "who.int", "un.org",
     "gov.cn", "gov.uk", "whitehouse.gov", "europa.eu", "openai.com",
     "anthropic.com", "deepmind.com", "github.com", "news.ycombinator.com",
+}
+_OFFICIAL_UPDATE_DOMAINS = {
+    "gov.cn", "gov.uk", "whitehouse.gov", "europa.eu", "openai.com",
+    "anthropic.com", "deepmind.com", "github.com",
 }
 _CATEGORY_LABELS = {
     "china": "中国要闻",
@@ -272,7 +277,7 @@ def score_event(event: ReportEvent, now: datetime) -> tuple[float, tuple[str, ..
         basis.append("显式热度")
         total_weight = 1.0
     else:
-        basis.append("多源关注")
+        basis.append("多源关注" if len(domains) >= 2 else "未提供显式热度")
         total_weight = 0.9
     score = round(sum(value * weight for value, weight in parts) / total_weight, 2)
     return score, tuple(basis)
@@ -288,8 +293,42 @@ def _is_material_update(event: ReportEvent, previous: Mapping[str, object], now:
     new_sources = {item.domain for item in event.sources if item.domain}
     if not old_tokens and not old_sources:
         return False
-    official = any(item.domain.endswith((".gov", ".gov.cn")) or item.domain in _AUTHORITY_DOMAINS for item in event.sources)
-    return official and (_token_jaccard(old_tokens, new_tokens) < 0.9 or bool(new_sources - old_sources))
+    old_numbers = set(re.findall(r"\d+(?:\.\d+)?", str(previous.get("summary") or "")))
+    new_numbers = set(re.findall(r"\d+(?:\.\d+)?", event.summary))
+    fact_changed = bool(old_numbers or new_numbers) and old_numbers != new_numbers
+    official = any(
+        item.domain.endswith((".gov", ".gov.cn")) or item.domain in _OFFICIAL_UPDATE_DOMAINS
+        for item in event.sources
+    )
+    return official and (
+        _token_jaccard(old_tokens, new_tokens) < 0.9
+        or bool(new_sources - old_sources)
+        or fact_changed
+    )
+
+
+def _find_history_match(event: ReportEvent, history_events: Mapping[str, object]):
+    """Match rewritten headlines to a prior event before applying cooldown."""
+    direct = history_events.get(event.event_id)
+    if direct is not None:
+        return event.event_id, direct
+    best = None
+    best_score = 0.0
+    current_tokens = _title_tokens(event.title)
+    if not current_tokens:
+        return None, None
+    for event_id, previous in history_events.items():
+        if not isinstance(previous, Mapping):
+            continue
+        category = str(previous.get("category") or event.category).lower()
+        if category != event.category:
+            continue
+        old_tokens = _title_tokens(str(previous.get("title") or ""))
+        similarity = _token_jaccard(current_tokens, old_tokens)
+        if similarity >= 0.65 and similarity > best_score:
+            best = (event_id, previous)
+            best_score = similarity
+    return best if best else (None, None)
 
 
 def select_events(
@@ -304,19 +343,21 @@ def select_events(
     history_events = (history or {}).get("events", {}) or {}
     scored: list[ReportEvent] = []
     for event in events:
-        score, basis = score_event(event, now)
-        if score <= 0:
+        freshness, _freshness_label = _freshness_score(event, now)
+        if freshness <= 0:
             continue
-        previous = history_events.get(event.event_id)
+        score, basis = score_event(event, now)
+        matched_id, previous = _find_history_match(event, history_events)
         status = "new"
         if previous:
             last = _parse_datetime(previous.get("last_published"))
-            age_days = ((now.astimezone(timezone.utc) - last.astimezone(timezone.utc)).total_seconds() / 86400) if last else 0
-            if age_days < cooldown_days:
+            age_days = ((now.astimezone(timezone.utc) - last.astimezone(timezone.utc)).total_seconds() / 86400) if last else None
+            if age_days is not None and age_days < cooldown_days:
                 if not _is_material_update(event, previous, now):
                     continue
                 status = "update"
-        scored.append(replace(event, heat_score=score, heat_basis=basis, status=status))
+        event_id = matched_id or event.event_id
+        scored.append(replace(event, event_id=event_id, heat_score=score, heat_basis=basis, status=status))
 
     order = {"china": 0, "global": 1, "ai_tech": 2}
     buckets: dict[str, list[ReportEvent]] = {}
@@ -339,9 +380,16 @@ def select_events(
     return selected
 
 
-def render_daily_report(events: Iterable[ReportEvent], generated_at: datetime) -> str:
+def _report_zone(timezone_name: str):
+    try:
+        return ZoneInfo(timezone_name)
+    except Exception:
+        return timezone(timedelta(hours=8))
+
+
+def render_daily_report(events: Iterable[ReportEvent], generated_at: datetime, timezone_name: str = "Asia/Shanghai") -> str:
     rows = list(events)
-    stamp = generated_at.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    stamp = generated_at.astimezone(_report_zone(timezone_name)).strftime("%Y-%m-%d %H:%M")
     lines = [f"📰 今日热点日报 · {stamp}", ""]
     if not rows:
         return "\n".join(lines + ["今日新鲜事件不足，暂不填充旧闻。"])

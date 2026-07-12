@@ -105,6 +105,11 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg.TAVILY_KEYS, [])
             self.assertEqual(cfg.SERPER_KEYS, [])
 
+    def test_invalid_daily_report_timezone_is_rejected(self):
+        with temporary_env(**required_env(DAILY_REPORT_TIMEZONE="Not/AZone")):
+            with self.assertRaisesRegex(RuntimeError, "DAILY_REPORT_TIMEZONE"):
+                reload_config()
+
     def test_ensure_data_dir_creates_private_directory(self):
         temp_dir = tempfile.mkdtemp(prefix="tg-bot-config-")
         shutil.rmtree(temp_dir)
@@ -132,6 +137,29 @@ class SearchProviderTests(unittest.TestCase):
             sys.modules.pop("tg_bot.tools.search", None)
             search = importlib.import_module("tg_bot.tools.search")
             self.assertEqual(search._execute_serper("test", "general"), "Serper 未配置")
+
+    def test_structured_news_candidates_preserve_date_and_relevance(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-search-provider-")
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=data_dir)):
+                reload_config()
+                sys.modules.pop("tg_bot.storage", None)
+                sys.modules.pop("tg_bot.tools.search", None)
+                search = importlib.import_module("tg_bot.tools.search")
+                payload = json.dumps({"results": [{
+                    "title": "Breaking event",
+                    "description": "Verified summary",
+                    "url": "https://example.com/news/1",
+                    "page_age": "2026-07-12T11:00:00+00:00",
+                    "score": 0.91,
+                }]})
+                with patch("tg_bot.tools.fetch.http_get", return_value=payload):
+                    items, diagnostics = search.execute_news_candidates("event")
+                self.assertEqual(items[0]["published_at"], "2026-07-12T11:00:00+00:00")
+                self.assertEqual(items[0]["relevance"], 0.91)
+                self.assertEqual(items[0]["source"], "brave")
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
 
 
 class TokenTests(unittest.TestCase):
@@ -607,6 +635,17 @@ class ReplyStructureTests(unittest.TestCase):
         self.assertNotIn("example.com", hidden)
         self.assertIn("example.com", visible)
 
+    def test_search_render_keeps_source_marker_mapping(self):
+        source = {"title": "来源标题", "domain": "example.com", "url": "https://example.com/a"}
+        envelope = self.response.ReplyEnvelope("结论", evidence=("事实 [来源1]",), sources=(source,), mode="search")
+        text = self.response.render_reply(envelope)
+        self.assertIn("事实 [来源1]", text)
+        self.assertIn("[来源1] 来源标题", text)
+
+    def test_source_heading_is_not_repeated_as_key_evidence(self):
+        envelope = self.response.normalize_reply("结论\n\n【来源】\n来源标题")
+        self.assertEqual(envelope.evidence, ())
+
     def test_render_reply_does_not_emit_reasoning_and_respects_limit(self):
         envelope = self.response.ReplyEnvelope("结论", evidence=("x" * 2000,), actions=("下一步",))
         text = self.response.render_reply(envelope, max_chars=240)
@@ -676,6 +715,27 @@ class DailyReportTests(unittest.TestCase):
         selected = self.daily.select_events([event], history, now=self.now, per_category=4, cooldown_days=14)
         self.assertEqual(selected, [])
 
+    def test_events_older_than_one_day_are_not_selected(self):
+        event = self.daily.cluster_candidates([
+            self._candidate("Stale event", hours=48),
+        ])[0]
+        selected = self.daily.select_events([event], {"events": {}}, now=self.now, per_category=4)
+        self.assertEqual(selected, [])
+
+    def test_history_title_rewrite_still_matches_cooldown(self):
+        previous = self._candidate("Government announces new AI safety rule", domain="reuters.com")
+        current = self._candidate("Government announces AI safety rule", domain="apnews.com")
+        previous_event = self.daily.cluster_candidates([previous])[0]
+        current_event = self.daily.cluster_candidates([current])[0]
+        self.assertNotEqual(previous_event.event_id, current_event.event_id)
+        history = {"events": {previous_event.event_id: {
+            "last_published": "2026-07-10T13:00:00+00:00",
+            "title": previous_event.title,
+            "sources": ["reuters.com"],
+        }}}
+        selected = self.daily.select_events([current_event], history, now=self.now, per_category=4)
+        self.assertEqual(selected, [])
+
     def test_official_update_after_one_day_can_reappear_as_update(self):
         candidate = self._candidate(
             "Government announces new AI safety rule",
@@ -697,6 +757,32 @@ class DailyReportTests(unittest.TestCase):
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0].status, "update")
 
+    def test_official_numeric_change_is_an_update(self):
+        candidate = self._candidate(
+            "Government announces AI safety rule",
+            domain="gov.cn",
+            hours=2,
+            url="https://gov.cn/notice/ai-safety-v3",
+        )
+        candidate = self.daily.NewsCandidate(
+            category=candidate.category,
+            title=candidate.title,
+            summary="Affected 30 systems instead of 20 systems.",
+            url=candidate.url,
+            domain=candidate.domain,
+            published_at=candidate.published_at,
+            relevance=candidate.relevance,
+        )
+        event = self.daily.cluster_candidates([candidate])[0]
+        history = {"events": {event.event_id: {
+            "last_published": "2026-07-10T13:00:00+00:00",
+            "title": event.title,
+            "summary": "Affected 20 systems.",
+            "sources": ["gov.cn"],
+        }}}
+        selected = self.daily.select_events([event], history, now=self.now, per_category=4)
+        self.assertEqual(selected[0].status, "update")
+
     def test_missing_explicit_heat_is_reported_as_multi_source_attention(self):
         event = self.daily.cluster_candidates([
             self._candidate("Breaking global event", domain="reuters.com"),
@@ -705,6 +791,15 @@ class DailyReportTests(unittest.TestCase):
         score, basis = self.daily.score_event(event, self.now)
         self.assertGreater(score, 0)
         self.assertIn("多源关注", basis)
+
+    def test_single_source_without_heat_does_not_claim_multi_source_attention(self):
+        event = self.daily.cluster_candidates([self._candidate("One source event")])[0]
+        _score, basis = self.daily.score_event(event, self.now)
+        self.assertNotIn("多源关注", basis)
+
+    def test_render_daily_report_uses_requested_timezone(self):
+        text = self.daily.render_daily_report([], self.now, timezone_name="UTC")
+        self.assertIn("2026-07-12 13:00", text)
 
     def test_selection_keeps_category_quota_and_domain_diversity(self):
         events = []
@@ -776,6 +871,16 @@ class DailyReportStorageTests(unittest.TestCase):
         self.assertIn("events", result["state"])
         self.assertEqual(len(result["selected"]), 1)
 
+    def test_build_report_prunes_old_state_entries(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_prune", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        now = module.datetime(2026, 7, 12, 13, 0, tzinfo=module.timezone.utc)
+        state = {"schema_version": 1, "events": {"old": {"last_published": "2026-01-01T13:00:00+00:00"}}}
+        result = module.build_report([], now=now, state=state)
+        self.assertNotIn("old", result["state"]["events"])
+
     def test_main_provider_failure_keeps_previous_report(self):
         data_dir = tempfile.mkdtemp(prefix="tg-bot-report-cli-")
         try:
@@ -793,6 +898,8 @@ class DailyReportStorageTests(unittest.TestCase):
                     self.assertEqual(module.main([]), 1)
                 with open(report_path, encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), "previous report")
+                with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
+                    self.assertEqual(json.load(handle)["status"], "stale_previous")
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
@@ -819,6 +926,7 @@ class DeploymentDocsTests(unittest.TestCase):
                 text = handle.read()
             self.assertIn("DAILY_REPORT_COOLDOWN_DAYS", text)
             self.assertIn("daily_report_state.json", text)
+            self.assertIn("daily_report_status.json", text)
 
 
 class GatherToolWorkerTests(unittest.TestCase):

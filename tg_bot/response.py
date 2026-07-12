@@ -23,7 +23,7 @@ _HEADING_RE = re.compile(
 
 
 def _clean(value: object) -> str:
-    text = _SOURCE_MARK_RE.sub("", str(value or ""))
+    text = str(value or "")
     text = re.sub(r"[ \t]{2,}", " ", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
@@ -91,7 +91,7 @@ def _paragraphs(text: str) -> list[str]:
 
 
 def _parse_sections(text: str) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
-    sections: dict[str, list[str]] = {"conclusion": [], "evidence": [], "actions": []}
+    sections: dict[str, list[str]] = {"conclusion": [], "evidence": [], "actions": [], "sources": []}
     current = "conclusion"
     found_heading = False
     for raw_line in _clean(text).splitlines():
@@ -108,10 +108,13 @@ def _parse_sections(text: str) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
                 current = "evidence"
             elif label in {"下一步", "行动建议"}:
                 current = "actions"
+            elif label in {"来源", "参考来源"}:
+                current = "sources"
             else:
                 current = "evidence"
             continue
-        sections[current].append(line)
+        if current != "sources":
+            sections[current].append(line)
 
     if found_heading:
         conclusion = "\n".join(sections["conclusion"])
@@ -150,12 +153,17 @@ def _bullet(value: str) -> str:
     return f"• {value}"
 
 
+def _display_text(value: str, *, keep_source_markers: bool) -> str:
+    text = _clean(value)
+    return text if keep_source_markers else _SOURCE_MARK_RE.sub("", text)
+
+
 def _source_line(index: int, source: Mapping[str, object]) -> str:
     title = _clean(source.get("title") or source.get("name") or "未命名来源")
     domain = _clean(source.get("domain") or "")
     url = _clean(source.get("url") or "")
     details = " · ".join(part for part in (title, domain, url) if part)
-    return f"[{index}] {details}".rstrip()
+    return f"[来源{index}] {details}".rstrip()
 
 
 def _clip(text: str, max_chars: int) -> str:
@@ -177,15 +185,16 @@ def render_reply(envelope: ReplyEnvelope, *, max_chars: int = 3800) -> str:
     if not isinstance(envelope, ReplyEnvelope):
         raise TypeError("render_reply expects ReplyEnvelope")
 
-    lines = [_safe_conclusion(envelope.conclusion)]
+    keep_source_markers = envelope.mode in _VISIBLE_SOURCE_MODES
+    lines = [_display_text(_safe_conclusion(envelope.conclusion), keep_source_markers=keep_source_markers)]
     if envelope.confidence != "unknown":
         lines.extend(("", f"把握：{envelope.confidence}"))
     if envelope.evidence:
         lines.extend(("", "【关键依据】"))
-        lines.extend(_bullet(item) for item in envelope.evidence[:4])
+        lines.extend(_bullet(_display_text(item, keep_source_markers=keep_source_markers)) for item in envelope.evidence[:4])
     if envelope.actions:
         lines.extend(("", "【下一步】"))
-        lines.extend(_bullet(item) for item in envelope.actions[:4])
+        lines.extend(_bullet(_display_text(item, keep_source_markers=keep_source_markers)) for item in envelope.actions[:4])
     if envelope.mode in _VISIBLE_SOURCE_MODES and envelope.sources:
         lines.extend(("", "【来源】"))
         lines.extend(_source_line(index, item) for index, item in enumerate(envelope.sources[:5], 1))

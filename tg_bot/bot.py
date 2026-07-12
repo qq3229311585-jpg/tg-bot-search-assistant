@@ -39,7 +39,6 @@ from tg_bot.evidence import (
     should_use_vps_traffic, build_vps_traffic_pack,
     should_use_today_report, build_today_report_pack,
 )
-from tg_bot.workers.display import clean_reply_for_user
 from tg_bot.response import normalize_reply, render_reply
 from tg_bot.lanes.router import decide_lane
 from tg_bot.commands.info import (
@@ -75,7 +74,7 @@ def _render_display_reply(raw_reply, *, meta=None, mode="answer"):
     """Render a stable user reply while keeping raw text for audit logs."""
     meta = meta or {}
     envelope = normalize_reply(
-        clean_reply_for_user(raw_reply or ""),
+        raw_reply or "",
         sources=meta.get("source_index") or (),
         mode=mode,
     )

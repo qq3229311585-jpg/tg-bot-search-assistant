@@ -102,6 +102,7 @@ DAILY_REPORT_ITEMS_PER_CATEGORY=4
 DAILY_REPORT_COOLDOWN_DAYS=14
 DAILY_REPORT_TIMEZONE=Asia/Shanghai
 DAILY_REPORT_STATE_FILE=/var/lib/morning-report/daily_report_state.json
+DAILY_REPORT_STATUS_FILE=/var/lib/morning-report/daily_report_status.json
 ASK_API_HOST=127.0.0.1
 ASK_API_PORT=7799
 ASK_API_TOKEN=                 # 留空则生成并保存为 0600 文件
@@ -234,6 +235,7 @@ curl -X POST http://127.0.0.1:7799/v1/ask \
 | today_report.txt | 今日午报内容 | 可以，删了午报功能临时失效 |
 | daily_report.json | 今日机器可读事件、热度分数、来源和去重依据 | 可以，删了不影响下一次生成 |
 | daily_report_state.json | 最近已发布事件指纹（默认冷却 14 天） | 谨慎，删除会让旧事件重新具备候选资格 |
+| daily_report_status.json | 最近一次日报采集状态（fresh / stale_previous） | 可以，下一次运行会重建 |
 | ask_api_token | HTTP 接口密钥 | 删了会自动重新生成 |
 | sources/ | 搜索原文缓存 | 可以，删了缓存失效需重新抓取 |
 | worklog/ | AI 每轮工作日志 | 可以，只是审计用 |
@@ -248,7 +250,7 @@ curl -X POST http://127.0.0.1:7799/v1/ask \
 写入 path.tmp.<pid> → flush/fsync → os.replace 覆盖正式文件
 ```
 
-以下覆盖写文件已走原子写：`chat_history.json`、`chat_summary.json`、`context_summary.json`、`thinking.json`、`tool_log.json`、`api_quota.json`、`api_limits.json`、`tg_offset.txt`、`ask_api_token`、`daily_report.json`、`daily_report_state.json`、`today_report.txt`、`sources/*/*.json`、`sources/*/index.json`。
+以下覆盖写文件已走原子写：`chat_history.json`、`chat_summary.json`、`context_summary.json`、`thinking.json`、`tool_log.json`、`api_quota.json`、`api_limits.json`、`tg_offset.txt`、`ask_api_token`、`daily_report.json`、`daily_report_state.json`、`daily_report_status.json`、`today_report.txt`、`sources/*/*.json`、`sources/*/index.json`。
 
 日报生成由 `scripts/build-daily-report.py` 完成。它按 `DAILY_REPORT_CATEGORIES` 调用新闻搜索，生成事件级 JSON 和兼容的 `today_report.txt`；所有供应商失败时不会覆盖上一份有效日报。
 
