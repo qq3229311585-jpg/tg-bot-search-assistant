@@ -36,6 +36,15 @@ def _env_bool(key, default=False):
         return False
     raise RuntimeError(f"环境变量 {key} 必须是 true/false，当前值：{raw!r}")
 
+
+def _parse_csv_env(key, default, allowed):
+    raw = os.getenv(key, ",".join(default)).strip()
+    values = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    invalid = [item for item in values if item not in allowed]
+    if invalid:
+        raise RuntimeError(f"环境变量 {key} 包含不支持的值：{','.join(invalid)}")
+    return list(dict.fromkeys(values)) or list(default)
+
 BOT_TOKEN    = _require("BOT_TOKEN")
 ALLOWED_CHAT = int(_require("ALLOWED_CHAT"))
 
@@ -103,6 +112,20 @@ DATA_DIR     = os.getenv("TG_BOT_DATA_DIR", "/var/lib/morning-report").strip() o
 HISTORY_FILE = DATA_DIR + "/chat_history.json"
 SUMMARY_FILE = DATA_DIR + "/chat_summary.json"
 REPORT_FILE  = DATA_DIR + "/today_report.txt"
+DAILY_REPORT_JSON_FILE = DATA_DIR + "/daily_report.json"
+DAILY_REPORT_STATE_FILE = os.getenv("DAILY_REPORT_STATE_FILE", DATA_DIR + "/daily_report_state.json").strip() or (DATA_DIR + "/daily_report_state.json")
+DAILY_REPORT_CATEGORIES = _parse_csv_env(
+    "DAILY_REPORT_CATEGORIES",
+    ("china", "global", "ai_tech"),
+    {"china", "global", "ai_tech"},
+)
+DAILY_REPORT_ITEMS_PER_CATEGORY = _parse_int_env(
+    "DAILY_REPORT_ITEMS_PER_CATEGORY", 4, minimum=1, maximum=10
+)
+DAILY_REPORT_COOLDOWN_DAYS = _parse_int_env(
+    "DAILY_REPORT_COOLDOWN_DAYS", 14, minimum=1, maximum=60
+)
+DAILY_REPORT_TIMEZONE = os.getenv("DAILY_REPORT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
 THINKING_FILE = DATA_DIR + "/thinking.json"
 TOOLLOG_FILE  = DATA_DIR + "/tool_log.json"
 CONTEXT_FILE  = DATA_DIR + "/context_summary.json"

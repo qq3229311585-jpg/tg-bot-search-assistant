@@ -721,6 +721,81 @@ class DailyReportTests(unittest.TestCase):
         self.assertLessEqual(sum(event.sources[0].domain == "reuters.com" for event in selected), 2)
 
 
+class DailyReportStorageTests(unittest.TestCase):
+    def _reload_storage(self, data_dir):
+        with temporary_env(**required_env(TG_BOT_DATA_DIR=data_dir)):
+            for module_name in ("tg_bot.storage", "tg_bot.config"):
+                sys.modules.pop(module_name, None)
+            config = importlib.import_module("tg_bot.config")
+            storage = importlib.import_module("tg_bot.storage")
+            return config, storage
+
+    def test_state_round_trip_uses_schema_version(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-state-")
+        try:
+            _config, storage = self._reload_storage(data_dir)
+            path = os.path.join(data_dir, "daily_report_state.json")
+            state = {"schema_version": 1, "events": {"abc": {"heat_score": 81.2}}}
+            storage.save_daily_report_state(state, path)
+            self.assertEqual(storage.load_daily_report_state(path), state)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_corrupt_state_is_backed_up_and_replaced(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-state-")
+        try:
+            _config, storage = self._reload_storage(data_dir)
+            path = os.path.join(data_dir, "daily_report_state.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{not-json")
+            state = storage.load_daily_report_state(path)
+            self.assertEqual(state, {"schema_version": 1, "events": {}})
+            self.assertTrue(any(name.startswith("daily_report_state.json.corrupt.") for name in os.listdir(data_dir)))
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_build_report_returns_machine_readable_state(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        now = module.datetime(2026, 7, 12, 13, 0, tzinfo=module.timezone.utc)
+        candidate = module.NewsCandidate(
+            category="global",
+            title="Major event today",
+            summary="A verified event.",
+            url="https://reuters.com/story/major-event",
+            domain="reuters.com",
+            published_at="2026-07-12T11:00:00+00:00",
+            relevance=0.9,
+            source="fixture",
+        )
+        result = module.build_report([candidate], now=now, state={"schema_version": 1, "events": {}})
+        self.assertIn("今日热点日报", result["report_text"])
+        self.assertIn("events", result["state"])
+        self.assertEqual(len(result["selected"]), 1)
+
+    def test_main_provider_failure_keeps_previous_report(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-cli-")
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=data_dir)):
+                for module_name in ("tg_bot.storage", "tg_bot.config"):
+                    sys.modules.pop(module_name, None)
+                script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+                spec = importlib.util.spec_from_file_location("build_daily_report_failure", script_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                report_path = os.path.join(data_dir, "today_report.txt")
+                with open(report_path, "w", encoding="utf-8") as handle:
+                    handle.write("previous report")
+                with patch.object(module, "collect_candidates", return_value=([], ["global: provider_error:TimeoutError"])):
+                    self.assertEqual(module.main([]), 1)
+                with open(report_path, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "previous report")
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+
 class GatherToolWorkerTests(unittest.TestCase):
     def test_parse_search_entries(self):
         seq = iter(["R001"])

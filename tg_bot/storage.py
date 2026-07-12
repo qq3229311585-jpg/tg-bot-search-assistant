@@ -5,7 +5,7 @@ import json, os, logging
 from datetime import datetime, timezone, timedelta
 
 from tg_bot.config import (
-    HISTORY_FILE, SUMMARY_FILE, REPORT_FILE, THINKING_FILE, TOOLLOG_FILE,
+    HISTORY_FILE, SUMMARY_FILE, REPORT_FILE, DAILY_REPORT_STATE_FILE, THINKING_FILE, TOOLLOG_FILE,
     CONTEXT_FILE, FOCUS_FILE, QUOTA_FILE, LIMITS_FILE, SOURCES_DIR, WORKLOG_DIR,
     MAX_HISTORY, MAX_THINKING, MAX_TOOLLOG, MAX_CONTEXT,
     MAX_SOURCES_DAYS, MAX_WORKLOG_DAYS,
@@ -42,6 +42,45 @@ def load_report():
     except Exception as e:
         log.debug(f"load_report: {e}")
         return ""
+
+
+def _empty_daily_report_state():
+    return {"schema_version": 1, "events": {}}
+
+
+def load_daily_report_state(path=None):
+    """Load versioned daily-report history, recovering safely from corruption."""
+    path = path or DAILY_REPORT_STATE_FILE
+    try:
+        with open(path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        if not isinstance(state, dict) or not isinstance(state.get("events"), dict):
+            raise ValueError("daily report state must contain an events object")
+        state["schema_version"] = int(state.get("schema_version", 1))
+        return state
+    except FileNotFoundError:
+        return _empty_daily_report_state()
+    except Exception as exc:
+        backup = f"{path}.corrupt.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        try:
+            os.replace(path, backup)
+        except OSError:
+            log.warning("无法备份损坏的日报状态文件 %s: %s", path, exc)
+        else:
+            log.warning("日报状态文件损坏，已备份到 %s: %s", backup, exc)
+        return _empty_daily_report_state()
+
+
+def save_daily_report_state(state, path=None):
+    """Atomically persist the daily-report event history."""
+    path = path or DAILY_REPORT_STATE_FILE
+    payload = dict(state or {})
+    payload["schema_version"] = 1
+    payload["events"] = dict(payload.get("events") or {})
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    atomic_write_json(path, payload)
 
 
 # ── 对话上文摘要（消歧用）────────────────────────────────────────────
