@@ -8,6 +8,8 @@ from urllib.request import urlopen, Request
 from tg_bot.config import (
     BRAVE_KEY, TAVILY_KEYS, SERPER_KEYS, SERPER_KEY,
     _ctx,
+    _reserve_serper_key,
+    _reserve_tavily_key,
     _next_serper_key,
     API_FREE_LIMITS,
 )
@@ -83,7 +85,7 @@ def _tavily_request(endpoint, payload):
     """轮换三个 Tavily key，超限自动切下一个"""
     import tg_bot.config as _cfg
     for attempt in range(len(TAVILY_KEYS)):
-        key = TAVILY_KEYS[_cfg._tavily_idx % len(TAVILY_KEYS)]
+        key_index, key = _reserve_tavily_key()
         payload["api_key"] = key
         try:
             body = json.dumps(payload).encode()
@@ -92,14 +94,12 @@ def _tavily_request(endpoint, payload):
             with urlopen(req, context=_ctx, timeout=25) as r:
                 data = json.loads(r.read())
             # 成功，下次从下一个 key 开始（均匀分摊）
-            inc_quota(f"tavily_{_cfg._tavily_idx % len(TAVILY_KEYS)}")
-            _cfg._tavily_idx += 1
+            inc_quota(f"tavily_{key_index}")
             return data
         except Exception as e:
             err = str(e)
             if "429" in err or "quota" in err.lower() or "limit" in err.lower():
-                log.warning(f"Tavily key[{_cfg._tavily_idx % len(TAVILY_KEYS)}] 超限，切换下一个")
-                _cfg._tavily_idx += 1
+                log.warning(f"Tavily key[{key_index}] 超限，切换下一个")
             else:
                 log.warning(f"Tavily 请求失败: {e}")
                 return None
@@ -147,6 +147,7 @@ def execute_news_candidates(query):
     prompts.  Daily-report generation uses this boundary so publication time
     and relevance are not lost while formatting search results for an LLM.
     """
+    import tg_bot.config as _cfg
     from tg_bot.tools.fetch import http_get
     from urllib.parse import quote_plus
 
@@ -209,11 +210,10 @@ def execute_news_candidates(query):
     else:
         diagnostics.append("tavily: unavailable")
 
-    import tg_bot.config as _cfg
     if _cfg.SERPER_KEYS:
         endpoint = "https://google.serper.dev/news"
         for _attempt in range(len(_cfg.SERPER_KEYS)):
-            key = _cfg.SERPER_KEYS[_cfg._serper_idx % len(_cfg.SERPER_KEYS)]
+            key_index, key = _reserve_serper_key()
             try:
                 body = json.dumps({"q": query, "num": 8}).encode()
                 req = Request(endpoint, data=body, headers={"Content-Type": "application/json", "X-API-KEY": key})
@@ -238,7 +238,7 @@ def execute_news_candidates(query):
                 break
             except Exception as exc:
                 diagnostics.append(f"serper[{_attempt}]: provider_error:{type(exc).__name__}")
-                _cfg._next_serper_key()
+                # The next loop iteration reserves the next key atomically.
     else:
         diagnostics.append("serper: unavailable")
     return [], diagnostics

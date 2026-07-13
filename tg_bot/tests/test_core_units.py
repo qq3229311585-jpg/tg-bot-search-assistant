@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -130,6 +131,27 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(diagnostics["ok"])
             self.assertTrue(any("ASK_API_TOKEN" in item for item in diagnostics["errors"]))
 
+    def test_daily_report_health_rejects_stale_status(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-health-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_MAX_STALE_HOURS="1",
+            )):
+                cfg = reload_config()
+                with open(cfg.DAILY_REPORT_STATUS_FILE, "w", encoding="utf-8") as handle:
+                    json.dump({
+                        "status": "fresh",
+                        "generated_at": "2026-07-12T10:00:00+00:00",
+                    }, handle)
+                health = cfg.daily_report_health(
+                    now=cfg.datetime(2026, 7, 12, 12, 30, tzinfo=cfg.timezone.utc)
+                )
+                self.assertFalse(health["ok"])
+                self.assertEqual(health["status"], "stale")
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
 
 class SearchProviderTests(unittest.TestCase):
     def test_serper_without_key_is_explicitly_unavailable(self):
@@ -186,6 +208,37 @@ class SearchProviderTests(unittest.TestCase):
                     items, diagnostics = search.execute_news_candidates("event")
                 self.assertEqual(items[0]["source"], "serper")
                 self.assertEqual(cfg._serper_idx, 1)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_structured_news_candidates_advances_serper_key_after_success(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-search-serper-success-")
+        try:
+            with temporary_env(**required_env(TG_BOT_DATA_DIR=data_dir, TAVILY_KEY_0=None, SERPER_KEY_0="k1", SERPER_KEY_1="k2")):
+                reload_config()
+                sys.modules.pop("tg_bot.storage", None)
+                sys.modules.pop("tg_bot.tools.search", None)
+                search = importlib.import_module("tg_bot.tools.search")
+                search.BRAVE_KEY = ""
+                search.TAVILY_KEYS = []
+
+                class FakeResponse:
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *_args):
+                        return False
+                    def read(self):
+                        return json.dumps({"news": [{"title": "Serper event", "link": "https://example.com/1", "date": "1 hour ago"}]}).encode()
+
+                observed = []
+                def fake_urlopen(request, **_kwargs):
+                    observed.append(request.get_header("X-api-key"))
+                    return FakeResponse()
+
+                with patch.object(search, "urlopen", side_effect=fake_urlopen):
+                    search.execute_news_candidates("event-1")
+                    search.execute_news_candidates("event-2")
+                self.assertEqual(observed, ["k1", "k2"])
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
@@ -312,6 +365,21 @@ class ApiServerTests(unittest.TestCase):
             status, data = self.request("GET", "/readyz")
         finally:
             self.api.validate_config = old
+        self.assertEqual(status, 503)
+        self.assertEqual(data["error"], "not_ready")
+        self.assertNotIn("details", data)
+
+    def test_readyz_reports_stale_daily_report(self):
+        old = self.api.daily_report_health
+        self.api.daily_report_health = lambda: {
+            "ok": False,
+            "status": "stale",
+            "errors": ["日报过期"],
+        }
+        try:
+            status, data = self.request("GET", "/readyz")
+        finally:
+            self.api.daily_report_health = old
         self.assertEqual(status, 503)
         self.assertEqual(data["error"], "not_ready")
         self.assertNotIn("details", data)
@@ -1177,6 +1245,162 @@ class DailyReportStorageTests(unittest.TestCase):
             shutil.rmtree(data_dir, ignore_errors=True)
 
 
+class FetchSecurityTests(unittest.TestCase):
+    def setUp(self):
+        self.fetch = importlib.import_module("tg_bot.tools.fetch")
+
+    def test_fetch_url_rejects_private_and_non_http_targets(self):
+        self.assertFalse(self.fetch.validate_fetch_url("http://127.0.0.1:8080/secret"))
+        self.assertFalse(self.fetch.validate_fetch_url("http://169.254.169.254/latest/meta-data"))
+        self.assertFalse(self.fetch.validate_fetch_url("http://100.64.0.1/shared"))
+        self.assertFalse(self.fetch.validate_fetch_url("https://example.com:0/article"))
+        self.assertFalse(self.fetch.validate_fetch_url("file:///etc/passwd"))
+        self.assertFalse(self.fetch.validate_fetch_url("http://localhost/admin"))
+
+    def test_fetch_url_rejects_hostname_resolving_to_private_address(self):
+        private_info = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.8", 443))]
+        with patch.object(self.fetch.socket, "getaddrinfo", return_value=private_info):
+            self.assertFalse(self.fetch.validate_fetch_url("https://example.test/article"))
+
+    def test_fetch_content_does_not_call_provider_for_unsafe_url(self):
+        with patch("tg_bot.tools.search._tavily_request") as tavily:
+            result = self.fetch.execute_fetch_content("http://127.0.0.1:8000/internal")
+        tavily.assert_not_called()
+        self.assertIn("URL 不安全", result)
+
+    def test_fetch_content_uses_local_extractor_before_remote_provider(self):
+        raw = "<html><body>" + ("安全正文 " * 100) + "</body></html>"
+        with patch.object(self.fetch, "validate_fetch_url", return_value=True), \
+             patch.object(self.fetch, "_safe_local_fetch", return_value=raw), \
+             patch("tg_bot.tools.search._tavily_request") as tavily:
+            result = self.fetch.execute_fetch_content("https://example.test/article")
+        tavily.assert_not_called()
+        self.assertIn("安全正文", result)
+
+
+class BotUtilsTests(unittest.TestCase):
+    def test_send_returns_delivery_status(self):
+        bot_utils = importlib.import_module("tg_bot.bot_utils")
+        with patch.object(bot_utils, "http_post", return_value={"ok": True}):
+            self.assertTrue(bot_utils.send(1, "hello"))
+        with patch.object(bot_utils, "http_post", return_value={"ok": False}):
+            self.assertFalse(bot_utils.send(1, "hello"))
+
+
+class DailyReportCollectionTests(unittest.TestCase):
+    def _load_builder(self, name):
+        script_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "scripts", "build-daily-report.py",
+        )
+        spec = importlib.util.spec_from_file_location(name, script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_collect_candidates_preserves_requested_order_when_workers_finish_out_of_order(self):
+        module = self._load_builder("build_daily_report_parallel_order")
+        delays = {"china": 0.04, "global": 0.01, "ai_tech": 0.0}
+        queries = {category: module._CATEGORY_QUERIES[category] for category in delays}
+
+        def fake_search(query):
+            category = next(item for item, expected in queries.items() if expected == query)
+            time.sleep(delays[category])
+            return ([{
+                "title": f"{category} headline",
+                "summary": "summary",
+                "url": f"https://example.com/{category}",
+                "source": "fixture",
+            }], [])
+
+        with patch("tg_bot.tools.search.execute_news_candidates", side_effect=fake_search):
+            candidates, diagnostics = module.collect_candidates(("china", "global", "ai_tech"))
+        self.assertEqual([item.category for item in candidates], ["china", "global", "ai_tech"])
+        self.assertEqual(diagnostics, [])
+
+    def test_collect_candidates_isolates_provider_exception(self):
+        module = self._load_builder("build_daily_report_parallel_errors")
+        queries = {category: module._CATEGORY_QUERIES[category] for category in ("china", "global")}
+
+        def fake_search(query):
+            if query == queries["global"]:
+                raise TimeoutError("fixture")
+            return ([{
+                "title": "stable headline",
+                "summary": "summary",
+                "url": "https://example.com/stable",
+                "source": "fixture",
+            }], [])
+
+        with patch("tg_bot.tools.search.execute_news_candidates", side_effect=fake_search):
+            candidates, diagnostics = module.collect_candidates(("china", "global"))
+        self.assertEqual([item.category for item in candidates], ["china"])
+        self.assertEqual(diagnostics, ["global: provider_error:TimeoutError"])
+
+    def test_report_content_hash_ignores_generation_timestamp(self):
+        module = self._load_builder("build_daily_report_hash")
+        first = module.build_report([], now=module.datetime(2026, 7, 12, 13, tzinfo=module.timezone.utc))
+        second = dict(first, generated_at="2026-07-13T13:00:00+00:00")
+        second["report_text"] = first["report_text"].replace("2026-07-12 21:00", "2026-07-13 21:00", 1)
+        self.assertEqual(module._report_content_hash(first), module._report_content_hash(second))
+
+    def test_push_is_idempotent_for_unchanged_report(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-push-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_PUSH="true",
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_push")
+                with patch.object(module, "collect_candidates", return_value=([], [])), \
+                     patch("tg_bot.bot_utils.send", return_value=True) as send:
+                    self.assertEqual(module.main([]), 0)
+                    self.assertEqual(module.main([]), 0)
+                self.assertEqual(send.call_count, 1)
+                with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
+                    status = json.load(handle)
+                self.assertEqual(status["push"]["status"], "skipped_unchanged")
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_push_failure_retries_same_event_before_committing_cooldown_state(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-push-retry-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_PUSH="true",
+                DAILY_REPORT_SECTIONS="global",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_push_retry")
+                candidate = module.NewsCandidate(
+                    category="global",
+                    title="Stable headline",
+                    summary="summary",
+                    url="https://example.com/stable",
+                    domain="example.com",
+                    published_at="2026-07-14T10:00:00+00:00",
+                    relevance=0.9,
+                    source="fixture",
+                )
+                with patch.object(module, "collect_candidates", return_value=([candidate], [])), \
+                     patch("tg_bot.bot_utils.send", side_effect=[False, True]) as send:
+                    self.assertEqual(module.main([]), 1)
+                    self.assertEqual(module.main([]), 0)
+                    self.assertEqual(module.main([]), 0)
+                self.assertEqual(send.call_count, 2)
+                with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
+                    status = json.load(handle)
+                self.assertEqual(status["push"]["status"], "skipped_unchanged")
+                self.assertEqual(status["event_count"], 1)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+
 class DeploymentDocsTests(unittest.TestCase):
     def setUp(self):
         self.root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -1190,6 +1414,7 @@ class DeploymentDocsTests(unittest.TestCase):
             timer = handle.read()
         self.assertIn("build-daily-report.py", service)
         self.assertIn("DAILY_REPORT_STATE_FILE", service)
+        self.assertIn("DAILY_REPORT_PUSH", service)
         self.assertIn("OnCalendar=*-*-* 13:00:00 Asia/Shanghai", timer)
         self.assertIn("Persistent=true", timer)
 
@@ -1198,6 +1423,8 @@ class DeploymentDocsTests(unittest.TestCase):
             with open(os.path.join(self.root, relative), encoding="utf-8") as handle:
                 text = handle.read()
             self.assertIn("DAILY_REPORT_COOLDOWN_DAYS", text)
+            self.assertIn("DAILY_REPORT_PUSH", text)
+            self.assertIn("DAILY_REPORT_MAX_WORKERS", text)
             self.assertIn("daily_report_state.json", text)
             self.assertIn("daily_report_status.json", text)
 

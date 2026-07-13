@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """storage.py — 所有文件读写函数"""
 
-import json, os, logging
+import json, os, logging, threading
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
 from tg_bot.config import (
@@ -16,6 +17,32 @@ from tg_bot.config import (
 from tg_bot.file_io import atomic_write_json, atomic_write_text
 
 log = logging.getLogger(__name__)
+_quota_lock = threading.Lock()
+
+
+@contextmanager
+def _quota_file_lock():
+    """Coordinate quota read/modify/write across bot and report processes."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - deployment target is Unix
+        yield
+        return
+    lock_path = f"{QUOTA_FILE}.lock"
+    parent = os.path.dirname(lock_path)
+    try:
+        if parent:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # ── 对话历史 ──────────────────────────────────────────────────────────
@@ -273,7 +300,8 @@ QUOTA_NO_RESET = {"serper"}   # 一次性额度,不随月份重置
 
 def load_quota():
     try:
-        d = json.loads(open(QUOTA_FILE, encoding="utf-8").read())
+        with open(QUOTA_FILE, encoding="utf-8") as handle:
+            d = json.load(handle)
         if d.get("month") != _quota_month():
             # 换月：只重置按月计费的 key,一次性额度保留
             old_counts = d.get("counts", {})
@@ -293,22 +321,23 @@ def save_quota(d):
 def inc_quota(key):
     """记录一次 API 调用；首次超阈值时加入预警队列"""
     import tg_bot.config as _cfg
-    d = load_quota()
-    d.setdefault("counts", {})[key] = d["counts"].get(key, 0) + 1
-    cnt   = d["counts"][key]
-    limit = _cfg.API_FREE_LIMITS.get(key, 0)
-    if limit > 0:
-        warn_pct = d.get("warn_pct", 80)
-        warned   = d.setdefault("warned", {})
-        warn_at  = int(limit * warn_pct / 100)
-        if cnt >= warn_at and not warned.get(key):
-            warned[key] = True
-            _cfg._quota_warnings.append(
-                f"⚠️ API 配额预警\n"
-                f"{key}：本月已用 {cnt}/{limit}（{cnt * 100 // limit}%）\n"
-                f"当前预警阈值 {warn_pct}%,发 /quota set <数字> 可调整."
-            )
-    save_quota(d)
+    with _quota_lock, _quota_file_lock():
+        d = load_quota()
+        d.setdefault("counts", {})[key] = d["counts"].get(key, 0) + 1
+        cnt   = d["counts"][key]
+        limit = _cfg.API_FREE_LIMITS.get(key, 0)
+        if limit > 0:
+            warn_pct = d.get("warn_pct", 80)
+            warned   = d.setdefault("warned", {})
+            warn_at  = int(limit * warn_pct / 100)
+            if cnt >= warn_at and not warned.get(key):
+                warned[key] = True
+                _cfg._quota_warnings.append(
+                    f"⚠️ API 配额预警\n"
+                    f"{key}：本月已用 {cnt}/{limit}（{cnt * 100 // limit}%）\n"
+                    f"当前预警阈值 {warn_pct}%,发 /quota set <数字> 可调整."
+                )
+        save_quota(d)
 
 def fmt_quota():
     """格式化配额概览,用于 /quota 命令"""

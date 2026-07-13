@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """config.py — 所有常量、路径、密钥配置（密钥从环境变量读取）"""
 
-import json, os, ssl
+import json, os, ssl, threading
 from tg_bot.file_io import atomic_write_json
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -91,19 +91,48 @@ def _next_verify_key() -> str:
 BRAVE_KEY    = _require("BRAVE_KEY")
 TAVILY_KEYS  = _getenv_list("TAVILY_KEY_0", "TAVILY_KEY_1")
 _tavily_idx  = 0
+_provider_rotation_lock = threading.Lock()
 
 SERPER_KEYS  = _getenv_list("SERPER_KEY_0", "SERPER_KEY_1", "SERPER_KEY_2")
 _serper_idx  = 0
+_serper_reservation_idx = 0
 SERPER_KEY   = SERPER_KEYS[0] if SERPER_KEYS else ""
 
 def _next_serper_key() -> str:
-    global _serper_idx, SERPER_KEY
-    if not SERPER_KEYS:
-        SERPER_KEY = ""
+    global _serper_idx, _serper_reservation_idx, SERPER_KEY
+    with _provider_rotation_lock:
+        if not SERPER_KEYS:
+            SERPER_KEY = ""
+            return SERPER_KEY
+        _serper_idx = (_serper_idx + 1) % len(SERPER_KEYS)
+        _serper_reservation_idx = (_serper_idx + 1) % len(SERPER_KEYS)
+        SERPER_KEY  = SERPER_KEYS[_serper_idx]
         return SERPER_KEY
-    _serper_idx = (_serper_idx + 1) % len(SERPER_KEYS)
-    SERPER_KEY  = SERPER_KEYS[_serper_idx]
-    return SERPER_KEY
+
+
+def _reserve_tavily_key():
+    """Reserve a Tavily key/index atomically for concurrent provider calls."""
+    global _tavily_idx
+    if not TAVILY_KEYS:
+        return -1, ""
+    with _provider_rotation_lock:
+        index = _tavily_idx % len(TAVILY_KEYS)
+        _tavily_idx += 1
+        return index, TAVILY_KEYS[index]
+
+
+def _reserve_serper_key():
+    """Reserve a Serper key/index atomically for concurrent provider calls."""
+    global _serper_idx, _serper_reservation_idx, SERPER_KEY
+    with _provider_rotation_lock:
+        if not SERPER_KEYS:
+            SERPER_KEY = ""
+            return -1, ""
+        index = _serper_reservation_idx % len(SERPER_KEYS)
+        _serper_reservation_idx = (index + 1) % len(SERPER_KEYS)
+        _serper_idx = index
+        SERPER_KEY = SERPER_KEYS[index]
+        return index, SERPER_KEY
 
 # OpenHuman 记忆树写入（每轮对话自动 ingest 到 telegram-bot namespace）
 OPENHUMAN_RPC_URL   = "http://127.0.0.1:7788/rpc"
@@ -141,6 +170,14 @@ DAILY_REPORT_ITEMS_PER_SECTION = _parse_int_env(
 DAILY_REPORT_EVENT_COOLDOWN_DAYS = _parse_int_env(
     "DAILY_REPORT_EVENT_COOLDOWN_DAYS", DAILY_REPORT_COOLDOWN_DAYS, minimum=1, maximum=60
 )
+DAILY_REPORT_MAX_WORKERS = _parse_int_env(
+    "DAILY_REPORT_MAX_WORKERS", 4, minimum=1, maximum=8
+)
+DAILY_REPORT_PUSH = _env_bool("DAILY_REPORT_PUSH", False)
+DAILY_REPORT_MAX_STALE_HOURS = _parse_int_env(
+    "DAILY_REPORT_MAX_STALE_HOURS", 30, minimum=1, maximum=168
+)
+FETCH_REMOTE_EXTRACT = _env_bool("FETCH_REMOTE_EXTRACT", False)
 DAILY_REPORT_NATIVE_SNAPSHOTS = _env_bool("DAILY_REPORT_NATIVE_SNAPSHOTS", True)
 DAILY_REPORT_TIMEZONE = os.getenv("DAILY_REPORT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
 try:
@@ -230,6 +267,56 @@ def ensure_data_dir():
         # caller still gets a useful mkdir/access error when writes occur.
         pass
     return DATA_DIR
+
+
+def daily_report_health(now=None):
+    """Return freshness diagnostics for the readiness probe.
+
+    A missing status file is treated as a warning so a fresh deployment can
+    become ready before its first scheduled report.  Once a status exists,
+    malformed, failed, stale, or explicitly preserved-previous reports fail
+    readiness and are visible in local diagnostics.
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        with open(DAILY_REPORT_STATUS_FILE, encoding="utf-8") as handle:
+            status = json.load(handle)
+    except FileNotFoundError:
+        return {"ok": True, "status": "missing", "warnings": ["日报状态文件尚未生成"]}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "status": "invalid", "errors": [f"日报状态文件不可读：{type(exc).__name__}"]}
+    if not isinstance(status, dict):
+        return {"ok": False, "status": "invalid", "errors": ["日报状态文件格式无效"]}
+    report_status = str(status.get("status") or "unknown")
+    if report_status in {"stale_previous", "invalid"}:
+        return {"ok": False, "status": report_status, "errors": [f"日报状态为 {report_status}"]}
+    if report_status != "fresh":
+        return {"ok": False, "status": "invalid", "errors": [f"日报状态未知：{report_status}"]}
+    generated_at = status.get("generated_at")
+    try:
+        generated = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+        if generated.tzinfo is None:
+            generated = generated.replace(tzinfo=timezone.utc)
+        age_hours = max(0.0, (now - generated.astimezone(timezone.utc)).total_seconds() / 3600)
+    except (TypeError, ValueError):
+        return {"ok": False, "status": report_status, "errors": ["日报 generated_at 无效"]}
+    if age_hours > DAILY_REPORT_MAX_STALE_HOURS:
+        return {
+            "ok": False,
+            "status": "stale",
+            "age_hours": round(age_hours, 2),
+            "errors": [f"日报已超过 {DAILY_REPORT_MAX_STALE_HOURS} 小时未更新"],
+        }
+    warnings = []
+    push = status.get("push")
+    if isinstance(push, dict) and push.get("status") == "failed":
+        warnings.append("日报已生成但 Telegram 推送失败")
+    return {
+        "ok": True,
+        "status": report_status,
+        "age_hours": round(age_hours, 2),
+        "warnings": warnings,
+    }
 
 
 def validate_config():

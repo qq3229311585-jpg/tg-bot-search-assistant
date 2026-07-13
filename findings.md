@@ -33,3 +33,12 @@
 - `scripts/build-daily-report.py` 当前只查询 `china`、`global`、`ai_tech` 三个类别，并会重新写完整 `today_report.txt`；因此直接扩展类别会丢掉原有天气、汇率、行情、代理、Hacker News、GitHub、冷知识等外部板块。
 - 仓库内已有 `execute_weather` 和 `execute_github_trending` 原生工具，但没有 Steam、代理更新、Hacker News、汇率或行情的专用日报采集器；这些板块原本依赖外部写入的 `today_report.txt`。
 - 采用板块注册表：快照板块不应用事件冷却，事件板块按自身 section id + 事件指纹保存历史。新采集候选为空时保留旧板块文本；候选存在但全部因冷却被过滤时只保留板块标题并明确跳过重复内容。
+
+## 2026-07-14 二次体检
+
+- 日报 systemd service 当前只执行 `scripts/build-daily-report.py` 写入 `today_report.txt`/JSON，代码图谱中没有从日报构建入口到 Telegram `send()` 的调用；Bot 提示中的“每天自动推送”与实际行为不一致。
+- `tg_bot.tools.fetch.execute_fetch_content` 接受任意候选 URL，现有封锁列表主要针对站点内容，不阻止 localhost、环回、私网、链路本地或非 HTTP(S) 地址；应在正文抓取入口增加 fail-closed 的 URL/地址校验。
+- `collect_candidates` 按板块串行调用 Brave/Tavily/Serper。默认板块增至多个后，单次生成延迟近似线性累积；需要有界并发、保持诊断顺序，并确保单个板块异常不取消其他板块。
+- `/readyz` 目前只调用 `validate_config()` 和 `ensure_data_dir()`，不会检查 `daily_report_status.json` 的新鲜度；运维无法通过现有探针区分“服务活着但日报已过期”。
+
+二次体检改进后的边界：正文抓取默认改为本地连接，先解析公网地址并把选定 IP 固定到连接，重定向逐跳复核；Tavily/12ft 远端提取改为 `FETCH_REMOTE_EXTRACT=true` 显式启用。日报写入/推送使用文件锁，API key 轮换与配额读改写分别使用线程锁和跨进程锁。

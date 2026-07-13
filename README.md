@@ -184,12 +184,18 @@ DAILY_REPORT_EVENT_COOLDOWN_DAYS=14
 DAILY_REPORT_NATIVE_SNAPSHOTS=true
 DAILY_REPORT_ITEMS_PER_CATEGORY=4
 DAILY_REPORT_COOLDOWN_DAYS=14
+DAILY_REPORT_MAX_WORKERS=4
+DAILY_REPORT_PUSH=false          # 默认只生成文件；开启后内容变化才推送 ALLOWED_CHAT
+DAILY_REPORT_MAX_STALE_HOURS=30  # /readyz 日报新鲜度窗口
+FETCH_REMOTE_EXTRACT=false       # 默认本地抓取；需时才显式启用 Tavily/12ft 远端提取
 DAILY_REPORT_TIMEZONE=Asia/Shanghai
 DAILY_REPORT_STATE_FILE=/var/lib/morning-report/daily_report_state.json
 DAILY_REPORT_STATUS_FILE=/var/lib/morning-report/daily_report_status.json
 ```
 
 日报按注册表保留天气、汇率、行情、中国/全球/AI、代理工具、Hacker News、GitHub、Steam 优惠和冷知识等板块。天气/汇率/行情属于每天刷新的快照；其余事件板块各自按事件指纹和 14 天冷却轮换，因此相近板块可以出现同一事件，但同一板块不会每天重复。事件优先按新鲜度、独立来源覆盖、权威性和相关性排序；没有真实互动字段时只显示“多源关注”，不会把搜索排名冒充为全网热度。若事件候选存在但都在冷却期，板块会保留并明确标记已跳过重复；如果专用采集器暂不可用，则兼容保留旧 `today_report.txt` 板块。所有供应商失败时保留旧日报，并在 `daily_report_status.json` 写入 `stale_previous`。
+
+日报定时任务默认只写入 `today_report.txt`、JSON 和状态文件，不会因为重跑而重复发消息。需要 Telegram 推送时设置 `DAILY_REPORT_PUSH=true` 或手动执行 `build-daily-report.py --push`；状态文件记录 `content_sha256` 和 `push.status`，相同内容会标记为 `skipped_unchanged`。候选采集使用最多 4 个并发工作线程，并保持板块/诊断顺序稳定；`DAILY_REPORT_MAX_WORKERS` 可在 1–8 之间调整。
 
 旧部署若只配置 `DAILY_REPORT_CATEGORIES` 仍可继续运行；要启用全部板块和 Steam/代理等新事件搜索，请迁移到 `DAILY_REPORT_SECTIONS`。
 

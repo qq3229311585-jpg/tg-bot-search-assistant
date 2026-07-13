@@ -57,3 +57,11 @@
 |---|---:|---|
 | 直接用工作树绝对路径查询知识图谱失败 | 1 | 改用已索引项目名 `Users-secondcomputer-Documents-Codex-2026-07-12-new-chat-work-tg-bot-search-assistant` |
 | brainstorming 技能路径误用 `.system/brainstorming` | 1 | 使用 `/Users/secondcomputer/.codex/skills/brainstorming/SKILL.md` |
+
+## Phase 6: 二次体检与可部署性加固（2026-07-14）
+
+- [x] 检查日报定时任务、推送链路、抓取入口、候选并发和 `/readyz` 运维信号。
+- [x] 写出分级改进项：P0 抓取 SSRF，P1 推送幂等/结果可观测、采集并发、日报新鲜度探针，P2 文档与测试。
+- [x] 以失败测试驱动实现 URL fail-closed 校验、发送状态返回、并发顺序隔离、内容哈希和推送去重。
+- [x] 加入 `/readyz` 日报过期检查，并补齐配置/部署/运维文档和环境变量。
+- [ ] 完成独立复审、最终回归与提交。

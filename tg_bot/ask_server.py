@@ -24,6 +24,7 @@ from tg_bot.config import (
     ASK_API_TOKEN as CONFIG_API_TOKEN,
     ASK_API_TRUST_PROXY,
     ASK_TOKEN_FILE,
+    daily_report_health,
     ensure_data_dir,
     validate_config,
 )
@@ -165,6 +166,15 @@ class _AskHandler(BaseHTTPRequestHandler):
                         "ok": False,
                         "errors": [f"数据目录不可用：{exc}"],
                     }
+            report_diagnostics = daily_report_health()
+            if not report_diagnostics["ok"]:
+                diagnostics = {
+                    **diagnostics,
+                    "ok": False,
+                    "errors": list(diagnostics.get("errors") or []) + [
+                        "日报检查失败：" + "; ".join(report_diagnostics.get("errors") or [])
+                    ],
+                }
             if diagnostics["ok"]:
                 self._json(200, _payload(request_id, ok=True, ready=True))
             else:

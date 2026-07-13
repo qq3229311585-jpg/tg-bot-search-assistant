@@ -20,3 +20,15 @@
 - 新增板块轮换与 legacy 保留测试，定向测试已通过；全量测试需在允许 loopback bind 的环境复跑。
 - 已补齐空候选快照刷新、过期候选不恢复旧段、严格板块历史匹配、每板块冷却状态保留、旧 `DAILY_REPORT_CATEGORIES` 显式兼容，以及 bot/evidence 中 Steam 和中国/全球板块说明。
 - 最终非 HTTP 全量回归：`90 tests ... OK`；日报/存储定向回归：`30 tests ... OK`；此前允许 loopback 的完整回归：`98 tests ... OK`。compileall、diff check、启动自检、CLI help 均通过。最近一次成功图谱索引为 930 nodes / 3131 edges，最新重复索引因会话额度限制未能运行。
+
+## 2026-07-14 二次体检与实施
+
+- 完成第二轮审计：确认日报定时服务默认只落盘、不自动发送；正文抓取入口存在 SSRF 风险；多板块采集串行；`/readyz` 不检查日报新鲜度。
+- 新增 `validate_fetch_url`：仅允许 HTTP(S)，拒绝 userinfo、localhost、环回/私网/链路本地/保留地址，并对域名 DNS 解析结果 fail-closed 校验。
+- `bot_utils.send`/`_send_chunk` 现在返回真实投递布尔值，HTML 失败会根据纯文本降级结果判断最终状态。
+- 日报采集改为 `DAILY_REPORT_MAX_WORKERS`（1–8，默认 4）有界并发，按请求顺序合并候选和诊断，单板块异常不影响其他板块。
+- 新增 `content_sha256`、可选 `DAILY_REPORT_PUSH`/`--push` 和 Telegram 推送幂等状态（`sent`/`failed`/`skipped_unchanged`），默认行为仍只生成文件。
+- `/readyz` 现在检查 `daily_report_status.json`，缺失状态仅告警，明确过期/损坏/上次保留旧日报则报告未就绪；新增 `DAILY_REPORT_MAX_STALE_HOURS`。
+- 已补齐二次体检测试、环境示例、README、systemd 注释。编译和非网络单元通过；允许 loopback 的完整回归 `113 tests ... OK`。
+- 根据独立复审继续加固：本地正文抓取将 DNS 解析结果固定到 socket，避免再次按 hostname 解析；远端 Tavily/12ft 默认关闭并明确 opt-in；日报推送同日复跑复用已发送状态、失败重试不提交冷却；Tavily/Serper key 和配额文件增加线程/跨进程锁。
+- 最终允许 loopback 的全量回归：`114 tests ... OK`；定向回归、compileall、py_compile、CLI `--help` 和 `git diff --check` 均通过。

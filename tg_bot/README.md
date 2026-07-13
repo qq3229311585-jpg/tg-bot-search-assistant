@@ -105,6 +105,10 @@ DAILY_REPORT_EVENT_COOLDOWN_DAYS=14
 DAILY_REPORT_NATIVE_SNAPSHOTS=true
 DAILY_REPORT_ITEMS_PER_CATEGORY=4
 DAILY_REPORT_COOLDOWN_DAYS=14
+DAILY_REPORT_MAX_WORKERS=4
+DAILY_REPORT_PUSH=false          # 默认不推送；开启后仅内容变化时发送
+DAILY_REPORT_MAX_STALE_HOURS=30
+FETCH_REMOTE_EXTRACT=false       # 默认本地抓取；远端提取服务需显式启用
 DAILY_REPORT_TIMEZONE=Asia/Shanghai
 DAILY_REPORT_STATE_FILE=/var/lib/morning-report/daily_report_state.json
 DAILY_REPORT_STATUS_FILE=/var/lib/morning-report/daily_report_status.json
@@ -240,7 +244,7 @@ curl -X POST http://127.0.0.1:7799/v1/ask \
 | today_report.txt | 今日午报内容 | 可以，删了午报功能临时失效 |
 | daily_report.json | 今日机器可读事件、热度分数、来源和去重依据 | 可以，删了不影响下一次生成 |
 | daily_report_state.json | 最近已发布事件指纹（默认冷却 14 天） | 谨慎，删除会让旧事件重新具备候选资格 |
-| daily_report_status.json | 最近一次日报采集状态（fresh / stale_previous） | 可以，下一次运行会重建 |
+| daily_report_status.json | 最近一次日报采集、内容哈希和推送状态（fresh / stale_previous） | 可以，下一次运行会重建 |
 | ask_api_token | HTTP 接口密钥 | 删了会自动重新生成 |
 | sources/ | 搜索原文缓存 | 可以，删了缓存失效需重新抓取 |
 | worklog/ | AI 每轮工作日志 | 可以，只是审计用 |
@@ -258,6 +262,8 @@ curl -X POST http://127.0.0.1:7799/v1/ask \
 以下覆盖写文件已走原子写：`chat_history.json`、`chat_summary.json`、`context_summary.json`、`thinking.json`、`tool_log.json`、`api_quota.json`、`api_limits.json`、`tg_offset.txt`、`ask_api_token`、`daily_report.json`、`daily_report_state.json`、`daily_report_status.json`、`today_report.txt`、`sources/*/*.json`、`sources/*/index.json`。
 
 日报生成由 `scripts/build-daily-report.py` 完成。它按 `DAILY_REPORT_SECTIONS` 调用事件板块搜索，快照和未接入采集器的旧板块从现有 `today_report.txt` 兼容保留，生成带板块元数据的事件级 JSON 和新的 `today_report.txt`。事件板块各自冷却，重复候选会被跳过；所有供应商失败时不会覆盖上一份有效日报。
+
+默认定时任务只写文件；设置 `DAILY_REPORT_PUSH=true` 或执行 `python3 scripts/build-daily-report.py --push` 才会发送到 `ALLOWED_CHAT`。发送按 `content_sha256` 去重，成功记录 `sent`，相同内容记录 `skipped_unchanged`，失败不会丢失已生成的日报。正文抓取默认在本机完成并校验重定向目标；只有设置 `FETCH_REMOTE_EXTRACT=true` 才会把 URL 交给 Tavily/12ft 远端提取服务。`/readyz` 会检查配置、数据目录以及日报是否超过 `DAILY_REPORT_MAX_STALE_HOURS`。
 旧环境若只设置 `DAILY_REPORT_CATEGORIES` 会自动兼容为对应事件子集；新部署建议显式设置 `DAILY_REPORT_SECTIONS`。
 
 这样在服务重启、进程异常或 VPS 瞬断时，上述文件不会留下半截 JSON/文本；最坏情况是保留旧版本。`daily_logs/*.jsonl` 和 `worklog/*.jsonl` 属于追加日志，仍保持逐行 append。

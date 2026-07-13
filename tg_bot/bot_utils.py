@@ -56,13 +56,14 @@ def _send_chunk(chat_id, chunk):
          "parse_mode": "HTML", "disable_web_page_preview": True}
     )
     if res and res.get("ok"):
-        return
+        return True
     log.warning(f"sendMessage HTML failed (res={res}), retrying as plain text")
     plain = re.sub(r"<[^>]+>", "", chunk)
-    http_post(
+    fallback = http_post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         {"chat_id": chat_id, "text": plain, "disable_web_page_preview": True}
     )
+    return bool(fallback and fallback.get("ok"))
 
 
 def _split_safe(text, limit=4000):
@@ -87,12 +88,15 @@ def _split_safe(text, limit=4000):
 
 
 def send(chat_id, text):
-    if not text: return
+    if not text:
+        return False
     text = md_to_html(text)
     chunks = _split_safe(text)
+    delivered = True
     for i, chunk in enumerate(chunks):
-        _send_chunk(chat_id, chunk)
+        delivered = _send_chunk(chat_id, chunk) and delivered
         if i + 1 < len(chunks): time.sleep(0.3)
+    return delivered
 
 
 def typing(chat_id):
