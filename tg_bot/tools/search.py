@@ -6,11 +6,10 @@ from urllib.error import HTTPError
 from urllib.request import urlopen, Request
 
 from tg_bot.config import (
-    BRAVE_KEY, TAVILY_KEYS, SERPER_KEYS, SERPER_KEY,
+    BRAVE_KEY, TAVILY_KEYS, SERPER_KEYS,
     _ctx,
     _reserve_serper_key,
     _reserve_tavily_key,
-    _next_serper_key,
     API_FREE_LIMITS,
 )
 from tg_bot.storage import inc_quota
@@ -281,90 +280,46 @@ def _serper_fallback(query, search_type):
 def _execute_serper(query, search_type):
     """Serper.dev 实际执行函数（被备用链和独立工具共用）"""
     import tg_bot.config as _cfg
-    if not _cfg.SERPER_KEYS or not _cfg.SERPER_KEY:
+    if not _cfg.SERPER_KEYS:
         return "Serper 未配置"
     log.info(f"🔍 Serper [{search_type}]: {query}")
-    try:
-        endpoint = "https://google.serper.dev/news" if search_type == "news" else "https://google.serper.dev/search"
-        payload  = {"q": query, "num": 5}
-        body     = json.dumps(payload).encode()
-        req      = Request(endpoint, data=body, headers={
-            "Content-Type": "application/json",
-            "X-API-KEY": _cfg.SERPER_KEY
-        })
-        with urlopen(req, context=_ctx, timeout=15) as r:
-            d = json.loads(r.read())
-        inc_quota("serper")
-        items = d.get("news", d.get("organic", []))
-        if not items:
-            return "Serper 未找到相关结果。"
-        items = sorted(items, key=lambda it: _preferred_rank(it.get("link", "")))
-        lines = []
-        for it in items[:5]:
-            title    = it.get("title", "")
-            snippet  = it.get("snippet", "")[:200]
-            link     = it.get("link", "")
-            date     = it.get("date", "")
-            date_tag = f" [{date}]" if date else ""
-            lines.append(f"• {title}{date_tag}\n  {snippet}\n  {link}")
-        return "\n\n".join(lines)
-    except HTTPError as e:
-        if getattr(e, "code", None) == 400:
-            return f"Serper 调用失败: HTTP 400 ({query[:40]})"
-        log.warning(f"Serper key {_cfg._serper_idx} 失败: {e}，切换下一个 key 重试")
-        _next_serper_key()
+    endpoint = "https://google.serper.dev/news" if search_type == "news" else "https://google.serper.dev/search"
+    payload = {"q": query, "num": 5}
+    last_error = None
+    for _attempt in range(len(_cfg.SERPER_KEYS)):
+        key_index, key = _reserve_serper_key()
+        if not key:
+            break
         try:
-            endpoint = "https://google.serper.dev/news" if search_type == "news" else "https://google.serper.dev/search"
-            payload  = {"q": query, "num": 5}
-            body     = json.dumps(payload).encode()
-            req2 = Request(endpoint, data=body, headers={
+            body = json.dumps(payload).encode()
+            req = Request(endpoint, data=body, headers={
                 "Content-Type": "application/json",
-                "X-API-KEY": _cfg.SERPER_KEY
+                "X-API-KEY": key,
             })
-            with urlopen(req2, context=_ctx, timeout=15) as r2:
-                d2 = json.loads(r2.read())
+            with urlopen(req, context=_ctx, timeout=15) as response:
+                data = json.loads(response.read())
             inc_quota("serper")
-            items2 = d2.get("news", d2.get("organic", []))
-            if not items2:
+            items = data.get("news", data.get("organic", []))
+            if not items:
                 return "Serper 未找到相关结果。"
-            items2 = sorted(items2, key=lambda it: _preferred_rank(it.get("link", "")))
-            lines2 = []
-            for it in items2[:5]:
-                title   = it.get("title", "")
-                snippet = it.get("snippet", "")[:200]
-                link    = it.get("link", "")
-                date    = it.get("date", "")
+            items = sorted(items, key=lambda it: _preferred_rank(it.get("link", "")))
+            lines = []
+            for item in items[:5]:
+                title = item.get("title", "")
+                snippet = item.get("snippet", "")[:200]
+                link = item.get("link", "")
+                date = item.get("date", "")
                 date_tag = f" [{date}]" if date else ""
-                lines2.append(f"• {title}{date_tag}\n  {snippet}\n  {link}")
-            return "\n\n".join(lines2)
-        except Exception as e2:
-            return f"Serper 全部 key 失败: {e2}"
-    except Exception as e:
-        log.warning(f"Serper key {_cfg._serper_idx} 失败: {e}，切换下一个 key 重试")
-        _next_serper_key()
-        try:
-            endpoint = "https://google.serper.dev/news" if search_type == "news" else "https://google.serper.dev/search"
-            payload  = {"q": query, "num": 5}
-            body     = json.dumps(payload).encode()
-            req2 = Request(endpoint, data=body, headers={
-                "Content-Type": "application/json",
-                "X-API-KEY": _cfg.SERPER_KEY
-            })
-            with urlopen(req2, context=_ctx, timeout=15) as r2:
-                d2 = json.loads(r2.read())
-            inc_quota("serper")
-            items2 = d2.get("news", d2.get("organic", []))
-            if not items2:
-                return "Serper 未找到相关结果。"
-            items2 = sorted(items2, key=lambda it: _preferred_rank(it.get("link", "")))
-            lines2 = []
-            for it in items2[:5]:
-                title   = it.get("title", "")
-                snippet = it.get("snippet", "")[:200]
-                link    = it.get("link", "")
-                date    = it.get("date", "")
-                date_tag = f" [{date}]" if date else ""
-                lines2.append(f"• {title}{date_tag}\n  {snippet}\n  {link}")
-            return "\n\n".join(lines2)
-        except Exception as e2:
-            return f"Serper 全部 key 失败: {e2}"
+                lines.append(f"• {title}{date_tag}\n  {snippet}\n  {link}")
+            return "\n\n".join(lines)
+        except HTTPError as exc:
+            if getattr(exc, "code", None) == 400:
+                return f"Serper 调用失败: HTTP 400 ({query[:40]})"
+            last_error = exc
+            log.warning(f"Serper key {key_index} 失败: {exc}，切换下一个 key 重试")
+        except Exception as exc:
+            last_error = exc
+            log.warning(f"Serper key {key_index} 失败: {exc}，切换下一个 key 重试")
+    if last_error is not None:
+        return f"Serper 全部 key 失败: {type(last_error).__name__}"
+    return "Serper 全部 key 失败: 未配置可用 key"

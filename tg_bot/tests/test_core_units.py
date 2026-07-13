@@ -242,6 +242,89 @@ class SearchProviderTests(unittest.TestCase):
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
+    def test_direct_serper_search_rotates_keys_after_success(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-direct-serper-success-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                TAVILY_KEY_0=None,
+                SERPER_KEY_0="k1",
+                SERPER_KEY_1="k2",
+            )):
+                reload_config()
+                sys.modules.pop("tg_bot.tools.search", None)
+                search = importlib.import_module("tg_bot.tools.search")
+
+                class FakeResponse:
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *_args):
+                        return False
+                    def read(self):
+                        return json.dumps({
+                            "organic": [{
+                                "title": "Serper result",
+                                "link": "https://example.com/1",
+                                "snippet": "summary",
+                            }]
+                        }).encode()
+
+                observed = []
+
+                def fake_urlopen(request, **_kwargs):
+                    observed.append(request.get_header("X-api-key"))
+                    return FakeResponse()
+
+                with patch.object(search, "urlopen", side_effect=fake_urlopen):
+                    search._execute_serper("query-1", "general")
+                    search._execute_serper("query-2", "general")
+                self.assertEqual(observed, ["k1", "k2"])
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_direct_serper_search_retries_all_configured_keys(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-direct-serper-retry-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                TAVILY_KEY_0=None,
+                SERPER_KEY_0="k1",
+                SERPER_KEY_1="k2",
+                SERPER_KEY_2="k3",
+            )):
+                reload_config()
+                sys.modules.pop("tg_bot.tools.search", None)
+                search = importlib.import_module("tg_bot.tools.search")
+
+                class FakeResponse:
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *_args):
+                        return False
+                    def read(self):
+                        return json.dumps({
+                            "organic": [{
+                                "title": "Serper result",
+                                "link": "https://example.com/1",
+                                "snippet": "summary",
+                            }]
+                        }).encode()
+
+                observed = []
+
+                def fake_urlopen(request, **_kwargs):
+                    observed.append(request.get_header("X-api-key"))
+                    if len(observed) < 3:
+                        raise OSError("key unavailable")
+                    return FakeResponse()
+
+                with patch.object(search, "urlopen", side_effect=fake_urlopen):
+                    result = search._execute_serper("query", "general")
+                self.assertIn("Serper result", result)
+                self.assertEqual(observed, ["k1", "k2", "k3"])
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
 
 class TokenTests(unittest.TestCase):
     def test_existing_token_file_is_tightened_to_private_mode(self):
