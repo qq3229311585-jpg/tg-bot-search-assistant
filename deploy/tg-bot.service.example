@@ -9,6 +9,7 @@ User=tgbot
 Group=tgbot
 UMask=0077
 EnvironmentFile=/etc/tg-bot.env
+Environment=PYTHONPATH=/opt/tg-bot-search-assistant
 # TG_BOT_DATA_DIR and ASK_API_HOST are configured in /etc/tg-bot.env.
 # If TG_BOT_DATA_DIR is customized, update ReadWritePaths below as well.
 WorkingDirectory=/opt/tg-bot-search-assistant

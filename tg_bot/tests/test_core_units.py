@@ -1415,6 +1415,7 @@ class DeploymentDocsTests(unittest.TestCase):
         self.assertIn("build-daily-report.py", service)
         self.assertIn("DAILY_REPORT_STATE_FILE", service)
         self.assertIn("DAILY_REPORT_PUSH", service)
+        self.assertIn("Environment=PYTHONPATH=/opt/tg-bot-search-assistant", service)
         self.assertIn("OnCalendar=*-*-* 13:00:00 Asia/Shanghai", timer)
         self.assertIn("Persistent=true", timer)
 
