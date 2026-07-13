@@ -32,3 +32,11 @@
 - 已补齐二次体检测试、环境示例、README、systemd 注释。编译和非网络单元通过；允许 loopback 的完整回归 `113 tests ... OK`。
 - 根据独立复审继续加固：本地正文抓取将 DNS 解析结果固定到 socket，避免再次按 hostname 解析；远端 Tavily/12ft 默认关闭并明确 opt-in；日报推送同日复跑复用已发送状态、失败重试不提交冷却；Tavily/Serper key 和配额文件增加线程/跨进程锁。
 - 最终允许 loopback 的全量回归：`114 tests ... OK`；定向回归、compileall、py_compile、CLI `--help` 和 `git diff --check` 均通过。
+
+## 2026-07-14 远端部署
+
+- 远端旧版原以 root 运行 `/usr/local/bin/tg-bot-new.py`；已备份到 `/root/tg-bot-backup-20260714-2602019`。
+- 已部署到 `/opt/tg-bot-search-assistant`，新增专用 `tgbot` 用户，运行数据 `/var/lib/morning-report` 改为 700/600 权限，环境文件保持 600。
+- 已安装并启用 `tg-bot.service`、`tg-bot-daily-report.timer`；日报服务设置 `DAILY_REPORT_PUSH=true`，远端提取保持关闭。
+- 发现并修复 systemd 未设置 `PYTHONPATH` 导致加载旧全局模块的问题，提交 `9931241` 后重新同步并重启。
+- 部署验证：Bot 运行用户为 `tgbot`，HTTP 仅监听 `127.0.0.1:7799`，`/health`、`/readyz` 成功，未授权 `/ask` 返回 401；日报首次运行生成 22 个事件，状态为 `fresh`，推送状态为 `sent`。
