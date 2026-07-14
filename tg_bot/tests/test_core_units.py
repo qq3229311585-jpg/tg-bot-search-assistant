@@ -865,35 +865,122 @@ class ThinkingDigestTests(unittest.TestCase):
                 for module_name in module_names:
                     sys.modules.pop(module_name, None)
                 info = importlib.import_module("tg_bot.commands.info")
-            digest = info._format_thinking_digest([
-                {
+            digest = info._format_thinking_digest(
+                [
+                    {
+                        "user": "今天有什么新闻？",
+                        "role": "gather",
+                        "ts": "2026-07-14 13:01",
+                        "rounds": [
+                            {
+                                "round": 0,
+                                "tool_calls": ["web_search", "fetch_content"],
+                                "reasoning": "This is a long internal chain that must never be shown to the user.",
+                            },
+                            {"round": 1, "tool_calls": ["web_search"], "reasoning": "another secret chain"},
+                        ],
+                    },
+                    {
+                        "user": "今天有什么新闻？",
+                        "role": "verifier",
+                        "ts": "2026-07-14 13:02",
+                        "verdict": "pass",
+                        "reasoning": "private verifier reasoning",
+                    },
+                ],
+                tool_log=[{
+                    "ts": "13:02",
                     "user": "今天有什么新闻？",
-                    "role": "gather",
-                    "ts": "2026-07-14 13:01",
-                    "rounds": [
-                        {
-                            "round": 0,
-                            "tool_calls": ["web_search", "fetch_content"],
-                            "reasoning": "This is a long internal chain that must never be shown to the user.",
-                        },
-                        {"round": 1, "tool_calls": ["web_search"], "reasoning": "another secret chain"},
+                    "model_tools": [
+                        "web_search(今日新闻)",
+                        "fetch_content(https://example.com/news)",
+                        "web_search(今日热点)",
                     ],
-                },
-                {
-                    "user": "今天有什么新闻？",
-                    "role": "verifier",
-                    "ts": "2026-07-14 13:02",
-                    "verdict": "pass",
-                    "reasoning": "private verifier reasoning",
-                },
-            ])
-            self.assertIn("执行摘要", digest)
+                    "route_info": {
+                        "route": "search",
+                        "reason": "问题涉及今天的动态信息",
+                    },
+                    "verify_status": "pass",
+                    "evidence_flags": ["source_index", "fetched_pages", "search_tools"],
+                }],
+            )
+            self.assertIn("执行链", digest)
+            self.assertIn("路线：搜索回答", digest)
+            self.assertIn("原因：问题涉及今天的动态信息", digest)
+            self.assertIn("第1轮：web_search、fetch_content", digest)
+            self.assertIn("第2轮：web_search", digest)
             self.assertIn("web_search × 2", digest)
             self.assertIn("fetch_content × 1", digest)
+            self.assertIn("web_search(今日新闻)", digest)
+            self.assertIn("正文已抓取", digest)
             self.assertIn("核查结论：通过", digest)
             self.assertNotIn("internal chain", digest)
             self.assertNotIn("private verifier", digest)
-            self.assertLessEqual(len(digest), 1800)
+            self.assertLessEqual(len(digest), 2600)
+        finally:
+            for name, module in previous.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+    def test_thinking_digest_reports_latest_fast_route_without_old_search_chain(self):
+        module_names = ("tg_bot.config", "tg_bot.commands", "tg_bot.commands.info")
+        previous = {name: sys.modules.get(name) for name in module_names}
+        try:
+            with temporary_env(**required_env()):
+                for module_name in module_names:
+                    sys.modules.pop(module_name, None)
+                info = importlib.import_module("tg_bot.commands.info")
+            digest = info._format_thinking_digest(
+                [],
+                tool_log=[{
+                    "ts": "13:05",
+                    "user": "你是谁",
+                    "model_tools": [],
+                    "route_info": {"route": "fast", "reason": "助手身份问题"},
+                    "verify_status": "skip",
+                    "evidence_flags": [],
+                }],
+            )
+            self.assertIn("用户问：你是谁", digest)
+            self.assertIn("路线：快速回答", digest)
+            self.assertIn("未调用搜索工具", digest)
+            self.assertNotIn("今天有什么新闻", digest)
+        finally:
+            for name, module in previous.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+
+class ToolLogDisplayTests(unittest.TestCase):
+    def test_user_tool_log_keeps_search_chain_without_raw_reasoning(self):
+        module_names = ("tg_bot.config", "tg_bot.commands", "tg_bot.commands.info")
+        previous = {name: sys.modules.get(name) for name in module_names}
+        try:
+            with temporary_env(**required_env()):
+                for module_name in module_names:
+                    sys.modules.pop(module_name, None)
+                info = importlib.import_module("tg_bot.commands.info")
+            text = info._format_toollog_for_user([{
+                "ts": "13:10",
+                "user": "查今天新闻",
+                "model_tools": ["web_search(今日新闻)", "fetch_content(https://example.com)"],
+                "route_info": {"route": "search", "reason": "涉及实时新闻"},
+                "verify_status": "pass",
+                "evidence_flags": ["source_index", "fetched_pages"],
+                "failed_urls": ["https://failed.example"],
+                "reasoning_preview": "private raw chain must not be displayed",
+                "reply_preview": "这是最终回答摘要",
+            }])
+            self.assertIn("搜索回答", text)
+            self.assertIn("web_search(今日新闻)", text)
+            self.assertIn("正文已抓取", text)
+            self.assertIn("https://failed.example", text)
+            self.assertIn("这是最终回答摘要", text)
+            self.assertNotIn("private raw chain", text)
         finally:
             for name, module in previous.items():
                 if module is None:
