@@ -910,11 +910,14 @@ class MemoryContextTests(unittest.TestCase):
                 {"user": "上次聊了日报", "assistant": "记录了日报分类和去重要求"},
                 {"user": "不要重复", "assistant": "已记录为长期偏好"},
             ],
+            profile="用户是技术型用户，喜欢直接、可验证的中文答案。",
         )
         self.assertIn("长期记忆摘要", text)
         self.assertIn("用户偏好中文", text)
         self.assertIn("上次聊了日报", text)
         self.assertIn("已记录为长期偏好", text)
+        self.assertIn("用户画像", text)
+        self.assertIn("技术型用户", text)
 
     def test_build_memory_context_has_safe_empty_fallback_and_limit(self):
         text = build_memory_context("", [], max_chars=180)

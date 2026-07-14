@@ -361,7 +361,16 @@ def handle(chat_id, text, http_mode=False, brief=False):
 
     summary = load_summary()
     memory_turns = load_context()
-    memory_context = build_memory_context(summary, memory_turns)
+    profile_text = ""
+    try:
+        profiles = json.loads(open(_cfg.USER_PROFILES_FILE, encoding="utf-8").read())
+        for profile in reversed(profiles if isinstance(profiles, list) else []):
+            if isinstance(profile, dict) and profile.get("profile"):
+                profile_text = str(profile["profile"]).strip()[:1200]
+                break
+    except Exception:
+        pass
+    memory_context = build_memory_context(summary, memory_turns, profile=profile_text)
     report  = load_report()
 
     bj_now   = datetime.now(timezone(timedelta(hours=8)))
