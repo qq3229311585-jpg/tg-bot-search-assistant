@@ -28,6 +28,7 @@ from tg_bot.storage import (
     read_sources_file,
 )
 from tg_bot.facts import build_facts_json
+from tg_bot.memory import build_memory_context
 from tg_bot.tools.native import execute_api_balance
 from tg_bot.tools.fetch import execute_read_cache
 from tg_bot.pipeline import (
@@ -39,7 +40,7 @@ from tg_bot.evidence import (
     should_use_vps_traffic, build_vps_traffic_pack,
     should_use_today_report, build_today_report_pack,
 )
-from tg_bot.response import normalize_reply, render_reply
+from tg_bot.workers.display import clean_reply_for_user
 from tg_bot.lanes.router import decide_lane
 from tg_bot.commands.info import (
     handle_thinking, handle_tools, handle_sources,
@@ -71,14 +72,8 @@ def _mark_no_references(reply):
 
 
 def _render_display_reply(raw_reply, *, meta=None, mode="answer"):
-    """Render a stable user reply while keeping raw text for audit logs."""
-    meta = meta or {}
-    envelope = normalize_reply(
-        raw_reply or "",
-        sources=meta.get("source_index") or (),
-        mode=mode,
-    )
-    return render_reply(envelope)
+    """Keep the original plain-text layout while hiding source markers."""
+    return clean_reply_for_user(raw_reply or "")
 
 
 _BLOCKED_SOURCE_DOMAINS = {"baike.baidu.com", "www.baike.baidu.com"}
@@ -365,6 +360,8 @@ def handle(chat_id, text, http_mode=False, brief=False):
     history = load_history()
 
     summary = load_summary()
+    memory_turns = load_context()
+    memory_context = build_memory_context(summary, memory_turns)
     report  = load_report()
 
     bj_now   = datetime.now(timezone(timedelta(hours=8)))
@@ -476,6 +473,10 @@ def handle(chat_id, text, http_mode=False, brief=False):
         "举例打比方用'比如/举个例子/就好比'引出，绝不把自己编的内容安在用户头上。\n"
         "引用用户的话只能引用对话记录里真实出现的原文。\n\n",
         _features_block,
+        "\n【对话记忆（仅用于保持连续性）】\n"
+        + memory_context
+        + "\n如果记忆中有相关记录，优先利用记录回答，不要声称自己完全没有记忆；"
+        "没有相关记录时，再如实说明只能查看已保存的日志或摘要。",
         "\n【午报说明】\n"
         "每天北京时间 13:00 自动生成并推送一份「午报」给用户。\n"
         "午报固定包含以下板块：\n"
@@ -518,7 +519,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
         pass
 
     # ══ 第一层：意图消歧 ══════════════════════════════════════════════
-    _ctx_turns = load_context()
+    _ctx_turns = memory_turns
     _focus = load_focus()
     pre = _pre_check(text, ctx=_ctx_turns, focus=_focus)
     needs_search = True   # 默认走搜索路径
@@ -893,11 +894,14 @@ def handle(chat_id, text, http_mode=False, brief=False):
     source_index_result = []
     try:
         from tg_bot.core.pipeline import run_search_pipeline
+        history_context = history[:-1]
+        if summary or memory_turns:
+            history_context = [{"role": "assistant", "content": memory_context}] + history_context
         reply, verify_status, meta = run_search_pipeline(
             text,
             keywords,
             chat_id=chat_id if not http_mode else None,
-            history_context=history[:-1],
+            history_context=history_context,
             pre_results=pre_results,
             pre_source_entries=pre_source_entries,
             retry_hint=_retry_hint,
@@ -933,7 +937,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
         if not meta.get("tool_calls_summary") and not meta.get("source_index"):
             log.warning("⚠️ 搜索路径但采集AI未调用任何工具，回复基于纯模型知识")
             reply, write_reasoning = write_ai(
-                text, "", history_context=history[:-1], facts_json=None,
+                text, "", history_context=history_context, facts_json=None,
                 source_index=source_index_result,
                 suggested_length=meta.get("suggested_length", ""),
                 tool_results=meta.get("tool_results", [])
@@ -943,7 +947,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
             verify_status = "skip_no_tools_warned"
         else:
             reply, write_reasoning = write_ai(
-                text, "", history_context=history[:-1], facts_json=None,
+                text, "", history_context=history_context, facts_json=None,
                 source_index=source_index_result,
                 suggested_length=meta.get("suggested_length", ""),
                 tool_results=meta.get("tool_results", [])

@@ -42,6 +42,7 @@ import tg_bot.workers.gather_executor as gather_executor
 from tg_bot.workers.gather_executor import GatherExecContext, execute_gather_tool
 from tg_bot.workers.gather_fallback import finalize_round_limit, parse_gather_completion
 from tg_bot.workers.source_backfill import complete_source_index, dedupe_source_index
+from tg_bot.memory import build_memory_context
 
 
 @contextlib.contextmanager
@@ -831,6 +832,29 @@ class ReplyStructureTests(unittest.TestCase):
         self.assertLessEqual(len(text), 240)
         self.assertNotIn("reasoning", text.lower())
 
+    def test_bot_display_keeps_plain_reply_layout(self):
+        module_name = "tg_bot.bot"
+        previous = sys.modules.get(module_name)
+        try:
+            detailed_log_stub = types.ModuleType("tg_bot.detailed_log")
+            detailed_log_stub.save_detailed_log = lambda **kwargs: None
+            with temporary_env(**required_env()):
+                with patch.dict(sys.modules, {"tg_bot.detailed_log": detailed_log_stub}):
+                    sys.modules.pop(module_name, None)
+                    bot = importlib.import_module(module_name)
+                    text = bot._render_display_reply(
+                        "结论。\n\n第二段事实。",
+                        meta={"source_index": [{"title": "来源", "domain": "example.com"}]},
+                        mode="answer",
+                    )
+            self.assertEqual(text, "结论。\n\n第二段事实。")
+            self.assertNotIn("关键依据", text)
+            self.assertNotIn("example.com", text)
+        finally:
+            sys.modules.pop(module_name, None)
+            if previous is not None:
+                sys.modules[module_name] = previous
+
 
 class ThinkingDigestTests(unittest.TestCase):
     def test_thinking_digest_hides_raw_reasoning_and_summarizes_execution(self):
@@ -876,6 +900,27 @@ class ThinkingDigestTests(unittest.TestCase):
                     sys.modules.pop(name, None)
                 else:
                     sys.modules[name] = module
+
+
+class MemoryContextTests(unittest.TestCase):
+    def test_build_memory_context_includes_summary_and_recent_context(self):
+        text = build_memory_context(
+            "用户偏好中文、简洁回答。",
+            [
+                {"user": "上次聊了日报", "assistant": "记录了日报分类和去重要求"},
+                {"user": "不要重复", "assistant": "已记录为长期偏好"},
+            ],
+        )
+        self.assertIn("长期记忆摘要", text)
+        self.assertIn("用户偏好中文", text)
+        self.assertIn("上次聊了日报", text)
+        self.assertIn("已记录为长期偏好", text)
+
+    def test_build_memory_context_has_safe_empty_fallback_and_limit(self):
+        text = build_memory_context("", [], max_chars=180)
+        self.assertEqual(text, "【长期记忆】暂无可用的历史摘要或近期对话记录。")
+        long_text = build_memory_context("x" * 500, [], max_chars=180)
+        self.assertLessEqual(len(long_text), 180)
 
 
 class ReplyIntegrationTests(unittest.TestCase):
