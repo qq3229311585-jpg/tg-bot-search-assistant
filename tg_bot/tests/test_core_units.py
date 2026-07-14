@@ -1205,6 +1205,13 @@ class ReplyIntegrationTests(unittest.TestCase):
             [("gather", "start", ""), ("sending",), ("complete",)],
         )
 
+    def test_fast_chat_prompt_is_honest_about_not_searching(self):
+        bot = self._load_bot_module()
+        prompt = bot._build_fast_system_prompt(["你是中文助手。"])
+        self.assertIn("你是中文助手。", prompt)
+        self.assertIn("没有调用任何搜索工具", prompt)
+        self.assertIn("不要出现「根据搜索结果」", prompt)
+
     def test_writer_prompt_declares_stable_sections(self):
         writer = importlib.import_module("tg_bot.agents.writer")
         for heading in ("结论", "关键依据", "下一步", "来源"):

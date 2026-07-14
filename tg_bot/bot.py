@@ -94,6 +94,16 @@ def _send_reply_with_progress(progress, send_func, chat_id, text):
     return delivered
 
 
+def _build_fast_system_prompt(parts):
+    """Keep the original fast-chat behavior honest about not using search."""
+    reminder = (
+        "【当前回答路径】你现在直接使用自己的知识回答，没有调用任何搜索工具，"
+        "没有查询外部网络。回答时不要出现「根据搜索结果」「据我查询」"
+        "「刚才搜索到」等措辞；如涉及可能变化的信息，要明确说明没有实时核验。"
+    )
+    return "\n".join(list(parts or []) + [reminder])
+
+
 _BLOCKED_SOURCE_DOMAINS = {"baike.baidu.com", "www.baike.baidu.com"}
 
 
@@ -748,7 +758,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
         progress.stage("writer", "start", "")
         reply = fast_chat(
             _fast_messages,
-            system="\n".join(parts),
+            system=_build_fast_system_prompt(parts),
             max_tokens=900,
             temp=0.6,
         )
