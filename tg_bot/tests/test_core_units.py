@@ -902,6 +902,68 @@ class ThinkingDigestTests(unittest.TestCase):
                     sys.modules[name] = module
 
 
+class TelegramProgressTests(unittest.TestCase):
+    @staticmethod
+    def _fake_telegram():
+        calls = []
+        next_message_id = [1]
+
+        def fake_tg(method, data):
+            calls.append((method, dict(data)))
+            if method == "sendMessage":
+                message_id = next_message_id[0]
+                next_message_id[0] += 1
+                return {"ok": True, "result": {"message_id": message_id}}
+            return {"ok": True, "result": True}
+
+        return calls, fake_tg
+
+    def test_progress_creates_and_edits_one_status_message(self):
+        from tg_bot.progress import TelegramProgress
+
+        calls, fake_tg = self._fake_telegram()
+        progress = TelegramProgress(1, fake_tg, animate=False)
+        progress.set_route("search")
+        progress.stage("gather", "start")
+        progress.stage("gather", "done", "3")
+        progress.sending()
+        progress.complete()
+
+        self.assertEqual(calls[0][0], "sendMessage")
+        self.assertIn("搜索路径", calls[0][1]["text"])
+        edits = [data["text"] for method, data in calls if method == "editMessageText"]
+        self.assertTrue(any("搜索采集中" in text for text in edits))
+        self.assertTrue(any("采集 · 3条素材" in text for text in edits))
+        self.assertIn("✓ 已发送", edits[-1])
+
+    def test_progress_tool_items_keep_three_visible_messages(self):
+        from tg_bot.progress import TelegramProgress
+
+        calls, fake_tg = self._fake_telegram()
+        progress = TelegramProgress(1, fake_tg, animate=False)
+        progress.set_route("search")
+        for index in range(4):
+            progress.stage("gather_item", "start", f"🔍 搜索{index}")
+
+        deleted = [
+            data["message_id"]
+            for method, data in calls
+            if method == "deleteMessage"
+        ]
+        self.assertEqual(deleted, [2])
+        progress.close()
+
+    def test_disabled_progress_never_calls_telegram(self):
+        from tg_bot.progress import TelegramProgress
+
+        calls, fake_tg = self._fake_telegram()
+        progress = TelegramProgress(1, fake_tg, enabled=False, animate=False)
+        progress.set_route("fast")
+        progress.stage("writer", "start")
+        progress.complete()
+        self.assertEqual(calls, [])
+
+
 class MemoryContextTests(unittest.TestCase):
     def test_build_memory_context_includes_summary_and_recent_context(self):
         text = build_memory_context(
