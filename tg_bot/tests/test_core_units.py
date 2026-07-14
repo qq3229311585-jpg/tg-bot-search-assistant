@@ -832,6 +832,52 @@ class ReplyStructureTests(unittest.TestCase):
         self.assertNotIn("reasoning", text.lower())
 
 
+class ThinkingDigestTests(unittest.TestCase):
+    def test_thinking_digest_hides_raw_reasoning_and_summarizes_execution(self):
+        module_names = ("tg_bot.config", "tg_bot.commands", "tg_bot.commands.info")
+        previous = {name: sys.modules.get(name) for name in module_names}
+        try:
+            with temporary_env(**required_env()):
+                for module_name in module_names:
+                    sys.modules.pop(module_name, None)
+                info = importlib.import_module("tg_bot.commands.info")
+            digest = info._format_thinking_digest([
+                {
+                    "user": "今天有什么新闻？",
+                    "role": "gather",
+                    "ts": "2026-07-14 13:01",
+                    "rounds": [
+                        {
+                            "round": 0,
+                            "tool_calls": ["web_search", "fetch_content"],
+                            "reasoning": "This is a long internal chain that must never be shown to the user.",
+                        },
+                        {"round": 1, "tool_calls": ["web_search"], "reasoning": "another secret chain"},
+                    ],
+                },
+                {
+                    "user": "今天有什么新闻？",
+                    "role": "verifier",
+                    "ts": "2026-07-14 13:02",
+                    "verdict": "pass",
+                    "reasoning": "private verifier reasoning",
+                },
+            ])
+            self.assertIn("执行摘要", digest)
+            self.assertIn("web_search × 2", digest)
+            self.assertIn("fetch_content × 1", digest)
+            self.assertIn("核查结论：通过", digest)
+            self.assertNotIn("internal chain", digest)
+            self.assertNotIn("private verifier", digest)
+            self.assertLessEqual(len(digest), 1800)
+        finally:
+            for name, module in previous.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+
 class ReplyIntegrationTests(unittest.TestCase):
     def test_writer_prompt_declares_stable_sections(self):
         writer = importlib.import_module("tg_bot.agents.writer")

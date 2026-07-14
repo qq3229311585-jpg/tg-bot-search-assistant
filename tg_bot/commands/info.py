@@ -2,6 +2,7 @@
 """commands/info.py — /thinking /tools /sources /worklog 命令处理函数"""
 
 import json, logging
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 
 from tg_bot.config import THINKING_FILE, TOOLLOG_FILE, SOURCES_DIR, DAILY_SUMMARIES_DIR, DAILY_LOGS_DIR, USER_PROFILES_FILE
@@ -14,57 +15,67 @@ from tg_bot.storage import (
 log = logging.getLogger(__name__)
 
 
-def handle_thinking(chat_id):
-    th = load_thinking()
+def _format_thinking_digest(th, *, max_chars=1800):
+    """Summarize execution metadata without exposing raw model reasoning."""
     if not th:
-        send(chat_id, "暂无思考记录。")
-        return
+        return "暂无思考记录。"
 
-    # 始终取最新一条问题的思考记录，快速路径也显示，不过滤
     seen_users = []
     for entry in reversed(th):
         u = entry.get("user")
         if u and u not in seen_users:
             seen_users.append(u)
     if not seen_users:
-        send(chat_id, "暂无思考记录。"); return
+        return "暂无思考记录。"
     last_user = seen_users[0]
-
     related = [e for e in th if e.get("user") == last_user]
-    out = [f"🧠 最近一轮思考记录\n用户问: {last_user}\n"]
+    tools = Counter()
+    stages = []
+    verdict = ""
+    timestamps = []
 
     for entry in related:
         role = entry.get("role", "gather")
         ts   = entry.get("ts", "")
+        if ts:
+            timestamps.append(ts)
 
         if role == "gather" or "rounds" in entry:
-            # 采集AI：多轮 reasoning
+            if "采集" not in stages:
+                stages.append("采集")
             rounds = entry.get("rounds", [])
-            if rounds:
-                out.append(f"\n【采集AI】{ts}")
-                for r in rounds:
-                    if r.get("reasoning") or r.get("tool_calls"):
-                        out.append(f"  第{r['round']+1}轮 | 工具: {'、'.join(r.get('tool_calls',[])) or '无'}")
-                        if r.get("reasoning"):
-                            out.append(f"  思考: {r['reasoning'][:600]}")
+            for round_ in rounds:
+                tools.update(name for name in (round_.get("tool_calls") or []) if name)
 
         elif role == "write_ai":
-            # 写作AI
-            reasoning = entry.get("reasoning", "")
-            if reasoning:
-                out.append(f"\n【写作AI】{ts}")
-                out.append(f"  {reasoning[:800]}")
+            if "写作" not in stages:
+                stages.append("写作")
 
         elif role == "verifier":
-            # 核查AI
-            reasoning = entry.get("reasoning", "")
-            verdict   = entry.get("verdict", "")
-            if reasoning or verdict:
-                out.append(f"\n【核查AI】{ts}  结论: {verdict}")
-                if reasoning:
-                    out.append(f"  {reasoning[:600]}")
+            if "核查" not in stages:
+                stages.append("核查")
+            verdict = str(entry.get("verdict") or verdict or "").lower()
 
-    send(chat_id, "\n".join(out))
+    verdict_label = {"pass": "通过", "reject": "退回", "unknown": "未知"}.get(verdict, "未记录")
+    out = [
+        "🧠 最近一轮执行摘要",
+        f"用户问：{last_user[:240]}",
+        f"阶段：{' → '.join(stages) if stages else '快速回答'}",
+    ]
+    if timestamps:
+        out.append(f"时间：{timestamps[0]}" if len(set(timestamps)) == 1 else f"时间：{timestamps[0]} ～ {timestamps[-1]}")
+    if tools:
+        out.append("调用工具：" + "、".join(f"{name} × {count}" for name, count in tools.items()))
+    else:
+        out.append("调用工具：无（快速回答或无需检索）")
+    if "核查" in stages:
+        out.append(f"核查结论：{verdict_label}")
+    out.append("内部思考原文已隐藏，仅保留可审计摘要。")
+    return "\n".join(out)[:max_chars]
+
+
+def handle_thinking(chat_id):
+    send(chat_id, _format_thinking_digest(load_thinking()))
 
 
 def handle_tools(chat_id):
