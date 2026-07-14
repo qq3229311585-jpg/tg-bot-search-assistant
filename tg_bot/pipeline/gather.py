@@ -53,9 +53,19 @@ def _clean_assistant_msg_for_history(msg):
     return clean
 
 
-def _send_tool_status(chat_id, tg_func, typing_func, fn, args, used=None, quota=None, prefix="采集"):
-    """Send a short Telegram status message for a gather tool call."""
-    if not chat_id:
+def _send_tool_status(
+    chat_id,
+    tg_func,
+    typing_func,
+    fn,
+    args,
+    used=None,
+    quota=None,
+    prefix="采集",
+    status_cb=None,
+):
+    """Send a tool status directly or through the shared progress callback."""
+    if not chat_id and not status_cb:
         return
     used = used or {}
     quota = quota or {}
@@ -84,12 +94,18 @@ def _send_tool_status(chat_id, tg_func, typing_func, fn, args, used=None, quota=
     elif fn == "read_today_cache":
         text = f"📂 读取今日缓存（{len(args.get('ids', []))} 条）…"
     if text:
-        typing_func(chat_id)
-        tg_func("sendMessage", {
-            "chat_id": chat_id,
-            "text": text,
-            "disable_notification": True,
-        })
+        if status_cb:
+            try:
+                status_cb("gather_item", "start", text)
+            except Exception:
+                pass
+        elif chat_id:
+            typing_func(chat_id)
+            tg_func("sendMessage", {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_notification": True,
+            })
 
 
 def build_execution_report(meta, pre_searched=""):
@@ -194,7 +210,7 @@ def summarize_for_context(reply: str) -> str:
 # Keep the underscored names imported above for backward-compatible call sites in this module.
 
 def gather_ai(user_text, keywords, chat_id=None, pre_results=None, history_ctx=None, focus_task=None,
-              retry_hint=False, prev_searches=None, pre_source_entries=None):
+              retry_hint=False, prev_searches=None, pre_source_entries=None, status_cb=None):
     """
     第二层：采集 AI。
     调用工具收集原始数据，最终输出结构化事实清单。
@@ -372,7 +388,17 @@ def gather_ai(user_text, keywords, chat_id=None, pre_results=None, history_ctx=N
                     continue
                 used[fn] += 1
 
-            _send_tool_status(chat_id, tg, typing, fn, args, used, quota, prefix="采集")
+            _send_tool_status(
+                chat_id,
+                tg,
+                typing,
+                fn,
+                args,
+                used,
+                quota,
+                prefix="采集",
+                status_cb=status_cb,
+            )
             exec_ctx = GatherExecContext(
                 user_text=user_text,
                 source_index=source_index,

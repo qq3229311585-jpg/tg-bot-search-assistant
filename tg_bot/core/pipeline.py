@@ -116,6 +116,7 @@ def run_search_pipeline(
     prev_searches: Optional[list[str]] = None,
     focus_task: Optional[dict] = None,
     suggested_length: str = "",
+    progress_cb=None,
 ) -> tuple[str, str, dict]:
     """
     执行完整搜索 pipeline，返回 (reply, verify_status, meta)。
@@ -132,6 +133,14 @@ def run_search_pipeline(
 
     cfg = config or PipelineConfig.from_env()
 
+    def _prog(stage: str, status: str, detail: str = "") -> None:
+        if not progress_cb:
+            return
+        try:
+            progress_cb(stage, status, detail)
+        except Exception as exc:
+            log.debug("progress callback failed (non-fatal): %s", exc)
+
     meta = {
         "rounds": [],
         "tool_calls_summary": [],
@@ -143,23 +152,27 @@ def run_search_pipeline(
     }
 
     # ── Step 0: QueryFixer（可选）────────────────────────────────────
+    _prog("query_fixer", "start", "")
     if cfg.query_fixer:
         query_variants = fix_query(user_text, keywords)
         log.info(f"🔧 QueryFixer: {query_variants}")
     else:
         query_variants = [user_text]
     gather_keywords = list(dict.fromkeys(list(keywords or []) + query_variants))
+    _prog("query_fixer", "done", query_variants[0][:30] if query_variants else "")
 
     # ── Step 1: 采集（复用现有 gather_ai）──────────────────────────
+    _prog("gather", "start", "")
     # gather_ai 返回 (source_index_list, meta)
     raw_sources_list, meta = gather_ai(
         user_text, gather_keywords,
-        chat_id=chat_id,
+        chat_id=None if progress_cb else chat_id,
         pre_results=pre_results,
         pre_source_entries=pre_source_entries,
         retry_hint=retry_hint,
         prev_searches=prev_searches,
         focus_task=focus_task,
+        status_cb=progress_cb,
     )
     meta = meta or {}
     meta.setdefault("rounds", [])
@@ -185,8 +198,10 @@ def run_search_pipeline(
         for e in (raw_sources_list or [])
     ]
     _sl = meta.get("suggested_length") or suggested_length
+    _prog("gather", "done", str(len(raw_sources)))
 
     # ── Step 2: Curator（可选）────────────────────────────────────────
+    _prog("curator", "start", "")
     if cfg.curator and raw_sources:
         write_req = curate(
             raw_sources,
@@ -208,6 +223,7 @@ def run_search_pipeline(
         )
 
     if not write_req.sources:
+        _prog("curator", "done", "0")
         log.warning("⚠️ 无可用来源，返回兜底提示")
         meta["source_index"] = []
         meta.setdefault("tool_calls_summary", [])
@@ -218,7 +234,11 @@ def run_search_pipeline(
             meta,
         )
 
+    _lo, _hi = write_req.target_words
+    _prog("curator", "done", f"{len(write_req.sources)}条·{_lo}-{_hi}字")
+
     # ── Step 3: Writer ───────────────────────────────────────────────
+    _prog("writer", "start", "")
     reply, reasoning = write(write_req)
     meta["write_reasoning"] = reasoning or ""
 
@@ -251,6 +271,7 @@ def run_search_pipeline(
             return "生成回复时出错，请稍后再试。", "write_empty", meta
 
     reply = _enforce_short_length(reply, user_text, write_req.target_words)
+    _prog("writer", "done", str(len(reply)))
 
     # ── Step 4: Critic + Patcher 循环（可选）──────────────────────────
     verify_status = "skip"
@@ -264,20 +285,24 @@ def run_search_pipeline(
         fix_cycles = 0
         attempt = 0
         while True:
+            _prog("critic", "start", str(attempt))
             report = critique(reply, write_req.sources, user_text, attempt)
 
             if report.verdict == "pass":
                 verify_status = "pass"
+                _prog("critic", "done", "pass")
                 log.info(f"✅ Critic 通过（attempt={attempt}）")
                 break
 
             if report.verdict == "unknown":
                 verify_status = "unknown"
+                _prog("critic", "done", "unknown")
                 log.warning("⚠️ Critic 状态 unknown，保留 Writer 草稿并记录，不触发重写")
                 break
 
             if fix_cycles >= budget["max_fix_cycles"]:
                 verify_status = f"limit_{report.verdict}"
+                _prog("critic", "done", verify_status)
                 log.warning(
                     "⚠️ Critic 修正预算已用尽: level=%s verdict=%s fixes=%s",
                     budget["level"], report.verdict, fix_cycles,
@@ -286,10 +311,13 @@ def run_search_pipeline(
 
             if report.verdict == "patch" and cfg.patcher:
                 # 小问题：Patcher 直接改
+                _prog("critic", "done", "patch")
+                _prog("patcher", "start", "")
                 reply = patch(reply, report, write_req.sources, user_text)
                 reply = _enforce_short_length(reply, user_text, write_req.target_words)
                 fix_cycles += 1
                 verify_status = f"patched_once" if fix_cycles == 1 else f"patched_{fix_cycles}"
+                _prog("patcher", "done", str(len(reply)))
                 if not budget["reaudit_after_fix"]:
                     log.info("🧪 短回答已 patch 一次，跳过二次 Critic")
                     break
@@ -305,6 +333,7 @@ def run_search_pipeline(
                         verify_status = "patched_instead_of_rewrite"
                     else:
                         verify_status = "rewrite_blocked_short"
+                    _prog("critic", "done", verify_status)
                     log.info("🧪 短回答禁止整篇 rewrite，已走最小处理")
                     break
                 # 大问题：Writer 重写
@@ -331,6 +360,7 @@ def run_search_pipeline(
                 continue
 
             verify_status = f"unhandled_{report.verdict}"
+            _prog("critic", "done", verify_status)
             break
 
     reply = _enforce_short_length(reply, user_text, write_req.target_words)

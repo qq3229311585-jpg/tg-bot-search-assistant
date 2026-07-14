@@ -964,6 +964,81 @@ class TelegramProgressTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class SearchProgressCallbackTests(unittest.TestCase):
+    def test_send_tool_status_prefers_callback_over_telegram(self):
+        with temporary_env(**required_env()):
+            from tg_bot.pipeline.gather import _send_tool_status
+
+        events = []
+
+        def fail_call(*_args, **_kwargs):
+            self.fail("Telegram should not be called when a status callback is available")
+
+        _send_tool_status(
+            None,
+            fail_call,
+            fail_call,
+            "web_search",
+            {"query": "今日新闻"},
+            used={"web_search": 1},
+            quota={"web_search": 10},
+            status_cb=lambda *event: events.append(event),
+        )
+
+        self.assertEqual(
+            events,
+            [("gather_item", "start", "🔍 采集搜索（1/10）：今日新闻")],
+        )
+
+    def test_search_pipeline_reports_each_visible_stage(self):
+        with temporary_env(**required_env()):
+            from tg_bot.core.pipeline import run_search_pipeline
+
+        events = []
+        source = {
+            "id": "R001",
+            "url": "https://example.com/news",
+            "domain": "example.com",
+            "title": "今日新闻",
+            "snippet": "已核实摘要",
+            "full_content": "已核实正文",
+            "tool": "web_search",
+            "query": "今日新闻",
+        }
+        meta = {
+            "rounds": [],
+            "tool_calls_summary": ["web_search(今日新闻)"],
+            "tool_results": [],
+            "fetched_pages": [],
+            "failed_urls": [],
+            "facts_json": {},
+        }
+        config = PipelineConfig(
+            query_fixer=False,
+            curator=False,
+            critic=False,
+            patcher=False,
+        )
+
+        with temporary_env(**required_env()):
+            with patch("tg_bot.pipeline.gather.gather_ai", return_value=([source], meta)):
+                with patch("tg_bot.agents.writer.write", return_value=("整理后的答案", "")):
+                    reply, verdict, _ = run_search_pipeline(
+                        "今天有什么新闻？",
+                        ["今日新闻"],
+                        config=config,
+                        progress_cb=lambda *event: events.append(event),
+                    )
+
+        self.assertEqual(reply, "整理后的答案")
+        self.assertEqual(verdict, "skip")
+        self.assertEqual(events[0], ("query_fixer", "start", ""))
+        self.assertIn(("gather", "start", ""), events)
+        self.assertIn(("gather", "done", "1"), events)
+        self.assertIn(("curator", "start", ""), events)
+        self.assertIn(("writer", "done", "6"), events)
+
+
 class MemoryContextTests(unittest.TestCase):
     def test_build_memory_context_includes_summary_and_recent_context(self):
         text = build_memory_context(
