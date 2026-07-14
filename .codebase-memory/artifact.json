@@ -1,11 +1,11 @@
 {
     "schema_version": 1,
-    "commit": "210c64d9714b7f8a449a2e2a5a91c054c7199ba5",
-    "indexed_at": "2026-07-14T06:46:16Z",
+    "commit": "4af292ef97bd145b33e03cc894f8eb868ba62646",
+    "indexed_at": "2026-07-14T07:23:49Z",
     "project": "Users-secondcomputer-Documents-Codex-2026-07-12-new-chat-work-tg-bot-search-assistant",
-    "nodes": 985,
-    "edges": 3400,
-    "original_size": 7208960,
-    "compressed_size": 1056051,
+    "nodes": 1027,
+    "edges": 3664,
+    "original_size": 7405568,
+    "compressed_size": 1101186,
     "compression_level": 3
 }
