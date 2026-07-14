@@ -29,6 +29,7 @@ from tg_bot.storage import (
 )
 from tg_bot.facts import build_facts_json
 from tg_bot.memory import build_memory_context
+from tg_bot.progress import TelegramProgress
 from tg_bot.tools.native import execute_api_balance
 from tg_bot.tools.fetch import execute_read_cache
 from tg_bot.pipeline import (
@@ -74,6 +75,23 @@ def _mark_no_references(reply):
 def _render_display_reply(raw_reply, *, meta=None, mode="answer"):
     """Keep the original plain-text layout while hiding source markers."""
     return clean_reply_for_user(raw_reply or "")
+
+
+def _run_search_with_progress(progress, runner, *args, **kwargs):
+    """Attach the visible progress callback to one search-pipeline run."""
+    kwargs["progress_cb"] = progress.stage
+    return runner(*args, **kwargs)
+
+
+def _send_reply_with_progress(progress, send_func, chat_id, text):
+    """Send the final reply and leave the visible progress message truthful."""
+    progress.sending()
+    delivered = send_func(chat_id, text)
+    if delivered is False:
+        progress.fail("发送失败，请稍后重试")
+    else:
+        progress.complete()
+    return delivered
 
 
 _BLOCKED_SOURCE_DOMAINS = {"baike.baidu.com", "www.baike.baidu.com"}
@@ -350,10 +368,6 @@ def handle(chat_id, text, http_mode=False, brief=False):
     def _typing():
         if not http_mode:
             typing(chat_id)
-    def _send_status(text_):
-        if not http_mode:
-            tg("sendMessage", {"chat_id": chat_id, "text": text_,
-                               "disable_notification": True})
 
     _typing()
 
@@ -707,6 +721,9 @@ def handle(chat_id, text, http_mode=False, brief=False):
         route_info["lane_evidence_kind"] = lane_decision.evidence_kind
     log.info(f"🛣️ Lane: {lane_decision.name} reason={lane_decision.reason}")
 
+    progress = TelegramProgress(chat_id, tg, enabled=not http_mode)
+    progress.set_route(lane_decision.name)
+
     # ── 纯快速路径：不搜索、不调用工具、不进入新 pipeline ───────────────────
     if lane_decision.name == "fast":
         is_fast_path = True
@@ -728,6 +745,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
             if m.get("role") in ("user", "assistant")
         ]
         _fast_messages.append({"role": "user", "content": text})
+        progress.stage("writer", "start", "")
         reply = fast_chat(
             _fast_messages,
             system="\n".join(parts),
@@ -737,6 +755,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
         write_reasoning = ""
         reply = _mark_no_references(reply)
         display_reply = _render_display_reply(reply, meta=meta, mode="answer")
+        progress.stage("writer", "done", str(len(display_reply)))
 
         history.append({"role": "user", "content": text, "ts": _now_ts()})
         history.append({"role": "assistant", "content": display_reply, "ts": _now_ts()})
@@ -805,7 +824,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
         for w in list(_cfg._quota_warnings):
             send(chat_id, w)
         _cfg._quota_warnings.clear()
-        send(chat_id, display_reply)
+        _send_reply_with_progress(progress, send, chat_id, display_reply)
         sync_to_openhuman_memory(
             user_text=text, reply_text=display_reply, source="telegram",
             tools_used=[],
@@ -882,12 +901,15 @@ def handle(chat_id, text, http_mode=False, brief=False):
                             e.get("query","") for e in _relevant[:3]
                         )[:40]
                         log.info(f"📂 代码层预查命中 {len(_good)} 条缓存，已注入采集AI")
-                        _send_status(f"📂 发现今日缓存 {len(_good)} 条，已注入采集AI，减少重复搜索")
+                        progress.stage(
+                            "gather_item",
+                            "start",
+                            f"📂 发现今日缓存 {len(_good)} 条，已注入采集AI，减少重复搜索",
+                        )
                 except Exception as _e:
                     log.debug(f"代码层预查解析失败: {_e}")
 
     # 第二层：采集 AI
-    _send_status(f"🔎 开始采集信息（关键词：{' / '.join(keywords) if keywords else text[:30]}）…")
     # ── 构建焦点任务 ────────────────────────────────────────────────
     _focus_now = load_focus()
     _focus_task = None
@@ -906,7 +928,9 @@ def handle(chat_id, text, http_mode=False, brief=False):
         history_context = history[:-1]
         if summary or memory_turns:
             history_context = [{"role": "assistant", "content": memory_context}] + history_context
-        reply, verify_status, meta = run_search_pipeline(
+        reply, verify_status, meta = _run_search_with_progress(
+            progress,
+            run_search_pipeline,
             text,
             keywords,
             chat_id=chat_id if not http_mode else None,
@@ -930,19 +954,24 @@ def handle(chat_id, text, http_mode=False, brief=False):
         log.info(f"🧱 新搜索 pipeline 已接入: verify={verify_status}, sources={len(source_index_result)}")
     except Exception as _pipe_e:
         log.warning(f"⚠️ 新搜索 pipeline 失败，回退旧流程: {_pipe_e}", exc_info=True)
+        progress.stage("gather_item", "start", "⚠️ 主搜索流程异常，切换备用方案…")
         source_index_result, meta = gather_ai(
-            text, keywords, chat_id if not http_mode else None,
+            text,
+            keywords,
+            None if progress.enabled else (chat_id if not http_mode else None),
             pre_results=pre_results,
             retry_hint=_retry_hint,
             prev_searches=_prev_searches,
             pre_source_entries=pre_source_entries,
             focus_task=_focus_task,
+            status_cb=progress.stage if progress.enabled else None,
         )
         _override = _maybe_override_first_gold_answer(text, meta)
         if _override:
             source_index_result, meta = _override
             log.warning("⚠️ 首枚奥运金牌问题触发直接答案兜底，跳过模型归纳")
 
+        progress.stage("writer", "start", "")
         if not meta.get("tool_calls_summary") and not meta.get("source_index"):
             log.warning("⚠️ 搜索路径但采集AI未调用任何工具，回复基于纯模型知识")
             reply, write_reasoning = write_ai(
@@ -974,6 +1003,9 @@ def handle(chat_id, text, http_mode=False, brief=False):
             })
             if _verdict != "pass":
                 log.warning(f"⚠️ 旧流程 fallback 审核未通过: {_flagged[:200]}")
+        progress.stage("writer", "done", str(len(reply or "")))
+        if verify_status != "skip_no_tools_warned":
+            progress.stage("critic", "done", verify_status)
 
     if not pre_searched:
         pre_searched = " ".join(keywords)[:40]  # 无缓存命中时回退到关键词记录
@@ -1140,7 +1172,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
     for w in list(_cfg._quota_warnings):
         send(chat_id, w)
     _cfg._quota_warnings.clear()
-    send(chat_id, display_reply)
+    _send_reply_with_progress(progress, send, chat_id, display_reply)
 
     # 同步到 OpenHuman 记忆（来自 Telegram 渠道）
     sync_to_openhuman_memory(

@@ -1064,6 +1064,60 @@ class MemoryContextTests(unittest.TestCase):
 
 
 class ReplyIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _load_bot_module():
+        module_name = "tg_bot.bot"
+        detailed_log_stub = types.ModuleType("tg_bot.detailed_log")
+        detailed_log_stub.save_detailed_log = lambda **kwargs: None
+        with temporary_env(**required_env()):
+            with patch.dict(sys.modules, {"tg_bot.detailed_log": detailed_log_stub}):
+                sys.modules.pop(module_name, None)
+                return importlib.import_module(module_name)
+
+    def test_search_runner_passes_progress_callback_and_marks_reply_sent(self):
+        bot = self._load_bot_module()
+        events = []
+
+        class FakeProgress:
+            def stage(self, *event):
+                events.append(event)
+
+            def sending(self):
+                events.append(("sending",))
+
+            def complete(self):
+                events.append(("complete",))
+
+            def fail(self, detail):
+                events.append(("fail", detail))
+
+        progress = FakeProgress()
+
+        def fake_runner(query, keywords, *, progress_cb=None):
+            self.assertEqual(query, "今日新闻")
+            self.assertEqual(keywords, ["热点"])
+            progress_cb("gather", "start", "")
+            return "回答", "pass", {"source_index": []}
+
+        result = bot._run_search_with_progress(
+            progress,
+            fake_runner,
+            "今日新闻",
+            ["热点"],
+        )
+        delivered = bot._send_reply_with_progress(
+            progress,
+            lambda chat_id, text: chat_id == 1 and text == "回答",
+            1,
+            result[0],
+        )
+
+        self.assertTrue(delivered)
+        self.assertEqual(
+            events,
+            [("gather", "start", ""), ("sending",), ("complete",)],
+        )
+
     def test_writer_prompt_declares_stable_sections(self):
         writer = importlib.import_module("tg_bot.agents.writer")
         for heading in ("结论", "关键依据", "下一步", "来源"):
