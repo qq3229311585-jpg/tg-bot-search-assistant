@@ -60,7 +60,13 @@ _SYS_DISAMBIG = """\
   "confidence": 0.0 到 1.0,
   "reason": "一句话说明为什么选这条路径",
   "clarify_question": "如果 clear 为 false，这里写你要反问用户的问题；否则为空字符串",
-  "suggested_tool": "从上方工具菜单中选最合适的一个工具名；不确定时填 web_search"
+  "suggested_tool": "从上方工具菜单中选最合适的一个工具名；不确定时填 web_search",
+  "focus_action": "none / fill / defer / switch / clarify（见下方对话焦点规则；没有挂起意图时填 none）",
+  "goal": "当前这轮真正要达成的目标，用一句话概括；没有挂起意图时可与 user_intent 相同",
+  "missing_slot": "如果 clear 为 false，这里写清楚还缺哪个具体信息；否则为空字符串",
+  "user_deferred": true 或 false,
+  "topic_anchor": ["用于话题延续判断的锚点词，通常和 keywords 重合或是其子集"],
+  "suggested_length": "short / medium / long / detailed 之一，按问题复杂度和用户措辞粗略估计"
 }
 
 字段关系：

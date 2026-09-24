@@ -9,6 +9,73 @@ from tg_bot.tools.fetch import http_post
 
 log = logging.getLogger(__name__)
 
+# ── 消歧模型完全不可用时的兜底：代码规则粗判，好过直接默认搜索 ──────────────
+_HEURISTIC_SOCIAL_RE = re.compile(
+    r"^(谢谢|谢了|多谢|好的|好|嗯|嗯嗯|哦|哈哈|哈哈哈|ok|okay|收到|没事|晚安|早|"
+    r"早上好|辛苦了|行|可以|知道了|算了|嗯好|好嘞|明白了|了解|收到了|拜拜|再见)"
+    r"[呀啊哦呢吧啦~！!。.，,\s]*$",
+    re.IGNORECASE,
+)
+_HEURISTIC_META_RE = re.compile(
+    r"(你.*(查了没|查过没|查没查|搜了没|搜过没|有没有搜|有没有查|用了什么工具|"
+    r"哪来的|来源|出处|依据|怎么知道|从哪)|"
+    r"(刚才|上条|那条|前面).*(查|搜|来源|工具|依据))"
+)
+
+
+def _heuristic_pre(text: str, ctx=None) -> dict:
+    """消歧模型 JSON 解析彻底失败时的代码兜底判断。
+
+    不再直接返回 None 让流程默认搜索——那样会把"谢谢""好的"这类闲聊也当成
+    搜索请求处理。规则简单但保守：明确的社交/元问题短句才判闲聊，其余一律
+    按需要搜索处理，keywords 用 query_signals 兜底。
+    """
+    from tg_bot.workers.source_utils import query_signals
+
+    stripped = (text or "").strip()
+
+    if _HEURISTIC_SOCIAL_RE.match(stripped):
+        return {
+            "clear": True, "query_type": "闲聊", "keywords": [],
+            "needs_search": False, "speech_act": "social_chat",
+            "addressing_assistant": False, "needs_external_evidence": False,
+            "needs_local_tool": False, "local_tool_hint": "",
+            "topic_continuity": "none", "user_intent": "社交闲聊/确认",
+            "confidence": 0.5, "reason": "消歧模型不可用，代码规则识别为社交短句",
+            "clarify_question": "", "retry_hint": False, "prev_searches": [],
+            "focus_action": "none", "goal": "", "missing_slot": "",
+            "user_deferred": False, "topic_anchor": [], "suggested_tool": "",
+            "suggested_length": "", "heuristic": True,
+        }
+
+    if _HEURISTIC_META_RE.search(stripped):
+        return {
+            "clear": True, "query_type": "闲聊", "keywords": [],
+            "needs_search": False, "speech_act": "meta_question",
+            "addressing_assistant": True, "needs_external_evidence": False,
+            "needs_local_tool": False, "local_tool_hint": "",
+            "topic_continuity": "none", "user_intent": "追问助手自身行为",
+            "confidence": 0.5, "reason": "消歧模型不可用，代码规则识别为元问题",
+            "clarify_question": "", "retry_hint": False, "prev_searches": [],
+            "focus_action": "none", "goal": "", "missing_slot": "",
+            "user_deferred": False, "topic_anchor": [], "suggested_tool": "",
+            "suggested_length": "", "heuristic": True,
+        }
+
+    keywords = query_signals(stripped)[:5]
+    return {
+        "clear": True, "query_type": "其他", "keywords": keywords,
+        "needs_search": True, "speech_act": "factual_question",
+        "addressing_assistant": False, "needs_external_evidence": True,
+        "needs_local_tool": False, "local_tool_hint": "",
+        "topic_continuity": "none", "user_intent": stripped[:40],
+        "confidence": 0.3, "reason": "消歧模型不可用，代码规则默认按搜索处理",
+        "clarify_question": "", "retry_hint": False, "prev_searches": [],
+        "focus_action": "none", "goal": stripped[:80], "missing_slot": "",
+        "user_deferred": False, "topic_anchor": keywords, "suggested_tool": "web_search",
+        "suggested_length": "", "heuristic": True,
+    }
+
 
 def _load_features_brief():
     """从 features.md 提取功能名（· 开头行），拼成一行供 disambig 注入"""
@@ -56,7 +123,11 @@ def _pre_check(text, ctx=None, focus=None):
                 last = tl[-1]
                 # pre_searched 记录了代码层预查/缓存词
                 if last.get("pre_searched"):
-                    ps = last["pre_searched"].lstrip("缓存:").lstrip("wiki:")
+                    ps = last["pre_searched"]
+                    for _prefix in ("缓存:", "wiki:"):
+                        if ps.startswith(_prefix):
+                            ps = ps[len(_prefix):]
+                            break
                     _prev_searches = [s.strip() for s in ps.split(",") if s.strip()]
                 # model_tools 记录了 AI 自行调用的工具名
                 mt = last.get("model_tools") or []
@@ -153,19 +224,26 @@ def _pre_check(text, ctx=None, focus=None):
                  {"role": "system", "content": _SYS_DISAMBIG + _features_note + f"\n\n【当前日期】今天是 {datetime.now(timezone(timedelta(hours=8))).strftime('%Y年%m月%d日')}，提取关键词时如需年份请用此日期。"},
                  {"role": "user",   "content": user_content}
              ],
-             "max_tokens": 200,
+             "max_tokens": 600,
+             "response_format": {"type": "json_object"},
              "thinking": {"type": "disabled"}},  # 固定 JSON，对错一眼看出
             headers={"Authorization": f"Bearer {_cfg.DEEPSEEK_KEY}"},
             timeout=20
         )
         if not resp or not resp.get("choices"):
-            return None
+            log.warning("_pre_check: 空响应，转启发式兜底")
+            return _heuristic_pre(text, ctx)
         out = (resp["choices"][0]["message"].get("content") or "").strip()
         # 提取 JSON（模型可能在 ```json ... ``` 里）
         m = re.search(r'\{.*\}', out, re.DOTALL)
         if not m:
-            return None
-        data = json.loads(m.group(0))
+            log.warning(f"_pre_check: 未找到 JSON，原始输出前300字: {out[:300]!r}")
+            return _heuristic_pre(text, ctx)
+        try:
+            data = json.loads(m.group(0))
+        except Exception as _je:
+            log.warning(f"_pre_check: JSON 解析失败({_je})，原始输出前300字: {out[:300]!r}")
+            return _heuristic_pre(text, ctx)
         result = {
             "clear":            bool(data.get("clear", True)),
             "query_type":       str(data.get("query_type", "其他")),
@@ -190,11 +268,12 @@ def _pre_check(text, ctx=None, focus=None):
             "user_deferred":    bool(data.get("user_deferred", False)),
             "topic_anchor":     data.get("topic_anchor") or [],
             "suggested_tool":   str(data.get("suggested_tool", "")),
+            "suggested_length": str(data.get("suggested_length", "")),
         }
         log.info(f"🔍 意图消歧: clear={result['clear']} type={result['query_type']} "
                  f"speech={result.get('speech_act','')} external={result.get('needs_external_evidence')} "
                  f"search={result['needs_search']} kw={result['keywords']}")
         return result
     except Exception as e:
-        log.warning(f"_pre_check 异常: {e}")
-        return None
+        log.warning(f"_pre_check 异常: {e}，转启发式兜底")
+        return _heuristic_pre(text, ctx)

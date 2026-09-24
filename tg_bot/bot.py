@@ -27,7 +27,6 @@ from tg_bot.storage import (
     auto_cleanup, save_sources_file, load_today_index, list_sources_files,
     read_sources_file,
 )
-from tg_bot.facts import build_facts_json
 from tg_bot.memory import build_memory_context
 from tg_bot.progress import TelegramProgress
 from tg_bot.tools.native import execute_api_balance
@@ -41,7 +40,8 @@ from tg_bot.evidence import (
     should_use_vps_traffic, build_vps_traffic_pack,
     should_use_today_report, build_today_report_pack,
 )
-from tg_bot.workers.display import clean_reply_for_user
+from tg_bot.workers.display import clean_reply_for_user, append_verification_note
+from tg_bot.workers.source_utils import cache_match_score
 from tg_bot.lanes.router import decide_lane
 from tg_bot.commands.info import (
     handle_thinking, handle_tools, handle_sources,
@@ -54,7 +54,7 @@ from tg_bot.commands.control import (
 from tg_bot.ask_server import (
     _load_or_create_ask_token, _run_ask_server, ASK_TOKEN_FILE,
 )
-from tg_bot.search_policy import decide_search_policy
+from tg_bot.search_policy import decide_search_policy, _SOCIAL_RE
 import tg_bot.ask_server as _ask_server_mod
 import tg_bot.config as _cfg
 
@@ -95,13 +95,58 @@ def _send_reply_with_progress(progress, send_func, chat_id, text):
 
 
 def _build_fast_system_prompt(parts):
-    """Keep the original fast-chat behavior honest about not using search."""
+    """快速路径专用系统提示：只用通用人设/格式/记忆部分，替换掉搜索路径专用规则。
+
+    快速路径没有任何工具（fast_chat 不带 tools 定义），所以不能沿用完整版
+    parts 里"先调 wikipedia_lookup""调 web_search"这类工具流程指令——那些指令
+    在快速路径里根本执行不了，只会让模型自相矛盾。这里显式告诉模型它此刻没有
+    工具，遇到需要查证的问题要引导用户去 /ask，而不是编造"我去查一下"。
+    也不再有"给自己打把握分（0-100）"这种自评机制——不确定就是不确定，
+    没有分数能让不确定的内容变得可信。
+    """
     reminder = (
         "【当前回答路径】你现在直接使用自己的知识回答，没有调用任何搜索工具，"
         "没有查询外部网络。回答时不要出现「根据搜索结果」「据我查询」"
-        "「刚才搜索到」等措辞；如涉及可能变化的信息，要明确说明没有实时核验。"
+        "「刚才搜索到」「我去查一下」「正在搜索」等措辞；如涉及可能变化的信息，"
+        "要明确说明没有实时核验。\n"
+        "你此刻没有任何工具，不能搜索：只回答常识、闲聊、情感陪伴、计算、写作、代码类内容。\n"
+        "遇到需要最新信息、具体数据、冷门事实的问题：直接说明「这个需要查资料，"
+        "发送 /ask + 问题 我去搜」，可以给出你知道的大致方向，但不给具体数字、日期、排名——"
+        "没有核实过的数字说了也是猜的。"
     )
     return "\n".join(list(parts or []) + [reminder])
+
+
+# ── 上下文搜索继承（B2）：抽成纯函数，方便单独测试 ──────────────────────────
+_NO_INHERIT_SPEECH_ACTS = {"social_chat", "emotion", "meta_question", "rewrite"}
+_INHERIT_FOLLOWUP_RE = re.compile(
+    r"(多说|继续|再说|展开|详细|说说|为什么|怎么|咋|啊原因|"
+    r"哪|能说|讲讲|告诉我|还有|然后|接着|更多|深入|具体|"
+    r"举例|比如|真的吗|是这样吗|那时候|后来|结果|影响)"
+)
+
+
+def _should_inherit_search_context(text, pre, route_info):
+    """判断当前这句是否应该继承上一轮的搜索上下文（前提：上一轮确实用过工具）。
+
+    收紧规则：闲聊/情绪/元问题/改写类话语行为，或命中社交短句正则，一律不继承；
+    只有明确的"延续同一话题"信号（topic_continuity / continue_previous / 追问正则）
+    才继承。不用"≤25 字"当继承条件——短句不等于追问。
+    """
+    text = (text or "").strip()
+    pre = pre or {}
+    route_info = route_info or {}
+    if route_info.get("category") in ("元问题", "改写", "系统查询", "闲聊", "情感闲聊"):
+        return False
+    if pre.get("speech_act") in _NO_INHERIT_SPEECH_ACTS:
+        return False
+    if _SOCIAL_RE.match(text):
+        return False
+    if pre.get("topic_continuity") == "continue_same_topic":
+        return True
+    if pre.get("speech_act") == "continue_previous":
+        return True
+    return bool(_INHERIT_FOLLOWUP_RE.search(text))
 
 
 _BLOCKED_SOURCE_DOMAINS = {"baike.baidu.com", "www.baike.baidu.com"}
@@ -128,63 +173,6 @@ def _has_evidence(meta=None):
         or meta.get("tool_calls_summary")
     )
 
-
-def _maybe_override_first_gold_answer(user_text, meta):
-    """对首枚奥运金牌这种高确定性问题，直接从工具结果抽取答案。"""
-    text = (user_text or "")
-    if not (
-        ("第一枚奥运金牌" in text)
-        or ("首枚奥运金牌" in text)
-        or ("奥运金牌" in text and "哪一年" in text)
-    ):
-        return None
-
-    haystack = []
-    for item in (meta or {}).get("tool_results", []) or []:
-        haystack.append((item.get("snippet") or "")[:1200])
-    for item in (meta or {}).get("source_index", []) or []:
-        haystack.append((item.get("title") or "") + " " + (item.get("snippet") or "") + " " + (item.get("full_content") or ""))
-    for item in (meta or {}).get("fetched_pages", []) or []:
-        haystack.append((item.get("content") or "")[:1500])
-
-    joined = "\n".join(haystack)
-    m = re.search(r"(1984年(?:7月29日)?).{0,40}?(许海峰|首金|第一枚奥运会金牌|第一枚奥运金牌)", joined)
-    if not m:
-        m = re.search(r"(许海峰).{0,40}?(1984年(?:7月29日)?|首金|第一枚奥运会金牌)", joined)
-    if not m:
-        return None
-
-    fact_list = (
-        "═══ 事实清单 ═══\n"
-        f"用户问题：{user_text}\n"
-        f"采集时间：{datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        "【直接API来源】\n"
-        "[F001] 中国第一枚奥运金牌出现在1984年\n"
-        "       来源：直接API-wikipedia_lookup / 搜索结果\n"
-        '       原文片段："1984年洛杉矶奥运会，许海峰为中国夺得第一枚奥运会金牌"\n\n'
-        "【搜索来源】\n"
-        "[F002] 许海峰为中国夺得首金\n"
-        "       来源：news/搜索结果\n"
-        '       原文片段："1984年7月29日，在洛杉矶奥运会上，27岁的射击运动员许海峰为中国夺得第一枚奥运会金牌"\n\n'
-        "【未获取到】\n"
-        "（本次无）\n\n"
-        "═══ 清单结束 ═══"
-    )
-    meta = dict(meta or {})
-    meta["source_index"] = [
-        {
-            "id": "SYNTH_OLYMPIC_1",
-            "tool": "wikipedia_lookup",
-            "query": text[:40],
-            "title": "许海峰",
-            "url": "local://synthetic/olympic-gold",
-            "domain": "local://synthetic",
-            "snippet": "1984年洛杉矶奥运会，许海峰为中国夺得第一枚奥运会金牌",
-            "full_content": joined[:1500],
-        }
-    ]
-    meta["facts_json"] = build_facts_json(fact_list, meta["source_index"])
-    return fact_list, meta
 
 logging.basicConfig(
     level=logging.INFO,
@@ -233,24 +221,8 @@ _NOISE_RE = re.compile(
     re.IGNORECASE
 )
 
-_CACHE_GENERIC_TERMS = {
-    "中国", "今天", "昨天", "明天", "年份", "时间", "时候", "哪里", "哪年", "哪一", "第一", "一个",
-}
-
-
-def _cache_match_score(entry_text, keywords):
-    text = (entry_text or "").lower()
-    score = 0
-    for k in keywords or []:
-        k = (k or "").strip().lower()
-        if len(k) < 2 or k in _CACHE_GENERIC_TERMS:
-            continue
-        if k in text:
-            score += 1
-    for s in ("1984", "许海峰", "首金", "洛杉矶奥运", "第一枚奥运", "第一枚金牌"):
-        if s in text:
-            score += 1
-    return score
+# 缓存命中评分复用 workers.source_utils.cache_match_score（同一份规则，
+# 不再各写一份带写死特判的副本——B5 要求去掉针对个别问题的写死加分）。
 
 def _detect_concept(text):
     """明确概念/定义类问法 → 返回核心词"""
@@ -363,6 +335,27 @@ def _fmt_time_ago(ts_str: str) -> str:
         return ""
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 路由分四层，先后顺序固定，谁也不覆盖谁；以后要加新规则先看清楚该插在哪一层，
+# 不要在 handle() 里再叠一层临时判断：
+#   ① 消歧（pipeline._pre_check / pipeline.disambig）
+#      模型对这句话做语义判断，输出 pre dict（needs_search、speech_act、
+#      topic_continuity 等）。模型不可用时落到 _heuristic_pre 兜底，
+#      永远不会返回 None（不会再"默认搜索"地悄悄兜底）。
+#   ② SearchPolicy（search_policy.decide_search_policy）
+#      用确定性正则规则复核①的结论，能修正消歧层的明显误判（如"你讲吧"被
+#      误判为需要搜索）。这一层的输出是 route_info，包含最终 route。
+#   ③ 上下文继承（本函数内，紧跟 SearchPolicy 之后）
+#      仅当②判定不需要搜索、但上一轮确实用过工具，且当前这句明确是"延续同一
+#      话题的追问"（topic_continuity / continue_previous / 追问关键词命中）
+#      时，才强制转回搜索路径。闲聊/情绪/元问题/改写/社交短句一律不继承。
+#   ④ Lane（lanes.router.decide_lane）
+#      前三层只回答"要不要搜索"；这一层把结果落到具体执行路径：
+#      fast / search / local_tool（vps_traffic）/ report（today_report）/
+#      system（系统查询、日历）。bot.py 之后按 lane 分发到对应分支。
+# ══════════════════════════════════════════════════════════════════════════
+
+
 def handle(chat_id, text, http_mode=False, brief=False):
     """
     处理一条消息。
@@ -431,8 +424,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
         "══════════════════════════════════════\n\n"
         "【最高指令·优先级高于一切】\n"
         "不确定的事情，不说。\n"
-        "模糊的概念和细节，先用工具搜，搜到再说。\n"
-        "完全没把握的直接说不知道。\n"
+        "完全没把握的直接说不知道，需要查资料的引导用户发 /ask。\n"
         "宁可说'我不知道'，绝不输出没有把握的内容。\n"
         "══════════════════════════════════════\n\n"
         f"【当前时间】今天是 {bj_str} {bj_week}。训练数据可能滞后，以此处时间为准。\n"
@@ -449,46 +441,9 @@ def handle(chat_id, text, http_mode=False, brief=False):
         "· 最后不加'希望对你有帮助''如有疑问欢迎继续问'之类的结尾废话\n\n"
         "【格式】\n"
         "纯文本 + emoji（适度），不用任何 Markdown（不加粗、不斜体、不用#标题、不用---）。\n\n"
-        "【工具使用流程】\n"
-        "▶ 知识/概念/定义/历史/科学/人物等可核查的问题：\n"
-        "  先调 wikipedia_lookup → 有结果直接用，不再调 web_search。\n"
-        "  Wikipedia 无结果 → 转入 web_search 流程。\n\n"
-        "▶ 新闻/动态/数字/最新事件，或 Wikipedia 无结果时：\n"
-        "  用 web_search（最多10次）+ fetch_content（最多4次）+ serper_search（最多3次）。\n"
-        "  搜索要求：\n"
-        "  ① 至少换3种不同关键词/角度（原词→拆词/同义→英文→上位概念），不能第一轮没结果就放弃。\n"
-        "  ② 搜完摘要后必须调 fetch_content 抓至少一篇原文；失败立即换下一个 URL，直到成功。\n"
-        "  ③ 没有成功抓到原文之前，不允许输出最终答案。\n\n"
-        "▶ 实用技巧/生活方法/操作建议类（'怎么办''咋做''有什么方法'等）：\n"
-        "  必须先搜再答，不能直接凭经验回答。搜索结果里有什么就说什么，没有的不补充。\n"
-        "▶ 纯闲聊/主观感受/数学/代码：不需要搜索，直接回答。\n"
-        "▶ 用户只是自然使用了某个词，没有问它的意思：不解释，不查。\n\n"
-        "【常识直接放行】\n"
-        "以下情况不需要搜索，可以直接回答：\n"
-        "  · 被反复验证的自然规律（水100℃沸腾、光速约30万km/s等）\n"
-        "  · 确定无误的数学/逻辑事实\n"
-        "  · 极为广为人知、从未有争议的历史事件（如二战结束年份）\n"
-        "  · 纯粹的主观/创意/闲聊/计算类问题\n"
-        "判断标准：'这件事在任何教科书里都一样，不可能有争议' → 放行。\n"
-        "只要有一丝'我不确定这是不是准确的'，就不算常识，必须搜索。\n\n"
-        "【搜索全部失败后的三档兜底】\n"
-        "（仅在 Wikipedia + web_search + serper 全部无结果时启用）\n\n"
-        "给自己打把握分（0-100），代表对这条知识公认正确的确信程度：\n"
-        "▸ ≥ 80分：可以用知识库回答，但开头声明一句：\n"
-        "  '搜索没找到相关内容，以下是我自己知道的，把握较高，供参考。'\n"
-        "  然后正常回答，不要在正文里打任何标签。\n"
-        "▸ 50-79分：先补救搜索一轮（换宽泛词/英文/上位概念）；\n"
-        "  补救搜到 → 基于结果回答；\n"
-        "  补救仍无结果 → 直接说不知道，不要凭印象猜。\n"
-        "▸ < 50分：先判断这是不是一个客观事实问题——\n"
-        "  是事实问题但就是没找到 → 只说'没找到相关信息，不知道。'\n"
-        "  不是事实问题（主观/创意/计算等）→ 直接回答。\n\n"
         "【回复格式】\n"
         "正文里不写任何来源标签，不写（推测）（估计值）（经验补充）（Wiki）等括号注释。\n"
-        "来源信息只在你自己心里记着，用于被追问时如实说明，不出现在正文里。\n"
-        "如果整体把握不足，只在开头整体声明一句，其余正文正常写。\n\n"
-        "【严格忠于搜索原文】\n"
-        "有搜索结果时，只按原始表述叙述，不夸大、不推断、不添加细节。\n\n"
+        "来源信息只在你自己心里记着，用于被追问时如实说明，不出现在正文里。\n\n"
         "【禁止伪造来源】\n"
         "绝对不能在正文里编一个看起来像网站的名字（如'KitchenToolsTips'等）当作来源出处。\n"
         "来源只记在心里，被问时再说，不主动写进回复。\n\n"
@@ -631,34 +586,25 @@ def handle(chat_id, text, http_mode=False, brief=False):
         if keywords:
             log.info(f"🧭 SearchPolicy 关键词兜底: {keywords}")
 
-    # 上下文搜索继承：前文用过工具 + 当前是追问 → 强制走搜索路
-    if (not needs_search and _ctx_turns
-            and route_info.get("category") not in ("元问题", "改写", "系统查询", "闲聊", "情感闲聊")):
+    # 上下文搜索继承：前文用过工具 + 当前明确是在延续/追问同一话题 → 强制走搜索路
+    if not needs_search and _ctx_turns and _should_inherit_search_context(text, pre, route_info):
         try:
             _tl = load_toollog()
             if _tl:
                 _last = _tl[-1]
                 _last_had_tools = bool(_last.get("model_tools")) or bool(_last.get("pre_searched"))
                 if _last_had_tools:
-                    import re as _re2
-                    _FOLLOWUP = _re2.compile(
-                        r"(多说|继续|再说|展开|详细|说说|为什么|怎么|咋|啊原因|"
-                        r"哪|能说|讲讲|告诉我|还有|然后|接着|更多|深入|具体|"
-                        r"举例|比如|真的吗|是这样吗|那时候|后来|结果|影响)"
-                    )
-                    _is_followup = len(text.strip()) <= 25 or bool(_FOLLOWUP.search(text))
-                    if _is_followup:
-                        needs_search = True
-                        route_info.update({
-                            "route": "search",
-                            "reason": "上轮使用过搜索/工具，当前是追问，继承搜索上下文",
-                            "category": "上下文追问",
-                            "policy_override": True,
-                        })
-                        if not keywords:
-                            _prev_u = _last.get("user", "")
-                            keywords = [w for w in re.split(r"[，。？！,.?!\s]+", _prev_u) if len(w) >= 2][:5]
-                        log.info(f"🔗 上下文继承：前文有工具，当前追问 → 强制搜索 kw={keywords}")
+                    needs_search = True
+                    route_info.update({
+                        "route": "search",
+                        "reason": "上轮使用过搜索/工具，当前是追问，继承搜索上下文",
+                        "category": "上下文追问",
+                        "policy_override": True,
+                    })
+                    if not keywords:
+                        _prev_u = _last.get("user", "")
+                        keywords = [w for w in re.split(r"[，。？！,.?!\s]+", _prev_u) if len(w) >= 2][:5]
+                    log.info(f"🔗 上下文继承：前文有工具，当前追问 → 强制搜索 kw={keywords}")
         except Exception as _ctx_e:
             log.debug(f"上下文继承检查失败: {_ctx_e}")
     # ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
@@ -734,8 +680,13 @@ def handle(chat_id, text, http_mode=False, brief=False):
     progress = TelegramProgress(chat_id, tg, enabled=not http_mode)
     progress.set_route(lane_decision.name)
 
+    # 系统查询（问 bot 自身功能/配置，不含日历）：功能清单已经在系统提示里，
+    # 不需要搜索也不需要走完整 pipeline，直接快速路径回答即可；但它不是"没有
+    # 依据的模型自由发挥"，所以标记为 system_info，不加"AI-no references"。
+    _is_system_info = (lane_decision.name == "system" and query_type == "系统查询")
+
     # ── 纯快速路径：不搜索、不调用工具、不进入新 pipeline ───────────────────
-    if lane_decision.name == "fast":
+    if lane_decision.name == "fast" or _is_system_info:
         is_fast_path = True
         meta = {
             "rounds": [],
@@ -747,30 +698,40 @@ def handle(chat_id, text, http_mode=False, brief=False):
             "facts_json": {},
         }
         verify_status = "skip"
-        reference_mode = "pure_model"
+        reference_mode = "system_info" if _is_system_info else "pure_model"
         evidence_flags = []
+        # history 在进入 lane 分支之前已经 append 过当前用户消息一次（约在消歧层之前），
+        # 这里用 history[:-1][-8:] 取"当前消息之前"的最近 8 轮，再手动补一次当前消息，
+        # 避免当前消息在喂给模型的上下文里出现两次。
         _fast_messages = [
             {"role": m.get("role"), "content": m.get("content", "")}
-            for m in history[-8:]
+            for m in history[:-1][-8:]
             if m.get("role") in ("user", "assistant")
         ]
         _fast_messages.append({"role": "user", "content": text})
         progress.stage("writer", "start", "")
+        if _is_system_info:
+            # 系统查询用完整人设+功能清单提示，不套用"你没有工具"的快速路径话术
+            # ——那套话术是给真正的闲聊/知识问答准备的，系统查询答的是 bot 自己。
+            _sys_prompt = "\n".join(list(parts or []))
+        else:
+            _sys_prompt = _build_fast_system_prompt(parts)
         reply = fast_chat(
             _fast_messages,
-            system=_build_fast_system_prompt(parts),
+            system=_sys_prompt,
             max_tokens=900,
-            temp=0.6,
+            temp=0.5,
         )
         write_reasoning = ""
-        reply = _mark_no_references(reply)
+        if not _is_system_info:
+            reply = _mark_no_references(reply)
         display_reply = _render_display_reply(reply, meta=meta, mode="answer")
         progress.stage("writer", "done", str(len(display_reply)))
 
-        history.append({"role": "user", "content": text, "ts": _now_ts()})
+        # 当前用户消息已经在进入本分支前写入过 history/daily_log 一次，这里只补写
+        # assistant 的回复，不再重复写 user 那一条。
         history.append({"role": "assistant", "content": display_reply, "ts": _now_ts()})
         if not http_mode:
-            append_daily_log("user", text)
             append_daily_log("assistant", display_reply)
 
         save_worklog_entry({
@@ -858,7 +819,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
             _relevant = [
                 e for e in _today_idx
                 if not _is_blocked_source(e)
-                and _cache_match_score(
+                and cache_match_score(
                     e.get("query","") + " " + e.get("title","") + " " +
                     e.get("snippet_head","") + " " + e.get("session_user",""),
                     _kw_low,
@@ -937,7 +898,13 @@ def handle(chat_id, text, http_mode=False, brief=False):
         from tg_bot.core.pipeline import run_search_pipeline
         history_context = history[:-1]
         if summary or memory_turns:
-            history_context = [{"role": "assistant", "content": memory_context}] + history_context
+            # 不再把 memory_context 伪装成一条 assistant 消息塞进历史——Writer 不会把
+            # history_context 当 messages 直接喂给模型，这里用 role="memory" 标记，
+            # Writer 只会把它放进"对话背景"说明段，不会被当成真实的对话轮次。
+            history_context = [{"role": "memory", "content": memory_context}] + history_context
+        _local_sources_for_pipeline = (
+            (local_evidence_pack or {}).get("source_index") if lane_decision.name in ("local_tool", "report") else None
+        )
         reply, verify_status, meta = _run_search_with_progress(
             progress,
             run_search_pipeline,
@@ -951,6 +918,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
             prev_searches=_prev_searches,
             focus_task=_focus_task,
             suggested_length=(pre or {}).get("suggested_length", ""),
+            local_sources=_local_sources_for_pipeline,
         )
         meta = meta or {}
         source_index_result = meta.get("source_index", []) or []
@@ -976,11 +944,6 @@ def handle(chat_id, text, http_mode=False, brief=False):
             focus_task=_focus_task,
             status_cb=progress.stage if progress.enabled else None,
         )
-        _override = _maybe_override_first_gold_answer(text, meta)
-        if _override:
-            source_index_result, meta = _override
-            log.warning("⚠️ 首枚奥运金牌问题触发直接答案兜底，跳过模型归纳")
-
         progress.stage("writer", "start", "")
         if not meta.get("tool_calls_summary") and not meta.get("source_index"):
             log.warning("⚠️ 搜索路径但采集AI未调用任何工具，回复基于纯模型知识")
@@ -1066,6 +1029,11 @@ def handle(chat_id, text, http_mode=False, brief=False):
         else "search" if evidence_flags else "answer"
     )
     display_reply = _render_display_reply(raw_reply, meta=meta, mode=display_mode)
+    if meta.get("verification"):
+        display_reply = append_verification_note(display_reply, meta.get("verification"))
+    route_info["verification"] = meta.get("verification")
+    route_info["patch_modes"] = meta.get("patch_modes", [])
+    route_info["critic_issues"] = meta.get("critic_issues", [])
 
     history.append({"role": "assistant", "content": display_reply, "ts": _now_ts()})
     if not http_mode:
