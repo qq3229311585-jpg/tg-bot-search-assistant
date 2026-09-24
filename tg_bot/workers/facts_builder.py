@@ -33,6 +33,7 @@ def build_minimal_facts_json(source_index: list[dict] | None) -> dict:
             "url": src.get("url") or "",
             "excerpt": compact_excerpt(body, query, 520),
             "tool": src.get("tool") or "",
+            "published_at": src.get("published_at") or "",
         })
     return {
         "schema_version": 1,

@@ -24,6 +24,7 @@ class Source:
     query: str = ""             # 触发此来源的搜索词
     score: float = 0.0          # Curator 打分后设置
     fetched_at: Optional[datetime] = None
+    published_at: str = ""      # 素材发布日期（YYYY-MM-DD），未知则空串
 
     @property
     def body(self) -> str:
@@ -57,6 +58,8 @@ class WriteRequest:
     style_hints: list[str] = field(default_factory=list)       # ["use_emoji", "intro_style"]
     reject_feedback: str = ""       # Critic 退回时的具体问题（重写用）
     verifier_checks: list[dict] = field(default_factory=list)  # Critic 原始 check 列表
+    evidence_sufficient: bool = True  # 采集层判断素材是否足以完整回答
+    evidence_gaps: str = ""           # 素材不足时，缺口说明（供 Writer 提示用户）
 
 
 # ── 核查报告（Critic 输出）──────────────────────────────────────────────────
@@ -69,6 +72,7 @@ class Issue:
     reason: str                 # 一句话说明问题
     suggested_fix: str = ""     # Patcher 可参考的修改建议
     evidence_excerpt: str = ""  # 原始素材中的对应原文
+    origin: Literal["rule", "llm"] = "llm"  # 问题是代码规则查出的还是模型审出的
 
 
 @dataclass
@@ -79,6 +83,8 @@ class CriticReport:
     # patch: 有 SOFT/HARD 问题，交 Patcher 做最小改动
     # rewrite: 问题太多，交 Writer 重写
     # unknown: 审核模型/JSON 格式失败，记录但不强制重写
+    llm_failed: bool = False        # 模型调用/解析失败（verdict 仅由规则问题推出时为 True）
+    rule_issue_count: int = 0       # 合并前，规则检查产生的问题数
 
 
 # ── 补丁指令（Critic → Patcher）────────────────────────────────────────────

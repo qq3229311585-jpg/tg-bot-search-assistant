@@ -84,8 +84,12 @@ def curate(
     # 1. 去重
     deduped = deduplicate(sources)
 
-    # 2. 过滤空页/导航页
-    valid = [s for s in deduped if not is_nav_or_empty(s.title, s.body)]
+    # 2. 过滤空页/导航页/空 body（保证进入 Writer 的来源列表里没有空 body，
+    #    编号才能和 format_sources_for_writer 的下标+1 对上）
+    valid = [
+        s for s in deduped
+        if s.body and not is_nav_or_empty(s.title, s.body, s.tool)
+    ]
 
     # 3. 打分
     for s in valid:

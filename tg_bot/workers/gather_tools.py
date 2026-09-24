@@ -10,6 +10,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from datetime import datetime, timezone, timedelta
 
 from tg_bot.workers.source_utils import (
     extract_wiki_title,
@@ -18,6 +19,47 @@ from tg_bot.workers.source_utils import (
 )
 
 log = logging.getLogger(__name__)
+
+_DATE_TAG_RE = re.compile(r'\[([^\[\]]{1,40})\]\s*$')
+_ISO_DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}')
+_RELATIVE_AGE_RE = re.compile(
+    r'(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago', re.I
+)
+_RELATIVE_DELTA = {
+    "second": lambda n: timedelta(seconds=n),
+    "minute": lambda n: timedelta(minutes=n),
+    "hour": lambda n: timedelta(hours=n),
+    "day": lambda n: timedelta(days=n),
+    "week": lambda n: timedelta(weeks=n),
+    "month": lambda n: timedelta(days=n * 30),
+    "year": lambda n: timedelta(days=n * 365),
+}
+
+
+def _bj_now() -> datetime:
+    return datetime.now(timezone(timedelta(hours=8)))
+
+
+def parse_date_tag(raw: str) -> str:
+    """把标题末尾的 [YYYY-MM-DD] / [x days ago] / [2 hours ago] 转成绝对日期。
+
+    解析不出来时返回空串（不是所有素材都带日期）。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    m_iso = _ISO_DATE_RE.match(raw)
+    if m_iso:
+        return m_iso.group(0)
+    m_rel = _RELATIVE_AGE_RE.search(raw)
+    if m_rel:
+        n = int(m_rel.group(1))
+        unit = m_rel.group(2).lower()
+        delta_fn = _RELATIVE_DELTA.get(unit)
+        if delta_fn:
+            dt = _bj_now() - delta_fn(n)
+            return dt.strftime("%Y-%m-%d")
+    return ""
 
 
 def _domain_from_url(url: str) -> str:
@@ -77,7 +119,10 @@ def parse_search_entries(
             continue
         url = lines[-1].strip()
         domain = _domain_from_url(url)
-        title_line = lines[0].lstrip("• ").split("[")[0].strip()[:80]
+        raw_title_line = lines[0].lstrip("• ").strip()
+        date_match = _DATE_TAG_RE.search(raw_title_line)
+        published_at = parse_date_tag(date_match.group(1)) if date_match else ""
+        title_line = (_DATE_TAG_RE.sub('', raw_title_line).strip() or raw_title_line)[:80]
         snippet = " ".join(l.strip() for l in lines[1:-1])[:300]
         if not source_matches_query(query, title_line, snippet, domain, url=url):
             log.info(f"🧹 过滤无关搜索源：{domain} | {title_line[:40]}")
@@ -91,6 +136,7 @@ def parse_search_entries(
             "domain": domain,
             "snippet": snippet,
             "full_content": None,
+            "published_at": published_at,
         })
     return entries
 

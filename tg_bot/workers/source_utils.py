@@ -4,10 +4,13 @@
 从 pipeline/gather.py 提取，均为无副作用纯函数，可单独测试。
 """
 from __future__ import annotations
+import logging
 import re
 from typing import Optional
 
 from tg_bot.core.contracts import Source
+
+log = logging.getLogger(__name__)
 
 
 # ── 查询信号提取 ──────────────────────────────────────────────────────────────
@@ -127,15 +130,35 @@ _CACHE_GENERIC_TERMS = {
 }
 
 
-def is_nav_or_empty(title: str, body: str) -> bool:
-    """是否是导航页 / 空页（应过滤）。"""
-    if len((body or "").strip()) < 200:
+_LONG_BODY_TOOLS = {"fetch_content", "wikipedia_lookup", "read_today_cache"}
+_SNIPPET_TOOLS = {"web_search", "serper_search"}
+
+
+def is_nav_or_empty(title: str, body: str, tool: str = "") -> bool:
+    """是否是导航页 / 空页（应过滤）。
+
+    不同工具的“正常长度”差别很大：抓全文/查百科应有几百字以上，
+    搜索摘要本来就短，直接 API 工具的返回从不按长度过滤。
+    """
+    body_len = len((body or "").strip())
+    if body_len == 0:
+        return True
+    tool = (tool or "").strip()
+    if tool in _DIRECT_API_TOOLS:
+        min_len = 1
+    elif tool in _SNIPPET_TOOLS:
+        min_len = 40
+    elif tool in _LONG_BODY_TOOLS or not tool:
+        min_len = 200
+    else:
+        min_len = 40
+    if body_len < min_len:
         return True
     return any(t and t in (title or "").lower().strip() for t in _NAV_TITLES)
 
 
 def cache_match_score(entry_text: str, keywords) -> int:
-    """今日库存/缓存命中评分。"""
+    """今日库存/缓存命中评分：按关键词命中数计分，不对特定问题加分。"""
     text = (entry_text or "").lower()
     score = 0
     for k in keywords or []:
@@ -144,50 +167,7 @@ def cache_match_score(entry_text: str, keywords) -> int:
             continue
         if k in text:
             score += 1
-    for s in ("1984", "许海峰", "首金", "洛杉矶奥运", "第一枚奥运", "第一枚金牌"):
-        if s in text:
-            score += 1
     return score
-
-
-def fact_list_supports_query(fact_list: str, keywords) -> bool:
-    """判断采集 AI 输出的事实清单是否覆盖用户查询。"""
-    hay = (fact_list or "").lower()
-    if not hay:
-        return False
-
-    first_gold_mode = any(
-        "第一枚奥运金牌" in (k or "")
-        or ("第一枚" in (k or "") and "奥运" in (k or ""))
-        or "首枚奥运金牌" in (k or "")
-        for k in (keywords or [])
-    )
-    if first_gold_mode:
-        return any(s in hay for s in ("许海峰", "首金", "第一枚奥运", "1984年7月29日", "1984"))
-
-    if re.search(r"(18|19|20)\d{2}", hay):
-        return True
-
-    generic_terms = {
-        "中国", "年份", "时间", "时候", "第一", "一个", "奥运金牌", "奥运", "金牌",
-        "首金", "百科", "维基", "来源", "直接api", "wikipedia_lookup", "web_search",
-    }
-    for k in keywords or []:
-        k = (k or "").strip().lower()
-        if not k or k in generic_terms:
-            continue
-        min_len = 2 if any("\u4e00" <= c <= "\u9fff" for c in k) else 5
-        if len(k) >= min_len and k in hay:
-            return True
-
-    if len(re.findall(r"^\[F\d{3}\]", fact_list or "", re.M)) >= 3 and len(hay.strip()) > 500:
-        return True
-
-    zh_char_count = sum(1 for c in hay if "\u4e00" <= c <= "\u9fff")
-    if zh_char_count / max(len(hay), 1) < 0.10 and len(hay.strip()) > 100:
-        return True
-
-    return any(s in hay for s in ("1984", "许海峰", "第一枚奥运金牌", "中国第一枚奥运金牌"))
 
 
 def score_source(s: Source, query: str = "") -> float:
@@ -235,10 +215,10 @@ def score_source(s: Source, query: str = "") -> float:
 
 
 def deduplicate(sources: list[Source]) -> list[Source]:
-    """去重：直接 API 工具只保留最新一条，其他按 url/snippet 去重。"""
+    """去重：直接 API 工具只保留最新一条；同 URL 有摘要又有全文时保留全文更长者。"""
     seen_tools: dict[str, int] = {}
-    seen_keys: set[str] = set()
-    result = []
+    by_key: dict[str, int] = {}   # key -> result 中的下标
+    result: list[Source] = []
 
     # 先扫一遍，记录每个直接API工具最后出现的位置
     for i, s in enumerate(sources):
@@ -250,27 +230,39 @@ def deduplicate(sources: list[Source]) -> list[Source]:
         if s.tool in _DIRECT_API_TOOLS:
             if seen_tools.get(s.tool) != i:
                 continue
-        # 其他：按 url / snippet 去重
+        # 其他：按 url / snippet 去重，同 key 保留正文更长（更完整）的一条
         key = s.url or (s.snippet or "")[:60]
-        if key and key in seen_keys:
+        if key and key in by_key:
+            existing_idx = by_key[key]
+            if len(s.body) > len(result[existing_idx].body):
+                result[existing_idx] = s
             continue
         if key:
-            seen_keys.add(key)
+            by_key[key] = len(result)
         result.append(s)
 
     return result
 
 
 def format_sources_for_writer(sources: list[Source], max_body: int = 2500) -> str:
-    """把编号 sources 格式化为 Writer 使用的 [来源N] 素材文本。"""
+    """把编号 sources 格式化为 Writer 使用的 [来源N] 素材文本。
+
+    列表下标+1 = 编号，Writer/Critic/Patcher/claim_check 必须用同一份 sources 列表，
+    保证编号一致。空 body 的来源应在 Curator 阶段就被剔除；这里跳过只是兜底防御，
+    一旦触发会记日志，因为会导致编号跳号。
+    """
     lines = []
     for i, s in enumerate(sources, 1):
         title = (s.title or s.domain or "")[:80]
         domain = (s.domain or s.tool or "")[:40]
         body = s.body.replace("\n", " ").strip()[:max_body]
         if not body:
+            log.warning(f"format_sources_for_writer: 来源{i}（{s.url or domain}）正文为空，被跳过，"
+                        "会导致后续编号跳号，应在 Curator 阶段过滤")
             continue
-        lines.append(f"[来源{i}] {title}（{domain}）")
+        published = (getattr(s, "published_at", "") or "").strip()
+        date_suffix = f"，发布于 {published}" if published else ""
+        lines.append(f"[来源{i}] {title}（{domain}{date_suffix}）")
         lines.append(body)
         lines.append("")
     return "\n".join(lines)

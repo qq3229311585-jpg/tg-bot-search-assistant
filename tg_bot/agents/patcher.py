@@ -3,7 +3,7 @@
 
 职责（只做这一件事）：
   输入：草稿文本 + CriticReport（含 Issue 列表）
-  输出：修改后的文本
+  输出：修改后的文本 + patch_mode（"model" 或 "deterministic"）
 
 不做的事：
   - 不判断哪里有问题（那是 Critic 的事）
@@ -14,12 +14,18 @@
   - [SOFT]：保留信息点，改写措辞更贴近原文（不删除）
   - [HARD]：删除整句，或替换为"目前资料未明确说明"
   - 未被标记的句子：一字不动
+
+越界保护：
+  模型输出的补丁要经过 claim_check.validate_patch 校验——
+  未点名句子改动过多 / 删得太狠 / 引入新的无来源数字 / 留下修改痕迹，
+  任一项没过，就弃用模型输出，改用 claim_check.deterministic_patch 做纯规则修补。
 """
 from __future__ import annotations
 import logging
 
 from tg_bot.core.contracts import CriticReport, Source
 from tg_bot.workers.source_utils import format_sources_for_writer
+from tg_bot.workers import claim_check
 
 log = logging.getLogger(__name__)
 
@@ -45,16 +51,17 @@ def patch(
     report: CriticReport,
     sources: list[Source],
     user_query: str = "",
-) -> str:
+) -> tuple[str, str]:
     """
     按 CriticReport 的 issues 对 reply 做最小改动。
-    失败时返回原始 reply（宁可原文也不引入新错误）。
+    返回 (patched_text, patch_mode)，patch_mode 为 "model" 或 "deterministic"。
+    模型输出越界或调用失败时，退回确定性修补（宁可少改，也不可引入新错误）。
     """
     import tg_bot.config as _cfg
     from tg_bot.tools.fetch import http_post
 
     if not report.issues:
-        return reply
+        return reply, "none"
 
     # 构建问题清单文本
     issue_lines = []
@@ -67,7 +74,8 @@ def patch(
             line += f"\n  原文片段：{iss.evidence_excerpt[:100]}"
         issue_lines.append(line)
 
-    sources_brief = format_sources_for_writer(sources, max_body=800)
+    # 与 Critic 一致，给足原文长度，不再只给 800 字截断素材
+    sources_brief = format_sources_for_writer(sources, max_body=2500)
 
     user_msg = (
         f"【需要修改的草稿】\n{reply}\n\n"
@@ -75,6 +83,10 @@ def patch(
     )
     if sources_brief:
         user_msg += f"\n\n【原文参考（改写 SOFT 问题时参考）】\n{sources_brief}"
+
+    def _deterministic(reason: str) -> tuple[str, str]:
+        log.warning(f"Patcher 改用确定性修补：{reason}")
+        return claim_check.deterministic_patch(reply, report.issues, sources), "deterministic"
 
     try:
         resp = http_post(
@@ -95,10 +107,12 @@ def patch(
         if resp and resp.get("choices"):
             patched = (resp["choices"][0]["message"].get("content") or "").strip()
             if patched:
-                log.info(f"🔧 Patcher 完成，{len(patched)} 字（原 {len(reply)} 字）")
-                return patched
+                ok, why = claim_check.validate_patch(reply, patched, report.issues, sources)
+                if ok:
+                    log.info(f"🔧 Patcher 完成，{len(patched)} 字（原 {len(reply)} 字）")
+                    return patched, "model"
+                return _deterministic(why)
     except Exception as e:
         log.warning(f"patcher 异常: {e}")
 
-    log.warning("Patcher 失败，返回原稿")
-    return reply
+    return _deterministic("模型调用失败或空响应")

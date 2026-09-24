@@ -120,6 +120,13 @@ def _format_thinking_digest(th, tool_log=None, *, max_chars=2600):
         step += 1
     if verify_status or verifier_verdict:
         out.append(f"{step}. 核查：{verdict_label}")
+    _verification = route_info.get("verification") or {}
+    _v_level = str(_verification.get("level") or "").strip()
+    if _v_level:
+        out.append(f"   核查结论级别：{_v_level}"
+                    f"（删除{_verification.get('removed_count', 0)}处 / "
+                    f"规则问题{_verification.get('rule_issue_count', 0)} / "
+                    f"模型问题{_verification.get('llm_issue_count', 0)}）")
 
     if tools:
         out.append("")

@@ -130,7 +130,9 @@ def execute_search(query, search_type="general"):
         items = sorted(items, key=lambda r: _preferred_rank(r.get("url", "")))
         lines = []
         for r in items[:5]:
-            lines.append(f"• {r.get('title','')}\n"
+            date_raw = r.get("page_age") or r.get("age") or ""
+            date_tag = f" [{date_raw}]" if date_raw else ""
+            lines.append(f"• {r.get('title','')}{date_tag}\n"
                          f"  {r.get('description','')[:200]}\n"
                          f"  {r.get('url','')}")
         return "\n\n".join(lines)
