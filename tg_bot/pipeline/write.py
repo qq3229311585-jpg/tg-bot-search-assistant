@@ -301,7 +301,13 @@ def write_ai(user_text, fact_list, history_context=None, reject_feedback="", fac
 
     msgs_write = []
     if history_context:
-        msgs_write.extend(history_context[-6:])  # 最近 3 轮对话给写作 AI 做语境
+        # 最近 3 轮对话给写作 AI 做语境；只保留 API 认可的角色（过滤 role="memory" 标记）
+        msgs_write.extend(
+            {"role": m["role"], "content": m.get("content", "")}
+            for m in history_context
+            if m.get("role") in ("user", "assistant")
+        )
+        msgs_write[:] = msgs_write[-6:]
     msgs_write.append({"role": "user", "content": user_content})
 
     try:

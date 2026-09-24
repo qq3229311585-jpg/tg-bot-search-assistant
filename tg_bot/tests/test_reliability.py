@@ -717,5 +717,33 @@ class WriterRequestTests(unittest.TestCase):
         self.assertIn("不能作为事实来源", user_content)
 
 
+class ReviewRegressionTests(unittest.TestCase):
+    def test_thousands_separator_before_cn_unit_is_supported(self):
+        src = Source(id="1", url="https://a.com/x", domain="a.com", title="t", snippet="",
+                     full_content="该公司2024年营收为1,234亿元，同比增长12.5%。" * 3)
+        issues = claim_check.check_claims("营收1234亿元[来源1]。\n营收为1,234亿元[来源1]。", [src], "")
+        self.assertEqual(issues, [])
+
+    def test_legacy_write_ai_drops_memory_role_from_messages(self):
+        captured = {}
+
+        def fake_post(url, payload, headers=None, timeout=None):
+            captured["payload"] = payload
+            return {"choices": [{"message": {"content": "正文", "reasoning_content": ""}}]}
+
+        history = [
+            {"role": "memory", "content": "长期记忆"},
+            {"role": "user", "content": "上一问", "ts": "x"},
+            {"role": "assistant", "content": "上一答", "ts": "x"},
+        ]
+        with temporary_env(**required_env()):
+            from tg_bot.pipeline import write as legacy_write
+            with patch.object(legacy_write, "http_post", side_effect=fake_post):
+                legacy_write.write_ai("问题", "", history_context=history, source_index=[])
+        messages = captured["payload"]["messages"]
+        self.assertNotIn("memory", {m["role"] for m in messages})
+        self.assertTrue(all(set(m) <= {"role", "content"} for m in messages))
+
+
 if __name__ == "__main__":
     unittest.main()

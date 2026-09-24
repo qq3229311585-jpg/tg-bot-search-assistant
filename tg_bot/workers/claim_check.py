@@ -170,8 +170,9 @@ def _normalize_text(text: str) -> str:
     text = text or ""
     text = _MD_LINK_RE.sub(r'\1', text)
     text = text.translate(_FULLWIDTH_DIGITS)
-    # 去掉数字千分位分隔符（不影响小数点，因为上面已转换为 .）
-    text = re.sub(r'(?<=\d),(?=\d{3}\b)', '', text)
+    # 去掉数字千分位分隔符（不影响小数点，因为上面已转换为 .）；
+    # 不用 \b：中文单位（亿/万）也是单词字符，"1,234亿" 会匹配不上
+    text = re.sub(r'(?<=\d),(?=\d{3}(?!\d))', '', text)
     return text
 
 
