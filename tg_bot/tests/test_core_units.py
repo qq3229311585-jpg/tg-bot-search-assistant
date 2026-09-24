@@ -23,7 +23,6 @@ from tg_bot.search_policy import decide_search_policy
 from tg_bot.workers.source_utils import (
     cache_match_score,
     compact_excerpt,
-    fact_list_supports_query,
     is_nav_or_empty,
     source_matches_query,
 )
@@ -743,11 +742,9 @@ class SourceUtilsTests(unittest.TestCase):
         self.assertFalse(is_nav_or_empty("Tornado Safety", "正文" * 120))
 
     def test_cache_match_score_ignores_generic_terms(self):
-        self.assertGreater(cache_match_score("许海峰 1984 洛杉矶奥运 首金", ["中国", "许海峰"]), 0)
-
-    def test_fact_list_supports_chinese_short_keywords(self):
-        fact_list = "[F001] 龙卷风发生时应进入低层无窗房间。"
-        self.assertTrue(fact_list_supports_query(fact_list, ["龙卷风", "应对"]))
+        # 通用词（"中国"）不计分，具体关键词命中才计分——不依赖任何写死的问题特判。
+        self.assertEqual(cache_match_score("今天天气不错", ["中国"]), 0)
+        self.assertGreater(cache_match_score("某地气温达到37度", ["气温"]), 0)
 
     def test_compact_excerpt_prefers_matching_lines(self):
         text = "导航菜单\n" + "龙卷风来临时，应立即前往地下室或低层无窗房间躲避。" * 4
@@ -1839,13 +1836,18 @@ class DailyReportCollectionTests(unittest.TestCase):
                 for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
                     sys.modules.pop(module_name, None)
                 module = self._load_builder("build_daily_report_push_retry")
+                # published_at 必须相对"运行时的当前时间"是新鲜的，否则会被新鲜度过滤
+                # 掉（选中事件数变成 0）。之前写死成固定日期，日历往前走几个月后
+                # 这个日期就变成"一天以前"，测试开始随钟表漂移而失败——这是测试本身
+                # 依赖挂钟时间不稳，不是被测代码的 bug，所以改成运行时动态计算。
+                recent_ts = module.datetime.now(module.timezone.utc).isoformat()
                 candidate = module.NewsCandidate(
                     category="global",
                     title="Stable headline",
                     summary="summary",
                     url="https://example.com/stable",
                     domain="example.com",
-                    published_at="2026-07-14T10:00:00+00:00",
+                    published_at=recent_ts,
                     relevance=0.9,
                     source="fixture",
                 )
