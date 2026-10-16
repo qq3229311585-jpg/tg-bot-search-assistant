@@ -547,3 +547,170 @@ def run_query(q, *, deps=None, now=None):
                                sources, conflicts, rejected)
     except Exception as exc:
         return _not_found(q, "any", stamp, [q], f"内部错误: {type(exc).__name__}")
+
+
+def load_env_file(path, environ):
+    """读取 KEY=VALUE 形式的环境文件(同 systemd EnvironmentFile 的简单子集),不覆盖已有变量。"""
+    import re as _re
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return 0
+    count = 0
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        environ.setdefault(key, value)
+        count += 1
+    return count
+
+
+class _QueryTimeout(BaseException):
+    """超时信号专用:继承 BaseException,避免被内部 `except Exception` 吞掉。"""
+
+
+def _audit(log_path, status, q, started, result_chars):
+    """追加一行 JSON 审计日志；任何异常都吞掉，不影响主流程。"""
+    try:
+        import hashlib
+        import time
+        from datetime import datetime as _dt, timezone as _tz
+        q = q or ""
+        line = json.dumps({
+            "ts": _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "status": status,
+            "q_sha256": hashlib.sha256(q.encode("utf-8")).hexdigest(),
+            "q": q[:300],
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "result_chars": result_chars,
+        }, ensure_ascii=False)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def main(argv=None, *, stdin_bytes=None, runner=None, env=None):
+    """命令行入口：返回退出码 0 成功 / 1 查询失败 / 2 输入无效 / 3 已暂停 / 4 忙 / 5 超时。"""
+    import os
+    import sys
+    import time
+    import signal
+    import fcntl
+
+    if env is None:
+        env = os.environ
+        env_file = env.get("MUSE_SEARCH_ENV_FILE")
+        if env_file:
+            load_env_file(env_file, os.environ)
+    if runner is None:
+        runner = run_query
+    started = time.monotonic()
+    disabled_file = env.get("MUSE_SEARCH_DISABLED_FILE", "/etc/muse-search.disabled")
+    lock_dir = env.get("MUSE_SEARCH_LOCK_DIR", "/var/lib/morning-report/muse-search")
+    log_path = env.get("MUSE_SEARCH_LOG", "/var/log/muse-search.log")
+    try:
+        timeout = int(env.get("MUSE_SEARCH_TIMEOUT", "180"))
+    except (TypeError, ValueError):
+        timeout = 180
+
+    def emit(text):
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+
+    if (getattr(sys.stdout, "encoding", "") or "").lower().replace("-", "") != "utf8":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+    if os.path.exists(disabled_file):
+        emit("查询工具已被管理员暂停。")
+        _audit(log_path, "disabled", "", started, 0)
+        return 3
+
+    if stdin_bytes is None:
+        stdin_bytes = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
+    q, err = validate_request(stdin_bytes)
+    if q is None:
+        emit(f"输入无效: {err}")
+        _audit(log_path, "invalid", "", started, 0)
+        return 2
+
+    slot = None
+    try:
+        os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+        for name in ("slot0", "slot1"):
+            fh = open(os.path.join(lock_dir, name), "a+")
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fh.close()
+                continue
+            except OSError:
+                fh.close()
+                break  # 锁机制异常：放行，不阻断查询
+            slot = fh
+            break
+        else:
+            emit("服务正忙,请稍后再试。")
+            _audit(log_path, "busy", q, started, 0)
+            return 4
+    except OSError:
+        slot = None  # 目录或文件异常：放行，不阻断查询
+
+    def _on_alarm(signum, frame):
+        raise _QueryTimeout()
+
+    try:
+        if timeout <= 0:
+            timeout = 180
+        try:
+            old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+        except (ValueError, OSError):
+            old_handler = None  # 非主线程等情况：无超时保护
+        try:
+            if old_handler is not None:
+                signal.alarm(timeout)
+            try:
+                result = runner(q)
+            finally:
+                if old_handler is not None:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
+        except (_QueryTimeout, TimeoutError):
+            emit(f"查询超时({timeout} 秒),请缩小问题范围后重试。")
+            _audit(log_path, "timeout", q, started, 0)
+            return 5
+        except Exception as exc:
+            emit(f"查询失败: {type(exc).__name__}")
+            _audit(log_path, "error", q, started, 0)
+            return 1
+        emit(result)
+        _audit(log_path, "ok", q, started, len(result))
+        return 0
+    finally:
+        if slot is not None:
+            try:
+                fcntl.flock(slot.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            slot.close()
+
+
+if __name__ == "__main__":
+    import os as _os
+    import sys as _sys
+    _code = main()
+    _sys.stdout.flush()
+    _sys.stderr.flush()
+    _os._exit(_code)  # 硬退出:超时后不等仍在跑的网络线程

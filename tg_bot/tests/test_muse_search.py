@@ -460,3 +460,161 @@ class RunQueryTests(unittest.TestCase):
                            now=NOW)
         self.assertIsInstance(out, str)
         self.assertIn("没有找到", out)
+
+
+class CliTests(unittest.TestCase):
+    def _env(self, tmp, **extra):
+        import os
+        env = {
+            "MUSE_SEARCH_DISABLED_FILE": os.path.join(tmp, "disabled"),
+            "MUSE_SEARCH_LOCK_DIR": os.path.join(tmp, "locks"),
+            "MUSE_SEARCH_LOG": os.path.join(tmp, "audit.log"),
+            "MUSE_SEARCH_TIMEOUT": "10",
+        }
+        env.update(extra)
+        return env
+
+    def _main(self, env, runner, stdin=b'{"q":"ab"}'):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = ms.main(stdin_bytes=stdin, runner=runner, env=env)
+        return code, buf.getvalue()
+
+    def test_disabled_flag_exits_3(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(tmp)
+            with open(env["MUSE_SEARCH_DISABLED_FILE"], "w") as fh:
+                fh.write("1")
+            calls = []
+            code, out = self._main(env, lambda q: calls.append(q) or "X")
+            self.assertEqual(code, 3)
+            self.assertIn("暂停", out)
+            self.assertEqual(calls, [])
+
+    def test_invalid_input_exits_2(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = self._main(self._env(tmp), lambda q: "X", stdin=b"not json")
+            self.assertEqual(code, 2)
+            self.assertIn("输入无效", out)
+
+    def test_ok_path_writes_audit(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(tmp, FAKE_API_KEY="SECRET_VALUE_X")
+            code, out = self._main(env, lambda q: "RESULT")
+            self.assertEqual(code, 0)
+            self.assertIn("RESULT", out)
+            with open(env["MUSE_SEARCH_LOG"], encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertNotIn("SECRET_VALUE_X", text)
+            lines = text.splitlines()
+            self.assertEqual(len(lines), 1)
+            rec = json.loads(lines[0])
+            self.assertEqual(rec["status"], "ok")
+            self.assertEqual(len(rec["q_sha256"]), 64)
+
+    def test_busy_exits_4(self):
+        import fcntl
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(tmp)
+            os.makedirs(env["MUSE_SEARCH_LOCK_DIR"], exist_ok=True)
+            held = []
+            try:
+                for name in ("slot0", "slot1"):
+                    fh = open(os.path.join(env["MUSE_SEARCH_LOCK_DIR"], name), "a+")
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held.append(fh)
+                calls = []
+                code, out = self._main(env, lambda q: calls.append(q) or "X")
+                self.assertEqual(code, 4)
+                self.assertIn("服务正忙", out)
+                self.assertEqual(calls, [])
+            finally:
+                for fh in held:
+                    fh.close()
+
+    def test_lock_released_after_run(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(tmp)
+            self.assertEqual(self._main(env, lambda q: "A")[0], 0)
+            self.assertEqual(self._main(env, lambda q: "B")[0], 0)
+
+    def test_timeout_exits_5(self):
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(tmp, MUSE_SEARCH_TIMEOUT="1")
+            code, out = self._main(env, lambda q: time.sleep(3) or "X")
+            self.assertEqual(code, 5)
+            self.assertIn("超时", out)
+
+    def test_timeout_not_swallowed_by_runner_except_exception(self):
+        import contextlib, io, tempfile, time
+        from tg_bot import muse_search as m
+
+        def swallowing_runner(q):
+            try:
+                time.sleep(3)
+            except Exception:
+                return "swallowed"
+            return "done"
+
+        with tempfile.TemporaryDirectory() as d:
+            env = {
+                "MUSE_SEARCH_DISABLED_FILE": d + "/none",
+                "MUSE_SEARCH_LOCK_DIR": d + "/locks",
+                "MUSE_SEARCH_LOG": d + "/log",
+                "MUSE_SEARCH_TIMEOUT": "1",
+            }
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = m.main(stdin_bytes=b'{"q":"ab"}', runner=swallowing_runner, env=env)
+        self.assertEqual(code, 5)
+        self.assertIn("超时", buf.getvalue())
+        self.assertNotIn("swallowed", buf.getvalue())
+
+    def test_load_env_file_parses_and_does_not_override(self):
+        import tempfile
+        from tg_bot import muse_search as m
+        with tempfile.TemporaryDirectory() as d:
+            path = d + "/e.env"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("# c\nA=1\nB = \"two words\"\nBAD KEY=x\nC=keep\n$X=1\n")
+            environ = {"C": "already"}
+            n = m.load_env_file(path, environ)
+        self.assertEqual(environ["A"], "1")
+        self.assertEqual(environ["B"], "two words")
+        self.assertEqual(environ["C"], "already")
+        self.assertNotIn("BAD KEY", environ)
+        self.assertNotIn("$X", environ)
+        self.assertEqual(n, 3)
+
+    def test_load_env_file_missing_returns_zero(self):
+        from tg_bot import muse_search as m
+        self.assertEqual(m.load_env_file("/nonexistent/x.env", {}), 0)
+
+    def test_runner_exception_exits_1(self):
+        import tempfile
+
+        def boom(q):
+            raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = self._main(self._env(tmp), boom)
+            self.assertEqual(code, 1)
+            self.assertIn("查询失败: RuntimeError", out)
+
+    def test_audit_failure_does_not_break(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(tmp, MUSE_SEARCH_LOG="/proc/nonexistent/x.log")
+            code, out = self._main(env, lambda q: "RESULT")
+            self.assertEqual(code, 0)
+            self.assertIn("RESULT", out)
