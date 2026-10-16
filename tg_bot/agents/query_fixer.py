@@ -74,9 +74,9 @@ def fix_query(user_text: str, keywords: list[str],
 
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
             {
-                "model": "deepseek-v4-flash",
+                "model": _cfg.DEEPSEEK_MODEL,
                 "messages": [
                     {"role": "system", "content": _SYS_QUERY_FIXER},
                     {"role": "user", "content": user_content},

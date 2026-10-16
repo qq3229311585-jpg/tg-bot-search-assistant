@@ -24,6 +24,7 @@ class Source:
     query: str = ""             # 触发此来源的搜索词
     score: float = 0.0          # Curator 打分后设置
     fetched_at: Optional[datetime] = None
+    citation_label: str = ""    # 分段核查时保留草稿中的原始 [来源…] 标签
 
     @property
     def body(self) -> str:
@@ -57,6 +58,7 @@ class WriteRequest:
     style_hints: list[str] = field(default_factory=list)       # ["use_emoji", "intro_style"]
     reject_feedback: str = ""       # Critic 退回时的具体问题（重写用）
     verifier_checks: list[dict] = field(default_factory=list)  # Critic 原始 check 列表
+    avoid_block: str = ""           # 新奇账本注入的避重提示
 
 
 # ── 核查报告（Critic 输出）──────────────────────────────────────────────────
@@ -75,6 +77,10 @@ class Issue:
 class CriticReport:
     verdict: Literal["pass", "patch", "rewrite", "unknown"]
     issues: list[Issue] = field(default_factory=list)
+    mode: Literal["single", "sharded"] = "single"
+    chunks_total: int = 1
+    chunks_passed: int = 0
+    chunks_unknown: int = 0
     # pass: 无问题，直接发送
     # patch: 有 SOFT/HARD 问题，交 Patcher 做最小改动
     # rewrite: 问题太多，交 Writer 重写
@@ -100,10 +106,17 @@ class PipelineConfig:
     patcher: bool = True        # False = Critic REJECT → 重新跑 Writer
     cache: bool = True          # False = 不用今日索引缓存
     max_rewrites: int = 2       # 审核修正轮次上限；pipeline 会按风险进一步收紧
+    chat_evidence_audit: bool = True
+    chat_evidence_corrective_rounds: int = 2
+    chat_evidence_max_requirements: int = 5
+    chat_review_shard_threshold: int = 1200
+    chat_review_max_chunks: int = 6
+    chat_review_chunk_evidence_chars: int = 6000
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
         import os
+        from tg_bot import config
         def _bool(k, default=True):
             return os.environ.get(k, str(default)).lower() not in ("false", "0", "no")
         return cls(
@@ -113,4 +126,10 @@ class PipelineConfig:
             patcher=_bool("PIPELINE_PATCHER"),
             cache=_bool("PIPELINE_CACHE"),
             max_rewrites=int(os.environ.get("PIPELINE_MAX_REWRITES", "2")),
+            chat_evidence_audit=config.CHAT_EVIDENCE_AUDIT,
+            chat_evidence_corrective_rounds=config.CHAT_EVIDENCE_CORRECTIVE_ROUNDS,
+            chat_evidence_max_requirements=config.CHAT_EVIDENCE_MAX_REQUIREMENTS,
+            chat_review_shard_threshold=config.CHAT_REVIEW_SHARD_THRESHOLD,
+            chat_review_max_chunks=config.CHAT_REVIEW_MAX_CHUNKS,
+            chat_review_chunk_evidence_chars=config.CHAT_REVIEW_CHUNK_EVIDENCE_CHARS,
         )

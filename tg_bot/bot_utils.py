@@ -25,7 +25,8 @@ def md_to_html(text):
     # 把非 Telegram 白名单的裸 HTML 标签转义（如 <文件名>、<参数> 等占位符）
     _TG_TAGS = {'b', '/b', 'i', '/i', 'u', '/u', 's', '/s',
                 'code', '/code', 'pre', '/pre', 'a', '/a',
-                'tg-spoiler', '/tg-spoiler', 'br'}
+                'tg-spoiler', '/tg-spoiler', 'br',
+                'blockquote', '/blockquote'}
     def _escape_unknown_tag(m):
         tag = m.group(1).split()[0].lstrip('/')
         if tag.lower() in _TG_TAGS:
@@ -48,8 +49,22 @@ def md_to_html(text):
     return text
 
 
+def _sanitize_blockquotes(text):
+    """损坏/不配对的 blockquote 标签整体转义，防止 Telegram HTML 解析失败。"""
+    # 开标签必须严格是 <blockquote> 或 <blockquote expandable>
+    text = re.sub(r"<blockquote(?!( expandable)?>)", "&lt;blockquote", text)
+    opens = len(re.findall(r"<blockquote( expandable)?>", text))
+    closes = text.count("</blockquote>")
+    if opens != closes:
+        text = re.sub(r"</?blockquote( expandable)?>",
+                      lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"),
+                      text)
+    return text
+
+
 def _send_chunk(chat_id, chunk):
     """发单块，HTML 失败自动降级纯文本。"""
+    chunk = _sanitize_blockquotes(chunk)
     res = http_post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         {"chat_id": chat_id, "text": chunk,
@@ -82,6 +97,12 @@ def _split_safe(text, limit=4000):
             sp = text.rfind(" ", 0, cut)
             if sp > cut // 2:
                 cut = sp + 1
+        # 不要把 <blockquote> 折叠块切成两半（会导致 HTML 解析失败降级纯文本）
+        head = text[:cut]
+        if head.count("<blockquote") != head.count("</blockquote>"):
+            bq = head.rfind("<blockquote")
+            if bq > 0:
+                cut = bq
         parts.append(text[:cut])
         text = text[cut:]
     return parts
@@ -96,6 +117,18 @@ def send(chat_id, text):
     for i, chunk in enumerate(chunks):
         delivered = _send_chunk(chat_id, chunk) and delivered
         if i + 1 < len(chunks): time.sleep(0.3)
+    return delivered
+
+
+def send_report_html(chat_id, section_chunks):
+    chunks = [str(item).strip() for item in section_chunks if str(item).strip()]
+    if not chunks:
+        return False
+    delivered = True
+    for index, chunk in enumerate(chunks):
+        delivered = _send_chunk(chat_id, chunk) and delivered
+        if index + 1 < len(chunks):
+            time.sleep(0.3)
     return delivered
 
 

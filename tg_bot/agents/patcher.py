@@ -78,9 +78,9 @@ def patch(
 
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
             {
-                "model": "deepseek-v4-flash",
+                "model": _cfg.DEEPSEEK_MODEL,
                 "messages": [
                     {"role": "system", "content": _SYS_PATCHER},
                     {"role": "user", "content": user_msg},

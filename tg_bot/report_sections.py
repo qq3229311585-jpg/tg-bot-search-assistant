@@ -24,6 +24,8 @@ class ReportSectionSpec:
     items: int = 4
     cooldown_days: int = 14
     aliases: tuple[str, ...] = ()
+    emoji: str = "📌"
+    reserve: bool = False
 
 
 # The order is intentional: snapshots first, then the current news lanes and
@@ -31,49 +33,69 @@ class ReportSectionSpec:
 DEFAULT_REPORT_SECTIONS: tuple[ReportSectionSpec, ...] = (
     ReportSectionSpec(
         "weather", "天气预报", "snapshot", collector="native:execute_weather",
-        aliases=("天气", "安阳天气"),
+        aliases=("天气", "安阳天气"), emoji="🌤",
     ),
     ReportSectionSpec(
-        "exchange", "汇率", "snapshot", collector="external",
-        aliases=("USD/CNY", "美元", "人民币"),
+        "exchange", "汇率", "snapshot", collector="native:execute_exchange_snapshot",
+        aliases=("USD/CNY", "美元", "人民币"), emoji="💱",
     ),
     ReportSectionSpec(
-        "market", "行情速览", "snapshot", collector="external",
-        aliases=("BTC", "ETH", "比特币", "以太坊", "行情"),
+        "market", "美股速览", "snapshot", collector="native:execute_us_market_snapshot",
+        aliases=("纳斯达克", "标普500", "美股", "NASDAQ", "S&P500", "行情"), emoji="📈",
     ),
     ReportSectionSpec(
         "china", "中国要闻", "event", "中国 今日 重大新闻", "news",
-        aliases=("中国新闻",),
+        aliases=("中国新闻",), emoji="📰",
     ),
     ReportSectionSpec(
         "global", "全球要闻", "event", "全球 今日 重大新闻", "news",
-        aliases=("全球新闻",),
+        aliases=("全球新闻",), emoji="🌍",
     ),
     ReportSectionSpec(
-        "ai_tech", "AI / 技术", "event", "AI 人工智能 技术 今日 新闻", "news",
-        aliases=("AI 速报", "AI速报", "人工智能速报", "人工智能"),
+        "ai_tech", "AI 速报", "event", "AI 人工智能 技术 今日 新闻", "news",
+        aliases=("AI / 技术", "AI速报", "人工智能速报", "人工智能"), emoji="🤖",
     ),
     ReportSectionSpec(
-        "proxy", "代理圈动态", "event", "sing-box Xray-core 代理工具 更新", "news",
-        aliases=("代理圈", "sing-box", "Xray", "代理"),
+        "security_privacy", "安全与隐私", "event", "网络安全 隐私 漏洞 今日 新闻", "news",
+        emoji="🛡", reserve=True,
     ),
     ReportSectionSpec(
-        "hackernews", "圈子热议", "event", "Hacker News 热议 今日", "news",
-        # Legacy prompt/report headings often shorten this to just
-        # "圈子在聊" without repeating the Hacker News source name.
-        aliases=("圈子在聊", "HackerNews", "Hacker News", "HN"),
+        "open_source", "开源与开发工具", "event", "开源 开发者工具 今日 发布 更新", "news",
+        emoji="🧰", reserve=True,
     ),
     ReportSectionSpec(
-        "github", "GitHub 热榜", "event", "GitHub trending 今日 star", "news",
-        aliases=("GitHub热榜", "GitHub Trending", "仓库"),
+        "science_space", "科学与太空", "event", "科学 太空 研究 今日 突破", "news",
+        emoji="🔭", reserve=True,
     ),
     ReportSectionSpec(
-        "steam", "Steam 降价优惠", "event", "Steam 降价 优惠 游戏 今日", "news",
-        aliases=("Steam降价", "Steam 折扣", "游戏优惠"),
+        "product_updates", "产品与服务更新", "event", "软件 产品 服务 今日 重大更新", "news",
+        emoji="📦", reserve=True,
     ),
+    # 代理圈动态改为直接查 sing-box / Xray-core 的 GitHub releases，
+    # 有新版本才报，不再用新闻搜索拿旧文章凑数。
     ReportSectionSpec(
-        "cold_knowledge", "今日冷知识", "event", "科学 历史 趣味 冷知识 今日", "news",
-        aliases=("冷知识", "趣味事实"),
+        "proxy", "代理圈动态", "snapshot", collector="native:execute_proxy_releases",
+        aliases=("代理圈", "sing-box", "Xray", "代理"), emoji="🔒",
+    ),
+    # 圈子在聊改为 HN 官方 API 的当日真实首页热帖。
+    ReportSectionSpec(
+        "hackernews", "圈子在聊", "snapshot", collector="native:execute_hn_front_page",
+        aliases=("圈子热议", "HackerNews", "Hacker News", "HN"), emoji="🗣️",
+    ),
+    # GitHub 热榜改用真实 trending 页面抓取器（每天必然不同）。
+    ReportSectionSpec(
+        "github", "GitHub 热榜", "snapshot", collector="native:execute_github_trending",
+        aliases=("GitHub热榜", "GitHub Trending", "仓库"), emoji="🛠",
+    ),
+    # Steam 特价改为官方中国区 API（简体中文、人民币价格），不再用新闻搜索凑数。
+    ReportSectionSpec(
+        "steam", "Steam 特价推荐", "snapshot", collector="native:execute_steam_specials",
+        aliases=("Steam 降价优惠", "Steam降价", "Steam 折扣", "游戏优惠"), emoji="🎮",
+    ),
+    # 冷知识由构建脚本的编辑 AI 按话题轮盘直接撰写（generated），不走新闻搜索。
+    ReportSectionSpec(
+        "cold_knowledge", "今日冷知识", "snapshot", collector="generated",
+        aliases=("冷知识", "趣味事实"), emoji="🧠",
     ),
 )
 
@@ -135,7 +157,7 @@ def _matches_section(line: str, spec: ReportSectionSpec) -> bool:
         return False
     # Headings normally use 【...】 or an emoji. Requiring one of these avoids
     # treating a sentence mentioning “GitHub” as a new section.
-    heading_like = text.startswith(("【", "📍", "💱", "📈", "🤖", "🔒", "🗣", "🛠", "⚡", "🎮", "🌤", "📊", "💰", "📰", "🧠"))
+    heading_like = text.startswith(("【", "📍", "💱", "📈", "🤖", "🔒", "🗣", "🛠", "⚡", "🎮", "🌤", "📊", "💰", "📰", "🧠", "🌍", "📌"))
     if not heading_like and not re.match(r"^(?:天气|汇率|行情|AI|代理|圈子|GitHub|Steam|今日冷知识|Hacker|HN|sing-box|Xray)", text, re.I):
         return False
     terms = (spec.title, spec.id, *spec.aliases)
@@ -155,6 +177,10 @@ def split_external_sections(text: str, sections: Iterable[ReportSectionSpec] | N
     found: dict[str, list[str]] = {}
     current: ReportSectionSpec | None = None
     for line in lines:
+        # 板块分隔线不属于任何板块内容
+        if line.strip() and set(line.strip()) <= {"┄", "─", "-"}:
+            current = None
+            continue
         matched = next((spec for spec in specs if _matches_section(line, spec)), None)
         if matched is not None:
             current = matched
@@ -170,7 +196,8 @@ def split_external_sections(text: str, sections: Iterable[ReportSectionSpec] | N
 
 
 def section_heading(section: ReportSectionSpec) -> str:
-    return f"【{section.title}】"
+    emoji = getattr(section, "emoji", "") or ""
+    return f"{emoji}  {section.title}".strip()
 
 
 def empty_section_text(section: ReportSectionSpec, *, repeated: bool = False) -> str:

@@ -14,16 +14,17 @@ _LATEST_ONLY_TOOLS = {
 }
 
 
-def _direct_api_entry(tool: str, query: str, snippet: str, next_rid: Callable[[], str]) -> dict:
+def _direct_api_entry(tool: str, query: str, snippet: str, next_rid: Callable[[], str], error: str = "") -> dict:
     return {
         "id": f"AUTO_{tool}_{next_rid()}",
         "tool": tool,
         "query": query,
         "title": (query or tool)[:80],
-        "url": "",
-        "domain": tool,
+        "url": f"direct://{tool}",
+        "domain": f"direct://{tool}",
         "snippet": snippet[:600],
         "full_content": snippet,
+        "error": error,
     }
 
 
@@ -58,7 +59,7 @@ def build_entries_from_tool_result(
             "full_content": snippet,
         }]
     if tool in set(direct_api_tools):
-        return [_direct_api_entry(tool, query, snippet, next_rid)]
+        return [_direct_api_entry(tool, query, snippet, next_rid, str(result.get("error", "")))]
     return []
 
 

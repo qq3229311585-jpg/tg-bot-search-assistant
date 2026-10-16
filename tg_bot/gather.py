@@ -125,8 +125,8 @@ def summarize_for_context(reply: str) -> str:
         return ""
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL,
              "messages": [
                  {"role": "system", "content":
                      "将下方助手回复压缩成10到30字的摘要，只说核心内容是什么，"
@@ -618,8 +618,8 @@ def gather_ai(user_text, keywords, chat_id=None, pre_results=None, history_ctx=N
 
     for round_ in range(14):
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL,
              "messages": msgs,
              "tools": TOOLS,
              "tool_choice": "auto",
@@ -705,8 +705,8 @@ def gather_ai(user_text, keywords, chat_id=None, pre_results=None, history_ctx=N
                     + "\n\n三个分组标题必须全部出现，即使某组为空也写（本次无）。直接输出清单，不要解释。"
                 })
                 resp2 = http_post(
-                    "https://api.deepseek.com/chat/completions",
-                    {"model": "deepseek-v4-flash",
+                    f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+                    {"model": _cfg.DEEPSEEK_MODEL,
                      "messages": msgs,
                      "max_tokens": 6000,
                      "temperature": 0.3,
@@ -1081,8 +1081,8 @@ def fast_chat(messages, system, max_tokens=3000, temp=0.7, chat_id=None, return_
     }
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL,
              "messages": msgs,
              "temperature": temp,
              "max_tokens": max_tokens,
@@ -1138,8 +1138,8 @@ def ds_chat(messages, system, max_tokens=3000, temp=0.8, chat_id=None, return_me
 
     for round_ in range(16):   # 扩展到16轮，给强制补搜/补抓留空间
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL,
              "messages": msgs,
              "tools": TOOLS,
              "tool_choice": "auto",

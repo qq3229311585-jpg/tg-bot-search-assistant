@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """tools/search.py — 搜索相关工具函数"""
 
+from collections.abc import Mapping
 import json, logging
 from urllib.error import HTTPError
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import urlopen, Request
 
 from tg_bot.config import (
@@ -82,9 +84,12 @@ def _preferred_rank(url: str) -> int:
 # ── Tavily key 轮换 ───────────────────────────────────────────────────
 def _tavily_request(endpoint, payload):
     """轮换三个 Tavily key，超限自动切下一个"""
-    import tg_bot.config as _cfg
-    for attempt in range(len(TAVILY_KEYS)):
-        key_index, key = _reserve_tavily_key()
+    if not TAVILY_KEYS:
+        return None
+    start_index, _start_key = _reserve_tavily_key()
+    for offset in range(len(TAVILY_KEYS)):
+        key_index = (start_index + offset) % len(TAVILY_KEYS)
+        key = TAVILY_KEYS[key_index]
         payload["api_key"] = key
         try:
             body = json.dumps(payload).encode()
@@ -130,8 +135,12 @@ def execute_search(query, search_type="general"):
         items = sorted(items, key=lambda r: _preferred_rank(r.get("url", "")))
         lines = []
         for r in items[:5]:
+            # 发布时间随素材一路传给审计/写作，时效数据回答才能标明数据日期
+            age = r.get("page_age") or r.get("age") or r.get("published")
+            age_line = f"  📅 {str(age)[:40]}\n" if age else ""
             lines.append(f"• {r.get('title','')}\n"
                          f"  {r.get('description','')[:200]}\n"
+                         f"{age_line}"
                          f"  {r.get('url','')}")
         return "\n\n".join(lines)
     except Exception as e:
@@ -139,108 +148,217 @@ def execute_search(query, search_type="general"):
         return _tavily_search_fallback(query, search_type)
 
 
-def execute_news_candidates(query):
-    """Return structured news candidates with provider diagnostics.
+def _validated_news_items(items, provider):
+    """Keep mapping rows and report malformed provider rows once."""
+    valid = []
+    malformed = False
+    for item in items:
+        if isinstance(item, Mapping):
+            valid.append(item)
+        else:
+            malformed = True
+    diagnostics = [f"{provider}: provider_error:TypeError"] if malformed else []
+    return valid, diagnostics
 
-    The legacy ``execute_search`` function remains text-based for existing
-    prompts.  Daily-report generation uses this boundary so publication time
-    and relevance are not lost while formatting search results for an LLM.
-    """
-    import tg_bot.config as _cfg
+
+def _news_from_brave(query):
+    """Return structured Brave news rows and provider-local diagnostics."""
     from tg_bot.tools.fetch import http_get
     from urllib.parse import quote_plus
 
+    if not BRAVE_KEY:
+        return [], ["brave: unavailable"]
+    try:
+        raw = http_get(
+            "https://api.search.brave.com/res/v1/news/search"
+            f"?q={quote_plus(query)}&count=9&freshness=pd",
+            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_KEY},
+        )
+        data = json.loads(raw) if raw else {}
+        items = data.get("results", [])
+        valid_items, diagnostics = _validated_news_items(items, "brave")
+        rows = [
+            {
+                "title": item.get("title", ""),
+                "summary": item.get("description", ""),
+                "url": item.get("url", ""),
+                "published_at": item.get("page_age") or item.get("age") or item.get("published"),
+                "relevance": item.get("score"),
+                "source": "brave",
+            }
+            for item in valid_items
+            if item.get("title") and item.get("url")
+        ]
+        if items:
+            inc_quota("brave")
+            return rows, diagnostics
+        return [], ["brave: empty"]
+    except Exception as exc:
+        return [], [f"brave: provider_error:{type(exc).__name__}"]
+
+
+def _news_from_tavily(query):
+    """Return structured Tavily news rows and provider-local diagnostics."""
+    if not TAVILY_KEYS:
+        return [], ["tavily: unavailable"]
+    try:
+        data = _tavily_request("https://api.tavily.com/search", {
+            "query": query,
+            "search_depth": "basic",
+            "topic": "news",
+            "time_range": "day",
+            "max_results": 8,
+        }) or {}
+        items = data.get("results", [])
+        valid_items, diagnostics = _validated_news_items(items, "tavily")
+        rows = [
+            {
+                "title": item.get("title", ""),
+                "summary": item.get("content", ""),
+                "url": item.get("url", ""),
+                "published_at": item.get("published_date"),
+                "relevance": item.get("score"),
+                "source": "tavily",
+            }
+            for item in valid_items
+            if item.get("title") and item.get("url")
+        ]
+        if items:
+            return rows, diagnostics
+        return [], ["tavily: empty"]
+    except Exception as exc:
+        return [], [f"tavily: provider_error:{type(exc).__name__}"]
+
+
+def _news_from_serper(query):
+    """Return structured Serper news rows while preserving key rotation."""
+    import tg_bot.config as _cfg
+
+    if not _cfg.SERPER_KEYS:
+        return [], ["serper: unavailable"]
     diagnostics = []
-    if BRAVE_KEY:
+    endpoint = "https://google.serper.dev/news"
+    keys = tuple(_cfg.SERPER_KEYS)
+    start_index, _start_key = _reserve_serper_key()
+    for attempt in range(len(keys)):
+        key_index = (start_index + attempt) % len(keys)
+        key = keys[key_index]
         try:
-            raw = http_get(
-                "https://api.search.brave.com/res/v1/news/search"
-                f"?q={quote_plus(query)}&count=9&freshness=pd",
-                headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_KEY},
-            )
-            data = json.loads(raw) if raw else {}
-            items = data.get("results", [])
+            body = json.dumps({"q": query, "num": 8}).encode()
+            req = Request(endpoint, data=body, headers={"Content-Type": "application/json", "X-API-KEY": key})
+            with urlopen(req, context=_ctx, timeout=15) as response:
+                data = json.loads(response.read())
+            items = data.get("news", [])
+            valid_items, response_diagnostics = _validated_news_items(items, "serper")
+            rows = [
+                {
+                    "title": item.get("title", ""),
+                    "summary": item.get("snippet", ""),
+                    "url": item.get("link", ""),
+                    "published_at": item.get("date"),
+                    "relevance": item.get("score"),
+                    "source": "serper",
+                }
+                for item in valid_items
+                if item.get("title") and item.get("link")
+            ]
             if items:
-                inc_quota("brave")
-                return [
-                    {
-                        "title": item.get("title", ""),
-                        "summary": item.get("description", ""),
-                        "url": item.get("url", ""),
-                        "published_at": item.get("page_age") or item.get("age") or item.get("published"),
-                        "relevance": item.get("score"),
-                        "source": "brave",
-                    }
-                    for item in items
-                    if item.get("title") and item.get("url")
-                ], diagnostics
-            diagnostics.append("brave: empty")
+                diagnostics.extend(response_diagnostics)
+                with _cfg._provider_rotation_lock:
+                    _cfg._serper_idx = key_index
+                    _cfg.SERPER_KEY = key
+                inc_quota("serper")
+                return rows, diagnostics
+            diagnostics.append("serper: empty")
+            break
         except Exception as exc:
-            diagnostics.append(f"brave: provider_error:{type(exc).__name__}")
-    else:
-        diagnostics.append("brave: unavailable")
-
-    if TAVILY_KEYS:
-        try:
-            data = _tavily_request("https://api.tavily.com/search", {
-                "query": query,
-                "search_depth": "basic",
-                "topic": "news",
-                "time_range": "day",
-                "max_results": 8,
-            }) or {}
-            items = data.get("results", [])
-            if items:
-                return [
-                    {
-                        "title": item.get("title", ""),
-                        "summary": item.get("content", ""),
-                        "url": item.get("url", ""),
-                        "published_at": item.get("published_date"),
-                        "relevance": item.get("score"),
-                        "source": "tavily",
-                    }
-                    for item in items
-                    if item.get("title") and item.get("url")
-                ], diagnostics
-            diagnostics.append("tavily: empty")
-        except Exception as exc:
-            diagnostics.append(f"tavily: provider_error:{type(exc).__name__}")
-    else:
-        diagnostics.append("tavily: unavailable")
-
-    if _cfg.SERPER_KEYS:
-        endpoint = "https://google.serper.dev/news"
-        for _attempt in range(len(_cfg.SERPER_KEYS)):
-            key_index, key = _reserve_serper_key()
-            try:
-                body = json.dumps({"q": query, "num": 8}).encode()
-                req = Request(endpoint, data=body, headers={"Content-Type": "application/json", "X-API-KEY": key})
-                with urlopen(req, context=_ctx, timeout=15) as response:
-                    data = json.loads(response.read())
-                items = data.get("news", [])
-                if items:
-                    inc_quota("serper")
-                    return [
-                        {
-                            "title": item.get("title", ""),
-                            "summary": item.get("snippet", ""),
-                            "url": item.get("link", ""),
-                            "published_at": item.get("date"),
-                            "relevance": item.get("score"),
-                            "source": "serper",
-                        }
-                        for item in items
-                        if item.get("title") and item.get("link")
-                    ], diagnostics
-                diagnostics.append("serper: empty")
-                break
-            except Exception as exc:
-                diagnostics.append(f"serper[{_attempt}]: provider_error:{type(exc).__name__}")
-                # The next loop iteration reserves the next key atomically.
-    else:
-        diagnostics.append("serper: unavailable")
+            diagnostics.append(f"serper[{attempt}]: provider_error:{type(exc).__name__}")
+            # The next loop iteration reserves the next key atomically.
     return [], diagnostics
+
+
+def execute_news_candidates(query):
+    """Return the first successful structured provider response.
+
+    This legacy fallback boundary intentionally keeps its first-success
+    behavior for existing callers.  Daily reports use the aggregate entrypoint
+    below instead.
+    """
+    diagnostics = []
+    for _name, provider in (
+        ("brave", _news_from_brave),
+        ("tavily", _news_from_tavily),
+        ("serper", _news_from_serper),
+    ):
+        items, notes = provider(query)
+        diagnostics.extend(notes)
+        if items or not notes:
+            return items, diagnostics
+    return [], diagnostics
+
+
+_NEWS_TRACKING_PARAMS = {
+    "dclid", "fbclid", "gclid", "mc_cid", "mc_eid", "msclkid",
+    "yclid",
+}
+
+
+def _canonical_news_url(url):
+    """Normalize a news URL for stable cross-provider deduplication."""
+    try:
+        parsed = urlsplit(str(url or "").strip())
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if scheme not in {"http", "https"} or not host:
+        return ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        host = f"{host}:{port}"
+    path = (parsed.path or "").rstrip("/")
+    query = [
+        (name, value)
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not name.lower().startswith("utm_")
+        and name.lower() not in _NEWS_TRACKING_PARAMS
+    ]
+    return urlunsplit((scheme, host, path, urlencode(query, doseq=True), ""))
+
+
+def execute_news_candidates_all(query, providers=None):
+    """Aggregate every news provider for daily reports in stable order."""
+    if providers is None:
+        providers = (
+            ("brave", _news_from_brave),
+            ("tavily", _news_from_tavily),
+            ("serper", _news_from_serper),
+        )
+    merged = []
+    diagnostics = []
+    seen = set()
+    for name, provider in providers:
+        try:
+            items, notes = provider(query)
+            diagnostics.extend(notes or [])
+            malformed = False
+            for item in items or []:
+                if not isinstance(item, Mapping):
+                    malformed = True
+                    continue
+                key = _canonical_news_url(item.get("url", ""))
+                if key:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                merged.append(item)
+            if malformed:
+                diagnostics.append(f"{name}: provider_error:TypeError")
+        except Exception as exc:
+            diagnostics.append(f"{name}: provider_error:{type(exc).__name__}")
+    return merged, diagnostics
 
 def _tavily_search_fallback(query, search_type):
     """搜索降级：Tavily → Serper"""
@@ -266,8 +384,9 @@ def _tavily_search_fallback(query, search_type):
             content  = (it.get("content","") or it.get("snippet",""))[:200]
             url_     = it.get("url", "")
             pub      = it.get("published_date","")[:10] if it.get("published_date") else ""
-            date_tag = f" [{pub}]" if pub else ""
-            lines.append(f"• {title}{date_tag}\n  {content}\n  {url_}")
+            # 日期用独立行：标题行里的 [日期] 会被条目解析器剥掉丢失
+            date_line = f"  📅 {pub}\n" if pub else ""
+            lines.append(f"• {title}\n  {content}\n{date_line}  {url_}")
         return "\n\n".join(lines)
     except Exception as e:
         log.warning(f"Tavily 降级搜索异常: {e}")
@@ -309,8 +428,9 @@ def _execute_serper(query, search_type):
                 snippet = item.get("snippet", "")[:200]
                 link = item.get("link", "")
                 date = item.get("date", "")
-                date_tag = f" [{date}]" if date else ""
-                lines.append(f"• {title}{date_tag}\n  {snippet}\n  {link}")
+                # 日期用独立行：标题行里的 [日期] 会被条目解析器剥掉丢失
+                date_line = f"  📅 {date}\n" if date else ""
+                lines.append(f"• {title}\n  {snippet}\n{date_line}  {link}")
             return "\n\n".join(lines)
         except HTTPError as exc:
             if getattr(exc, "code", None) == 400:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
+import html
 import re
 from typing import Iterable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -29,13 +30,56 @@ _OFFICIAL_UPDATE_DOMAINS = {
 _CATEGORY_LABELS = {
     "china": "中国要闻",
     "global": "全球要闻",
-    "ai_tech": "AI / 技术",
+    "ai_tech": "AI 速报",
+    "security_privacy": "安全与隐私",
+    "open_source": "开源与开发工具",
+    "science_space": "科学与太空",
+    "product_updates": "产品与服务更新",
     "proxy": "代理圈动态",
-    "hackernews": "圈子热议",
+    "hackernews": "圈子在聊",
     "github": "GitHub 热榜",
-    "steam": "Steam 优惠",
+    "steam": "Steam 特价推荐",
     "cold_knowledge": "今日冷知识",
 }
+_CATEGORY_EMOJI = {
+    "china": "📰",
+    "global": "🌍",
+    "ai_tech": "🤖",
+    "security_privacy": "🛡",
+    "open_source": "🧰",
+    "science_space": "🔭",
+    "product_updates": "📦",
+    "proxy": "🔒",
+    "hackernews": "🗣️",
+    "github": "🛠",
+    "steam": "🎮",
+    "cold_knowledge": "🧠",
+}
+_WEEKDAYS_ZH = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+_SECTION_SEPARATOR = "┄" * 14
+_REPORT_CHUNK_LIMIT = 4000
+_MAX_ESCAPED_HREF_LENGTH = _REPORT_CHUNK_LIMIT // 2
+_EVENT_START_RE = re.compile(r"(?m)^\d+\. <b>")
+_BLOCKQUOTE_RE = re.compile(
+    r"<blockquote(?: expandable)?>.*?</blockquote>", re.DOTALL
+)
+_HTML_TAG_RE = re.compile(
+    r"(<(?:b|code|a|blockquote)(?:\s[^<>]*)?>|</(?:b|code|a|blockquote)>)"
+)
+_CLOSE_TAG = {
+    "b": "</b>",
+    "code": "</code>",
+    "a": "</a>",
+    "blockquote": "</blockquote>",
+}
+
+
+def _h(value: object) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def _report_heading(stamp: str, weekday: str) -> list[str]:
+    return ["<b>🗞 午间日报</b>", f"<code>{_h(f'{stamp} · {weekday}')}</code>", ""]
 
 
 def _clean_text(value: object) -> str:
@@ -46,6 +90,36 @@ def _domain_from_url(url: str) -> str:
     try:
         host = urlsplit(url).netloc.lower().split("@")[-1].split(":", 1)[0]
     except Exception:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _safe_http_domain(url: str) -> str:
+    try:
+        raw_authority = re.split(r"[/?#]", url.partition("://")[2], maxsplit=1)[0]
+        parts = urlsplit(url)
+        if (
+            parts.scheme.lower() not in {"http", "https"}
+            or not parts.hostname
+            or not raw_authority.isascii()
+            or "\\" in raw_authority
+            or parts.username is not None
+            or parts.password is not None
+            or any(
+                char.isspace() or ord(char) < 32 or ord(char) == 127
+                for char in raw_authority
+            )
+        ):
+            return ""
+        parts.port
+        host = parts.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        return ""
+    labels = host.split(".")
+    if len(host) > 253 or any(
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in labels
+    ):
         return ""
     return host[4:] if host.startswith("www.") else host
 
@@ -324,7 +398,10 @@ def _find_history_match(event: ReportEvent, history_events: Mapping[str, object]
     best = None
     best_score = 0.0
     current_tokens = _title_tokens(event.title)
-    if not current_tokens:
+    # 冷知识类内容常换标题不换事实，额外用摘要相似度判重
+    match_summary = event.category == "cold_knowledge"
+    current_summary_tokens = _title_tokens(event.summary) if match_summary else frozenset()
+    if not current_tokens and not current_summary_tokens:
         return None, None
     for event_id, previous in history_events.items():
         if not isinstance(previous, Mapping):
@@ -337,6 +414,11 @@ def _find_history_match(event: ReportEvent, history_events: Mapping[str, object]
             continue
         old_tokens = _title_tokens(str(previous.get("title") or ""))
         similarity = _token_jaccard(current_tokens, old_tokens)
+        if match_summary:
+            old_summary_tokens = _title_tokens(str(previous.get("summary") or ""))
+            summary_similarity = _token_jaccard(current_summary_tokens, old_summary_tokens)
+            if summary_similarity >= 0.60:
+                similarity = max(similarity, 0.65 + summary_similarity - 0.60)
         if similarity >= 0.65 and similarity > best_score:
             best = (event_id, previous)
             best_score = similarity
@@ -351,11 +433,15 @@ def select_events(
     per_category: int = 4,
     cooldown_days: int = 14,
     strict_category: bool = False,
+    require_dated: bool = False,
 ) -> list[ReportEvent]:
     now = now or datetime.now(timezone.utc)
     history_events = (history or {}).get("events", {}) or {}
     scored: list[ReportEvent] = []
     for event in events:
+        # 要闻类板块要求有真实发布时间：无日期的常青内容不再给保底分入选
+        if require_dated and _latest_published(event) is None:
+            continue
         freshness, _freshness_label = _freshness_score(event, now)
         if freshness <= 0:
             continue
@@ -402,6 +488,35 @@ def _report_zone(timezone_name: str):
         return timezone(timedelta(hours=8))
 
 
+def select_visible_event_sections(section_specs, events, target=3) -> tuple[str, ...]:
+    """Choose populated primaries first, then the hottest reserve lanes."""
+    registry = list(section_specs)
+    rows = list(events)
+    populated = {getattr(event, "category", "") for event in rows}
+    limit = min(6, max(1, int(target)))
+    primary = [
+        section.id for section in registry
+        if section.kind == "event" and not section.reserve and section.id in populated
+    ]
+    reserve_heat = {
+        section_id: max(
+            (_number(getattr(event, "heat_score", 0)) for event in rows
+             if getattr(event, "category", "") == section_id),
+            default=0.0,
+        )
+        for section_id in populated
+    }
+    reserve = sorted(
+        (
+            (index, section.id)
+            for index, section in enumerate(registry)
+            if section.kind == "event" and section.reserve and section.id in populated
+        ),
+        key=lambda item: (-reserve_heat.get(item[1], 0.0), item[0]),
+    )
+    return tuple((primary + [section_id for _, section_id in reserve])[:limit])
+
+
 def render_daily_report(
     events: Iterable[ReportEvent],
     generated_at: datetime,
@@ -411,77 +526,289 @@ def render_daily_report(
     preserved_sections: Mapping[str, str] | None = None,
     repeated_sections: Iterable[str] | None = None,
     suppressed_sections: Iterable[str] | None = None,
+    event_comments: Mapping[str, str] | None = None,
 ) -> str:
-    """Render the report, optionally using the full legacy section registry.
-
-    The original three-category renderer remains the default for callers that
-    do not pass ``section_specs``. Sectioned mode keeps snapshot/external text,
-    renders fresh event candidates, and emits a clear placeholder when a
-    section had candidates but all were suppressed by cooldown.
-    """
+    """Render a deterministic Telegram-safe HTML daily report."""
     rows = list(events)
-    stamp = generated_at.astimezone(_report_zone(timezone_name)).strftime("%Y-%m-%d %H:%M")
-    lines = [f"📰 今日热点日报 · {stamp}", ""]
+    local_now = generated_at.astimezone(_report_zone(timezone_name))
+    stamp = local_now.strftime("%Y-%m-%d %H:%M")
+    weekday = _WEEKDAYS_ZH[local_now.weekday()]
+
+    def _heading(section_id: str, section=None) -> str:
+        title = getattr(section, "title", None) or _CATEGORY_LABELS.get(section_id, section_id)
+        emoji = getattr(section, "emoji", None) or _CATEGORY_EMOJI.get(section_id, "📌")
+        return f"<b>{_h(f'{emoji} {title}')}</b>"
+
+    def _links_block(event: ReportEvent) -> str:
+        link_lines: list[str] = []
+        seen_domains: set[str] = set()
+        for source in event.sources:
+            url = str(source.url or "").strip()
+            domain = _safe_http_domain(url)
+            domain_key = domain.casefold()
+            if not url or not domain_key or domain_key in seen_domains:
+                continue
+            seen_domains.add(domain_key)
+            escaped_url = _h(url)
+            escaped_domain = _h(domain)
+            if len(escaped_url) <= _MAX_ESCAPED_HREF_LENGTH:
+                source_text = f'<a href="{escaped_url}">{escaped_domain}</a>'
+            else:
+                source_text = escaped_domain
+            link_lines.append(f"{len(link_lines) + 1}. {source_text}")
+            if len(link_lines) == 3:
+                break
+        if not link_lines:
+            return ""
+        return "<blockquote expandable><b>来源</b>\n" + "\n".join(link_lines) + "</blockquote>"
+
+    def _event_block(event: ReportEvent, index: int) -> str:
+        status = "（更新）" if event.status == "update" else ""
+        lines = [f"{index}. <b>{_h(event.title)}</b>{status}"]
+        if event.summary:
+            lines.append(_h(event.summary))
+        links = _links_block(event)
+        if links:
+            lines.append(links)
+        return "\n".join(lines)
+
+    def _event_section(section_id: str, section_events: list[ReportEvent], section=None) -> str:
+        blocks = [_event_block(event, index) for index, event in enumerate(section_events, 1)]
+        return f"{_heading(section_id, section)}\n\n" + "\n\n".join(blocks)
+
+    def _snapshot_body(section, value: object) -> str:
+        lines = str(value or "").strip().splitlines()
+        if not lines:
+            return ""
+        labels = (getattr(section, "title", ""), *getattr(section, "aliases", ()))
+        if any(label and label in lines[0] for label in labels):
+            lines = lines[1:]
+        # 采集器正文自带的 "📍 xxx" 定位行和板块标题重复（如天气板块出现
+        # "🌤 天气预报" + "📍 安阳天气" 双标题），渲染时去掉。
+        if lines and lines[0].lstrip().startswith("📍"):
+            lines = lines[1:]
+        # rstrip 而非 strip：避免把第一行的 "  • " 缩进也一并削掉。
+        return "\n".join(lines).rstrip()
+
+    def _compose(section_chunks: list[str]) -> str:
+        if not section_chunks:
+            return ""
+        heading = "\n".join(_report_heading(stamp, weekday))
+        return heading + "\n" + f"\n{_SECTION_SEPARATOR}\n".join(section_chunks)
+
     if section_specs is not None:
         specs = tuple(section_specs)
         preserved = dict(preserved_sections or {})
-        repeated = set(repeated_sections or ())
-        suppressed = set(suppressed_sections or ())
         buckets: dict[str, list[ReportEvent]] = {}
         for event in rows:
             buckets.setdefault(event.category, []).append(event)
-        index = 1
+        section_chunks: list[str] = []
         for section in specs:
             section_id = getattr(section, "id", "")
             section_kind = getattr(section, "kind", "event")
             matched = buckets.get(section_id, [])
             if matched:
-                lines.extend((f"【{getattr(section, 'title', _CATEGORY_LABELS.get(section_id, section_id))}】", ""))
-                for event in matched:
-                    status = "（更新）" if event.status == "update" else ""
-                    lines.append(f"{index}. {event.title}{status}")
-                    lines.append(f"   发生了什么：{event.summary or '来源尚未提供足够摘要。'}")
-                    lines.append(f"   热度：{event.heat_score:.2f}/100（{'；'.join(event.heat_basis)}）")
-                    source_lines = [f"{source.domain} — {source.url}" for source in event.sources[:3]]
-                    lines.append(f"   来源：{'；'.join(source_lines)}")
-                    lines.append("")
-                    index += 1
-                continue
-            if section_id in suppressed:
-                empty = "今日没有新的高价值事件，已跳过重复内容。" if section_id in repeated else "今日暂无可验证的新内容。"
-                lines.extend((f"【{getattr(section, 'title', _CATEGORY_LABELS.get(section_id, section_id))}】", "", empty, ""))
-                continue
-            if section_id in preserved:
-                lines.extend((preserved[section_id], ""))
+                section_chunks.append(_event_section(section_id, matched, section))
                 continue
             if section_kind == "snapshot":
-                empty = "今日快照采集器暂未提供数据。"
-            else:
-                empty = "今日暂无可验证的新内容。"
-            lines.extend((f"【{getattr(section, 'title', _CATEGORY_LABELS.get(section_id, section_id))}】", "", empty, ""))
-        return "\n".join(lines).rstrip()
-    if not rows:
-        return "\n".join(lines + ["今日新鲜事件不足，暂不填充旧闻。"])
-    current = None
-    for index, event in enumerate(rows, 1):
-        if event.category != current:
-            if current is not None:
-                lines.append("")
-            current = event.category
-            lines.extend((f"【{_CATEGORY_LABELS.get(current, current)}】", ""))
-        status = "（更新）" if event.status == "update" else ""
-        lines.append(f"{index}. {event.title}{status}")
-        lines.append(f"   发生了什么：{event.summary or '来源尚未提供足够摘要。'}")
-        lines.append(f"   热度：{event.heat_score:.2f}/100（{'；'.join(event.heat_basis)}）")
-        source_lines = []
-        for source in event.sources[:3]:
-            source_lines.append(f"{source.domain} — {source.url}")
-        lines.append(f"   来源：{'；'.join(source_lines)}")
-        lines.append("")
-    return "\n".join(lines).rstrip()
+                body = _snapshot_body(section, preserved.get(section_id, ""))
+                if body:
+                    escaped_body = _h(body)
+                    # hackernews/steam 快照会在正文里嵌入真实的 <blockquote> 引用块
+                    # （原文链接/商店链接），需要把它从整体转义里解出来。
+                    if section_id in ("hackernews", "steam"):
+                        escaped_body = escaped_body.replace(
+                            "&lt;blockquote expandable&gt;", "<blockquote expandable>",
+                        ).replace("&lt;/blockquote&gt;", "</blockquote>")
+                    # Steam 游戏名/GitHub 仓库名的加粗来自我们自己的采集器
+                    # （Steam 官方 API 名称、正则约束的 owner/repo），放行 <b>；
+                    # HN 标题是不可信网页内容，保持全转义。
+                    if section_id in ("steam", "github"):
+                        escaped_body = escaped_body.replace(
+                            "&lt;b&gt;", "<b>",
+                        ).replace("&lt;/b&gt;", "</b>")
+                    section_chunks.append(f"{_heading(section_id, section)}\n\n{escaped_body}")
+        return _compose(section_chunks)
+
+    section_order: list[str] = []
+    buckets: dict[str, list[ReportEvent]] = {}
+    for event in rows:
+        if event.category not in buckets:
+            section_order.append(event.category)
+            buckets[event.category] = []
+        buckets[event.category].append(event)
+    return _compose([
+        _event_section(section_id, buckets[section_id])
+        for section_id in section_order
+    ])
+
+
+def _safe_text_cut(text: str, available: int) -> int:
+    if len(text) <= available:
+        return len(text)
+    cut = available
+    newline = text.rfind("\n", 0, available + 1)
+    space = text.rfind(" ", 0, available + 1)
+    boundary = max(newline, space)
+    if boundary >= available // 2:
+        cut = boundary + 1
+    amp = text.rfind("&", 0, cut)
+    semicolon = text.rfind(";", 0, cut)
+    if amp > semicolon and amp > 0:
+        cut = amp
+    return max(1, cut)
+
+
+def _split_html_core(text: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    stack: list[tuple[str, str]] = []
+    suppressed_closings: list[str] = []
+
+    def closing_tags() -> str:
+        return "".join(_CLOSE_TAG[name] for name, _tag in reversed(stack))
+
+    def reopened_tags() -> str:
+        return "".join(tag for _name, tag in stack)
+
+    def flush() -> None:
+        nonlocal current
+        chunk = (current + closing_tags()).strip()
+        if chunk:
+            chunks.append(chunk)
+        current = reopened_tags()
+
+    for token in _HTML_TAG_RE.split(text):
+        if not token:
+            continue
+        if token.startswith("</"):
+            name = token[2:-1]
+            if suppressed_closings and suppressed_closings[-1] == name:
+                suppressed_closings.pop()
+                continue
+            current += token
+            if stack and stack[-1][0] == name:
+                stack.pop()
+            continue
+        if token.startswith("<"):
+            match = re.match(r"<(b|code|a|blockquote)(?:\s|>)", token)
+            if match:
+                name = match.group(1)
+                required = len(current) + len(token) + len(closing_tags()) + len(_CLOSE_TAG[name])
+                if required > limit and current.strip():
+                    flush()
+                required = len(current) + len(token) + len(closing_tags()) + len(_CLOSE_TAG[name])
+                if required > limit:
+                    suppressed_closings.append(name)
+                    continue
+                current += token
+                stack.append((name, token))
+                continue
+        remaining = token
+        while remaining:
+            available = limit - len(current) - len(closing_tags())
+            if available <= 0:
+                flush()
+                available = limit - len(current) - len(closing_tags())
+            cut = _safe_text_cut(remaining, available)
+            current += remaining[:cut]
+            remaining = remaining[cut:]
+            if remaining:
+                flush()
+    flush()
+    return chunks
+
+
+def _append_html_piece(chunks: list[str], piece: str, limit: int) -> None:
+    piece = piece.strip()
+    if not piece:
+        return
+    if chunks and len(chunks[-1]) + 2 + len(piece) <= limit:
+        chunks[-1] += "\n\n" + piece
+    else:
+        chunks.append(piece)
+
+
+def _split_html_safe(text: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    cursor = 0
+    for match in _BLOCKQUOTE_RE.finditer(text):
+        for piece in _split_html_core(text[cursor:match.start()], limit):
+            _append_html_piece(chunks, piece, limit)
+        blockquote = match.group(0)
+        pieces = [blockquote] if len(blockquote) <= limit else _split_html_core(blockquote, limit)
+        for piece in pieces:
+            _append_html_piece(chunks, piece, limit)
+        cursor = match.end()
+    for piece in _split_html_core(text[cursor:], limit):
+        _append_html_piece(chunks, piece, limit)
+    return chunks
+
+
+def _split_oversized_section(text: str, limit: int) -> list[str]:
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    starts = [match.start() for match in _EVENT_START_RE.finditer(text)]
+    if not starts:
+        return _split_html_safe(text, limit)
+    prefix = text[:starts[0]].strip()
+    event_blocks = [
+        text[start:end].strip()
+        for start, end in zip(starts, starts[1:] + [len(text)])
+    ]
+    chunks: list[str] = []
+    current = prefix
+    for block in event_blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.extend(
+                [current] if len(current) <= limit else _split_html_safe(current, limit)
+            )
+        if len(block) <= limit:
+            current = block
+        else:
+            chunks.extend(_split_html_safe(block, limit))
+            current = ""
+    if current:
+        chunks.extend([current] if len(current) <= limit else _split_html_safe(current, limit))
+    return chunks
+
+
+def split_report_chunks(report_text: str) -> list[str]:
+    """Split safe HTML by section, event, then balanced text boundaries."""
+    text = str(report_text or "").strip()
+    if not text:
+        return []
+    section_chunks: list[str] = []
+    current: list[str] = []
+    blockquote_depth = 0
+    for line in text.splitlines(keepends=True):
+        if line.rstrip("\r\n") == _SECTION_SEPARATOR and blockquote_depth == 0:
+            chunk = "".join(current).strip()
+            if chunk:
+                section_chunks.append(chunk)
+            current = []
+            continue
+        current.append(line)
+        blockquote_depth += len(re.findall(r"<blockquote(?: expandable)?>", line))
+        blockquote_depth -= line.count("</blockquote>")
+        blockquote_depth = max(0, blockquote_depth)
+    chunk = "".join(current).strip()
+    if chunk:
+        section_chunks.append(chunk)
+    return [
+        piece
+        for section in section_chunks
+        for piece in _split_oversized_section(section, _REPORT_CHUNK_LIMIT)
+    ]
 
 
 __all__ = [
     "NewsCandidate", "ReportEvent", "cluster_candidates", "event_fingerprint",
     "normalize_candidate", "render_daily_report", "score_event", "select_events",
+    "split_report_chunks",
 ]

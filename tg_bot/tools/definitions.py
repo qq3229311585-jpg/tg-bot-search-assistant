@@ -103,12 +103,18 @@ TOOLS = [
     "function": {
         "name": "check_weather",
         "description": (
-            "查询安阳当前天气及未来2天预报，包含气温、体感、湿度、风速、降雨概率、UV指数、分时段预报。"
-            "用户问'天气''冷不冷''要下雨吗''带伞吗''今天天气'等时调用。"
+            "查询指定城市当前天气及未来2天预报（分时段温度、天气、降雨概率）。"
+            "不传 city 时默认安阳。用户问任何城市的'天气''冷不冷''要下雨吗''带伞吗'时都调用本工具，"
+            "不要用网页搜索查天气。"
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "城市名（中文或英文，如'武汉''东京'）；用户没提城市就省略，默认安阳"
+                }
+            },
             "required": []
         }
     }
@@ -131,6 +137,180 @@ TOOLS = [
             },
             "required": []
         }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "exchange_rate",
+        "description": (
+            "查询任意两种货币的实时汇率并可换算金额（免费官方数据）。"
+            "用户问'汇率''XX多少人民币''美元换日元'等时必须调用本工具，不要网页搜索。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "base": {"type": "string", "description": "源货币 ISO 代码，如 USD/JPY/EUR/GBP，默认 USD"},
+                "target": {"type": "string", "description": "目标货币 ISO 代码，默认 CNY"},
+                "amount": {"type": "number", "description": "要换算的金额，不需要换算时省略"}
+            },
+            "required": []
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "stock_quote",
+        "description": (
+            "查询股票/指数实时报价（价格、涨跌幅、数据时间）。用户问'XX股价''纳指怎么样'等时必须调用本工具，不要网页搜索。"
+            "query 请传英文公司名或股票代码（如 Apple、AAPL、TSLA、^IXIC；A股加后缀如 600519.SS）；"
+            "留空返回纳斯达克+标普500快照。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "英文公司名或股票代码；留空=美股大盘快照"}
+            },
+            "required": []
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "world_time",
+        "description": (
+            "查询世界任意城市的当前时间、星期、时区和与北京的时差。用户问'XX现在几点''时差'时调用。"
+            "外国城市请传英文名（如 Tokyo、New York、London），中国城市可直接中文；留空返回北京时间。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "place": {"type": "string", "description": "城市名，外国城市用英文；留空=北京时间"}
+            },
+            "required": []
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "steam_specials",
+        "description": (
+            "获取 Steam 中国区当前特价游戏（官方API：游戏名、人民币价格、折扣力度、商店链接）。"
+            "用户问'steam打折''游戏特价''有什么便宜游戏'时必须调用本工具，不要网页搜索。"
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "hn_front_page",
+        "description": (
+            "获取 Hacker News 当前首页热帖（官方API，技术圈正在热议的话题）。"
+            "用户问'圈子在聊什么''HN热帖''技术圈动态'时必须调用本工具，不要网页搜索。"
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "proxy_releases",
+        "description": (
+            "查询 sing-box / Xray-core / mihomo 三个代理内核的最新版本和更新内容（GitHub 官方 releases）。"
+            "用户问这几个工具的'最新版本''更新了什么'时必须调用本工具，不要网页搜索。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "number", "description": "只看最近 N 天内的发布，默认 30"}
+            },
+            "required": []
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "chinese_holiday",
+        "description": (
+            "查询中国法定节假日和调休安排。用户问'放假''调休''补班''XX节放几天'时必须调用，不要网页搜索。"
+            "不传参数返回今天安排+下一个法定假期。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "要查的日期 YYYY-MM-DD；留空=今天+下个假期"}
+            },
+            "required": []
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "github_release",
+        "description": (
+            "查任意 GitHub 开源项目的最新版本号和更新内容（官方 releases API）。"
+            "用户问某个开源软件'最新版本''更新了什么'时必须调用，不要网页搜索。repo 传 owner/name 格式。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "仓库名 owner/name，如 python/cpython、ffmpeg 就传 FFmpeg/FFmpeg"}
+            },
+            "required": ["repo"]
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "epic_free_games",
+        "description": "查 Epic 商店本周免费领取的游戏和即将免费的预告（官方接口）。用户问'epic送什么''免费游戏''喜加一'时调用。",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "cn_hot_topics",
+        "description": (
+            "查中文互联网热榜：微博热搜、知乎热榜、B站热门。用户问'微博热搜''知乎在讨论什么''国内热点''今天有什么瓜'时调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "platform": {"type": "string", "description": "weibo/zhihu/bilibili/all，默认 all"}
+            },
+            "required": []
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "earthquake_recent",
+        "description": "查近期全球显著地震（USGS 官方数据，北京时间）。用户问'最近地震''XX地震了吗'时调用。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "min_magnitude": {"type": "number", "description": "最小震级，默认 5.0"},
+                "limit": {"type": "number", "description": "返回条数，默认 5"}
+            },
+            "required": []
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "x_trends",
+        "description": "查 X(推特) 当前全球热门话题榜（第三方数据源，偶尔不可用）。用户问'推特热搜''X上在聊什么'时调用。",
+        "parameters": {"type": "object", "properties": {}, "required": []}
     }
 },
 {

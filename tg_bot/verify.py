@@ -166,8 +166,8 @@ def verify_reply(reply, fact_list, user_text="", attempt=0, source_index=None,
 
     def _call_verifier(timeout=60):
         return http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL_VERIFY,
              "messages": [
                  {"role": "system", "content": _SYS_VERIFIER},
                  {"role": "user",   "content": user_msg},
@@ -227,8 +227,8 @@ def patch_by_verifier(reply, exec_report, audit_report, user_text=""):
     )
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL_VERIFY,
              "messages": [
                  {"role": "system", "content": sys_prompt},
                  {"role": "user",   "content": user_msg},
@@ -285,8 +285,8 @@ def regenerate_reply(messages, system, exec_report, rejected_reply, audit_report
     msgs = [{"role": "system", "content": system}] + retry_msgs
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL_VERIFY,
              "messages": msgs,
              "max_tokens": 3000,
              "temperature": 0.5,

@@ -40,12 +40,13 @@ def _trim_at_sentence_boundary(text: str, lo: int, hi: int) -> str:
 
 
 def _enforce_short_length(reply: str, user_text: str, target_words: tuple[int, int]) -> str:
-    """显式短字数请求用硬约束兜底，避免模型自称合规但实际超长。"""
+    """只压缩显式短回答或超短自动档，避免误砍长回答。"""
+    from tg_bot.agents.curator import _USER_LENGTH_RE, _BRIEF_HINT_RE
     lo, hi = target_words
-    if hi > 450:
-        return reply
-
     reply = re.sub(r"\n?（全文约[^）]*字[^）]*）\s*$", "", reply or "").strip()
+    explicit = bool(_USER_LENGTH_RE.search(user_text or "") or _BRIEF_HINT_RE.search(user_text or ""))
+    if not (explicit or hi <= 200) or hi > 1500:
+        return reply
     if len(reply) <= hi:
         return reply
 
@@ -116,7 +117,9 @@ def run_search_pipeline(
     prev_searches: Optional[list[str]] = None,
     focus_task: Optional[dict] = None,
     suggested_length: str = "",
+    suggested_words: int = 0,
     progress_cb=None,
+    gather_fn=None,
 ) -> tuple[str, str, dict]:
     """
     执行完整搜索 pipeline，返回 (reply, verify_status, meta)。
@@ -161,10 +164,16 @@ def run_search_pipeline(
     gather_keywords = list(dict.fromkeys(list(keywords or []) + query_variants))
     _prog("query_fixer", "done", query_variants[0][:30] if query_variants else "")
 
+    # 新奇账本仅影响冷知识/笑话等可替换主题；不影响普通事实问答。
+    from tg_bot.storage import NOVELTY_REQUEST_RE, append_novelty_entry, extract_novelty_topic, format_novelty_avoid_block
+    _is_novelty_request = bool(NOVELTY_REQUEST_RE.search(user_text or ""))
+    _avoid_block = format_novelty_avoid_block() if _is_novelty_request else ""
+
     # ── Step 1: 采集（复用现有 gather_ai）──────────────────────────
     _prog("gather", "start", "")
     # gather_ai 返回 (source_index_list, meta)
-    raw_sources_list, meta = gather_ai(
+    gather_runner = gather_fn or gather_ai
+    raw_sources_list, meta = gather_runner(
         user_text, gather_keywords,
         chat_id=None if progress_cb else chat_id,
         pre_results=pre_results,
@@ -173,6 +182,11 @@ def run_search_pipeline(
         prev_searches=prev_searches,
         focus_task=focus_task,
         status_cb=progress_cb,
+        evidence_audit_enabled=cfg.chat_evidence_audit,
+        evidence_corrective_rounds=cfg.chat_evidence_corrective_rounds,
+        evidence_max_requirements=cfg.chat_evidence_max_requirements,
+        avoid_block=_avoid_block,
+        suggested_words=suggested_words,
     )
     meta = meta or {}
     meta.setdefault("rounds", [])
@@ -181,6 +195,8 @@ def run_search_pipeline(
     meta.setdefault("fetched_pages", [])
     meta.setdefault("failed_urls", [])
     meta.setdefault("facts_json", {})
+    if cfg.chat_evidence_audit:
+        meta["raw_reasoning_redacted"] = True
     meta["query_variants"] = query_variants
 
     # 把 gather_ai 返回的 dict list 转为 Source dataclass
@@ -197,7 +213,35 @@ def run_search_pipeline(
         )
         for e in (raw_sources_list or [])
     ]
-    _sl = meta.get("suggested_length") or suggested_length
+    # Complex searches must prove coverage before the Writer sees the material.
+    # Fast/direct paths intentionally never set audit_required, so retain their
+    # existing low-latency behavior.
+    if meta.get("audit_required") and not meta.get("sufficient"):
+        supported_ids = set(meta.get("supported_source_ids") or [])
+        supported_sources = [source for source in raw_sources if source.id in supported_ids]
+        if not raw_sources:
+            # 采集本身一无所获，才真正拒答。
+            meta["source_index"] = []
+            return (
+                "没有搜索到可用于回答的资料。请换个问法或发「再查一下」。",
+                "insufficient_evidence",
+                meta,
+            )
+        # 审计未通过时不再一票否决拒答：优先用审计认可的来源子集，审计一条
+        # 都没认可（含审计器故障）时用全部采集素材，并在回复末尾附降级说明。
+        # 宁可给出打了折扣但有依据的回答（如休市日给最近收盘价），也不给零分。
+        if supported_sources:
+            raw_sources = supported_sources
+        meta["degraded_answer"] = True
+    # 字数档位：消歧层按"问题分量"定锚，采集层只允许因素材不足下调，
+    # 不允许因素材丰富上调——否则"刘备是谁"配上维基全文就会写出1500字。
+    _rank = {"short": 0, "medium": 1, "long": 2, "detailed": 3}
+    _anchor_sl = (suggested_length or "").strip().lower()
+    _gather_sl = str(meta.get("suggested_length") or "").strip().lower()
+    if _anchor_sl in _rank and _gather_sl in _rank:
+        _sl = _anchor_sl if _rank[_anchor_sl] <= _rank[_gather_sl] else _gather_sl
+    else:
+        _sl = _anchor_sl if _anchor_sl in _rank else _gather_sl
     _prog("gather", "done", str(len(raw_sources)))
 
     # ── Step 2: Curator（可选）────────────────────────────────────────
@@ -208,13 +252,17 @@ def run_search_pipeline(
             user_query=user_text,
             keywords=keywords,
             suggested_length=_sl,
+            suggested_words=suggested_words,
             history_context=history_context,
         )
     else:
         # 降级：不用 Curator，直接用所有来源
         from tg_bot.agents.curator import _LENGTH_MAP, target_words_to_max_tokens
-        sl = _sl.strip().lower() if _sl else ""
-        target_words = _LENGTH_MAP.get(sl, _LENGTH_MAP["medium"])
+        if suggested_words:
+            target_words = (int(suggested_words * 0.85), int(suggested_words * 1.15))
+        else:
+            sl = _sl.strip().lower() if _sl else ""
+            target_words = _LENGTH_MAP.get(sl, _LENGTH_MAP["medium"])
         write_req = WriteRequest(
             user_query=user_text,
             sources=raw_sources[:8],
@@ -234,13 +282,20 @@ def run_search_pipeline(
             meta,
         )
 
+    if _avoid_block:
+        write_req.avoid_block = _avoid_block
+
     _lo, _hi = write_req.target_words
     _prog("curator", "done", f"{len(write_req.sources)}条·{_lo}-{_hi}字")
 
     # ── Step 3: Writer ───────────────────────────────────────────────
     _prog("writer", "start", "")
     reply, reasoning = write(write_req)
-    meta["write_reasoning"] = reasoning or ""
+    meta["writer_state"] = {
+        "mode": "writer", "reasoning_present": bool(reasoning), "reply_present": bool((reply or "").strip()),
+    }
+    if not meta.get("raw_reasoning_redacted"):
+        meta["write_reasoning"] = reasoning or ""
 
     if not (reply or "").strip():
         log.warning("⚠️ Writer 返回空回复")
@@ -261,7 +316,12 @@ def run_search_pipeline(
                 suggested_length=_sl,
                 tool_results=meta.get("tool_results", []),
             )
-            meta["write_reasoning"] = reasoning or meta.get("write_reasoning", "")
+            meta["writer_state"] = {
+                "mode": "legacy_fallback", "reasoning_present": bool(reasoning),
+                "reply_present": bool((reply or "").strip()),
+            }
+            if not meta.get("raw_reasoning_redacted"):
+                meta["write_reasoning"] = reasoning or meta.get("write_reasoning", "")
             if (reply or "").strip():
                 log.info(f"✍️ Writer 空回复，已降级旧 write_ai 生成 {len(reply)} 字")
             else:
@@ -286,7 +346,23 @@ def run_search_pipeline(
         attempt = 0
         while True:
             _prog("critic", "start", str(attempt))
-            report = critique(reply, write_req.sources, user_text, attempt)
+            report = critique(
+                reply,
+                write_req.sources,
+                user_text,
+                attempt,
+                shard_threshold=cfg.chat_review_shard_threshold,
+                max_chunks=cfg.chat_review_max_chunks,
+                chunk_evidence_chars=cfg.chat_review_chunk_evidence_chars,
+                progress_cb=_prog,
+            )
+            meta["review_audit"] = {
+                "mode": report.mode,
+                "chunks_total": report.chunks_total,
+                "chunks_passed": report.chunks_passed,
+                "chunks_unknown": report.chunks_unknown,
+                "issues_total": len(report.issues),
+            }
 
             if report.verdict == "pass":
                 verify_status = "pass"
@@ -350,7 +426,12 @@ def run_search_pipeline(
                     for iss in report.issues
                 ]
                 reply, reasoning = write(write_req)
-                meta["write_reasoning"] = reasoning or meta.get("write_reasoning", "")
+                meta["writer_state"] = {
+                    "mode": "rewrite", "reasoning_present": bool(reasoning),
+                    "reply_present": bool((reply or "").strip()),
+                }
+                if not meta.get("raw_reasoning_redacted"):
+                    meta["write_reasoning"] = reasoning or meta.get("write_reasoning", "")
                 reply = _enforce_short_length(reply, user_text, write_req.target_words)
                 fix_cycles += 1
                 verify_status = f"rewrite_once" if fix_cycles == 1 else f"rewrite_{fix_cycles}"
@@ -364,6 +445,18 @@ def run_search_pipeline(
             break
 
     reply = _enforce_short_length(reply, user_text, write_req.target_words)
+
+    if meta.get("degraded_answer") and (reply or "").strip():
+        # 降级标注只在真正值得提醒时出现：高风险话题（金融/医疗/法律等），
+        # 或来源确实单薄（独立域名不足2个）。其余情况静默——审计结果在
+        # 进度面板里可见，每条回复都挂免责声明只会让它失去意义。
+        _used_domains = {
+            source.domain for source in write_req.sources
+            if source.domain and not str(source.url or "").startswith("direct://")
+        }
+        _high_risk = bool(_HIGH_RISK_RE.search(user_text or ""))
+        if _high_risk or len(_used_domains) < 2:
+            reply = reply.rstrip() + "\n\nⓘ 部分信息未交叉核实，重要事项请以官方来源为准。"
 
     # 把 Source 转回 dict 格式，供 bot.py 记录
     meta["source_index"] = [
@@ -379,6 +472,13 @@ def run_search_pipeline(
     meta.setdefault("fetched_pages", [])
     meta.setdefault("failed_urls", [])
     meta["verify_status"] = verify_status
+
+    if _is_novelty_request and (reply or "").strip():
+        try:
+            first_line = next((line.strip() for line in reply.splitlines() if line.strip()), "")
+            append_novelty_entry("chat", extract_novelty_topic(first_line))
+        except Exception as exc:
+            log.debug("novelty ledger 记录失败: %s", exc)
 
     log.info(
         f"🏁 Pipeline 完成: verify={verify_status}, "

@@ -228,8 +228,8 @@ def write_ai(user_text, fact_list, history_context=None, reject_feedback="", fac
 
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL_WRITER,
              "messages": [{"role": "system", "content": _SYS_WRITE}] + msgs_write,
              "max_tokens": _max_tokens,
              "temperature": 0.7,

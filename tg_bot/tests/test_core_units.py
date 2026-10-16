@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import contextlib
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timedelta, timezone
 import http.client
 import importlib
+import io
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -113,6 +116,68 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "DAILY_REPORT_TIMEZONE"):
                 reload_config()
 
+    def test_daily_report_event_section_target_defaults_to_three(self):
+        with temporary_env(**required_env(DAILY_REPORT_EVENT_SECTION_TARGET=None)):
+            cfg = reload_config()
+            self.assertEqual(cfg.DAILY_REPORT_EVENT_SECTION_TARGET, 3)
+
+    def test_daily_report_event_section_target_accepts_only_one_through_six(self):
+        for value in (1, 6):
+            with self.subTest(value=value), temporary_env(**required_env(
+                DAILY_REPORT_EVENT_SECTION_TARGET=str(value),
+            )):
+                cfg = reload_config()
+                self.assertEqual(cfg.DAILY_REPORT_EVENT_SECTION_TARGET, value)
+        for value in (0, 7):
+            with self.subTest(value=value), temporary_env(**required_env(
+                DAILY_REPORT_EVENT_SECTION_TARGET=str(value),
+            )):
+                with self.assertRaisesRegex(RuntimeError, "DAILY_REPORT_EVENT_SECTION_TARGET"):
+                    reload_config()
+
+    def test_daily_report_research_budgets_have_bounded_defaults(self):
+        keys = {
+            "DAILY_REPORT_FOLLOWUP_QUERIES_PER_EVENT": None,
+            "DAILY_REPORT_FETCHES_PER_EVENT": None,
+            "DAILY_REPORT_MIN_INDEPENDENT_SOURCES": None,
+            "DAILY_REPORT_EVIDENCE_TOP_K": None,
+            "DAILY_REPORT_MAX_EVIDENCE_CHARS": None,
+            "DAILY_REPORT_SUMMARY_RETRIES": None,
+            "DAILY_REPORT_VERIFY_RETRIES": None,
+        }
+        with temporary_env(**required_env(**keys)):
+            cfg = reload_config()
+        self.assertEqual(cfg.DAILY_REPORT_FOLLOWUP_QUERIES_PER_EVENT, 2)
+        self.assertEqual(cfg.DAILY_REPORT_FETCHES_PER_EVENT, 3)
+        self.assertEqual(cfg.DAILY_REPORT_MIN_INDEPENDENT_SOURCES, 1)
+        self.assertEqual(cfg.DAILY_REPORT_EVIDENCE_TOP_K, 3)
+        self.assertEqual(cfg.DAILY_REPORT_MAX_EVIDENCE_CHARS, 18000)
+        self.assertEqual(cfg.DAILY_REPORT_SUMMARY_RETRIES, 2)
+        self.assertEqual(cfg.DAILY_REPORT_VERIFY_RETRIES, 1)
+
+    def test_daily_report_research_budgets_accept_only_documented_bounds(self):
+        cases = (
+            ("DAILY_REPORT_FOLLOWUP_QUERIES_PER_EVENT", 1, 3),
+            ("DAILY_REPORT_FETCHES_PER_EVENT", 1, 5),
+            ("DAILY_REPORT_MIN_INDEPENDENT_SOURCES", 1, 3),
+            ("DAILY_REPORT_EVIDENCE_TOP_K", 1, 6),
+            ("DAILY_REPORT_MAX_EVIDENCE_CHARS", 4000, 40000),
+            ("DAILY_REPORT_SUMMARY_RETRIES", 1, 4),
+            ("DAILY_REPORT_VERIFY_RETRIES", 1, 3),
+        )
+        for key, minimum, maximum in cases:
+            for value in (minimum, maximum):
+                with self.subTest(key=key, value=value), temporary_env(
+                    **required_env(**{key: str(value)})
+                ):
+                    self.assertEqual(getattr(reload_config(), key), value)
+            for value in (minimum - 1, maximum + 1):
+                with self.subTest(key=key, value=value), temporary_env(
+                    **required_env(**{key: str(value)})
+                ):
+                    with self.assertRaisesRegex(RuntimeError, key):
+                        reload_config()
+
     def test_ensure_data_dir_creates_private_directory(self):
         temp_dir = tempfile.mkdtemp(prefix="tg-bot-config-")
         shutil.rmtree(temp_dir)
@@ -153,6 +218,49 @@ class ConfigTests(unittest.TestCase):
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
+    def test_daily_report_health_accepts_fresh_no_publishable_content(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-health-empty-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_MAX_STALE_HOURS="1",
+            )):
+                cfg = reload_config()
+                with open(cfg.DAILY_REPORT_STATUS_FILE, "w", encoding="utf-8") as handle:
+                    json.dump({
+                        "status": "no_publishable_content",
+                        "generated_at": "2026-07-12T12:00:00+00:00",
+                    }, handle)
+                health = cfg.daily_report_health(
+                    now=cfg.datetime(2026, 7, 12, 12, 30, tzinfo=cfg.timezone.utc)
+                )
+                self.assertTrue(health["ok"])
+                self.assertEqual(health["status"], "no_publishable_content")
+                self.assertTrue(any("无可发布内容" in item for item in health["warnings"]))
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_daily_report_health_rejects_stale_no_publishable_content(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-health-empty-stale-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_MAX_STALE_HOURS="1",
+            )):
+                cfg = reload_config()
+                with open(cfg.DAILY_REPORT_STATUS_FILE, "w", encoding="utf-8") as handle:
+                    json.dump({
+                        "status": "no_publishable_content",
+                        "generated_at": "2026-07-12T10:00:00+00:00",
+                    }, handle)
+                health = cfg.daily_report_health(
+                    now=cfg.datetime(2026, 7, 12, 12, 30, tzinfo=cfg.timezone.utc)
+                )
+                self.assertFalse(health["ok"])
+                self.assertEqual(health["status"], "stale")
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
 
 class SearchProviderTests(unittest.TestCase):
     def test_serper_without_key_is_explicitly_unavailable(self):
@@ -161,6 +269,488 @@ class SearchProviderTests(unittest.TestCase):
             sys.modules.pop("tg_bot.tools.search", None)
             search = importlib.import_module("tg_bot.tools.search")
             self.assertEqual(search._execute_serper("test", "general"), "Serper 未配置")
+
+    def test_all_news_candidates_calls_every_provider_and_dedupes_tracking_urls(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            calls = []
+            first = {
+                "title": "First report",
+                "summary": "kept summary",
+                "url": "HTTPS://X.TEST/story/?utm_source=newsletter&GCLID=click&keep=1#details",
+                "published_at": "2026-07-17T04:00:00+00:00",
+                "relevance": 0.9,
+                "source": "brave",
+            }
+            duplicate = {
+                "title": "Duplicate report",
+                "summary": "later duplicate",
+                "url": "https://x.test/story?keep=1&utm_medium=feed",
+                "published_at": "2026-07-17T04:05:00+00:00",
+                "source": "tavily",
+            }
+            distinct = {
+                "title": "Distinct report",
+                "summary": "distinct summary",
+                "url": "https://y.test/story?keep=1&fbclid=click",
+                "published_at": "2026-07-17T04:10:00+00:00",
+                "source": "serper",
+            }
+
+            def fake(name, rows):
+                def run(_query):
+                    calls.append(name)
+                    return rows, []
+                return run
+
+            items, diagnostics = search.execute_news_candidates_all(
+                "query",
+                providers=(
+                    ("brave", fake("brave", [first])),
+                    ("tavily", fake("tavily", [duplicate])),
+                    ("serper", fake("serper", [distinct])),
+                ),
+            )
+            self.assertEqual(calls, ["brave", "tavily", "serper"])
+            self.assertEqual(items, [first, distinct])
+            self.assertEqual(diagnostics, [])
+
+    def test_all_news_candidates_preserves_identity_query_parameters(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            for parameter in ("source", "from", "ref", "referrer"):
+                with self.subTest(parameter=parameter):
+                    first = {"title": "A", "url": f"https://x.test/story?{parameter}=A"}
+                    second = {"title": "B", "url": f"https://x.test/story?{parameter}=B"}
+                    items, diagnostics = search.execute_news_candidates_all(
+                        "query",
+                        providers=(
+                            ("brave", lambda _query, row=first: ([row], [])),
+                            ("tavily", lambda _query, row=second: ([row], [])),
+                        ),
+                    )
+                    self.assertEqual(items, [first, second])
+                    self.assertEqual(diagnostics, [])
+
+    def test_all_news_candidates_keeps_query_parameter_order_distinct(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            first = {"title": "A", "url": "https://x.test/story?a=1&b=2"}
+            second = {"title": "B", "url": "https://x.test/story?b=2&a=1"}
+            items, diagnostics = search.execute_news_candidates_all(
+                "query",
+                providers=(
+                    ("brave", lambda _query: ([first], [])),
+                    ("tavily", lambda _query: ([second], [])),
+                ),
+            )
+            self.assertEqual(items, [first, second])
+            self.assertEqual(diagnostics, [])
+
+    def test_all_news_candidates_continues_after_provider_exception(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            calls = []
+
+            def first(_query):
+                calls.append("brave")
+                return [{"title": "First", "url": "https://one.test/a"}], []
+
+            def broken(_query):
+                calls.append("tavily")
+                raise RuntimeError("secret-key-must-not-appear")
+
+            def last(_query):
+                calls.append("serper")
+                return [{"title": "Last", "url": "https://two.test/b"}], []
+
+            items, diagnostics = search.execute_news_candidates_all(
+                "query",
+                providers=(("brave", first), ("tavily", broken), ("serper", last)),
+            )
+            self.assertEqual(calls, ["brave", "tavily", "serper"])
+            self.assertEqual([item["title"] for item in items], ["First", "Last"])
+            self.assertEqual(diagnostics, ["tavily: provider_error:RuntimeError"])
+            self.assertNotIn("secret-key", " ".join(diagnostics))
+
+    def test_all_news_candidates_skips_bad_rows_and_keeps_valid_rows(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            calls = []
+            brave_item = {
+                "title": "Brave valid",
+                "url": "https://brave.test/a",
+                "source": "brave",
+            }
+
+            def mixed(_query):
+                calls.append("brave")
+                return [None, "bad", brave_item], ["brave: partial"]
+
+            def tavily(_query):
+                calls.append("tavily")
+                return [{"title": "Tavily", "url": "https://tavily.test/a"}], []
+
+            def serper(_query):
+                calls.append("serper")
+                return [{"title": "Serper", "url": "https://serper.test/a"}], []
+
+            try:
+                items, diagnostics = search.execute_news_candidates_all(
+                    "query",
+                    providers=(("brave", mixed), ("tavily", tavily), ("serper", serper)),
+                )
+            except Exception as exc:
+                self.fail(f"malformed row escaped provider isolation: {type(exc).__name__}")
+            self.assertEqual(calls, ["brave", "tavily", "serper"])
+            self.assertEqual(
+                [item["title"] for item in items],
+                ["Brave valid", "Tavily", "Serper"],
+            )
+            self.assertEqual(diagnostics, [
+                "brave: partial",
+                "brave: provider_error:TypeError",
+            ])
+
+    def test_all_news_candidates_isolates_provider_with_only_bad_rows(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            calls = []
+
+            def first(_query):
+                calls.append("brave")
+                return [{"title": "First", "url": "https://one.test/a"}], []
+
+            def malformed(_query):
+                calls.append("tavily")
+                return [None, "bad"], []
+
+            def last(_query):
+                calls.append("serper")
+                return [{"title": "Last", "url": "https://two.test/b"}], []
+
+            try:
+                items, diagnostics = search.execute_news_candidates_all(
+                    "query",
+                    providers=(("brave", first), ("tavily", malformed), ("serper", last)),
+                )
+            except Exception as exc:
+                self.fail(f"malformed provider escaped isolation: {type(exc).__name__}")
+            self.assertEqual(calls, ["brave", "tavily", "serper"])
+            self.assertEqual([item["title"] for item in items], ["First", "Last"])
+            self.assertEqual(diagnostics, ["tavily: provider_error:TypeError"])
+
+    def test_all_news_candidates_continues_after_empty_provider(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            calls = []
+
+            def empty(_query):
+                calls.append("brave")
+                return [], ["brave: empty"]
+
+            def found(_query):
+                calls.append("tavily")
+                return [{"title": "Found", "url": "https://found.test/a"}], []
+
+            items, diagnostics = search.execute_news_candidates_all(
+                "query",
+                providers=(("brave", empty), ("tavily", found)),
+            )
+            self.assertEqual(calls, ["brave", "tavily"])
+            self.assertEqual([item["title"] for item in items], ["Found"])
+            self.assertEqual(diagnostics, ["brave: empty"])
+
+    def test_all_news_candidates_reports_every_unconfigured_provider(self):
+        with temporary_env(**required_env()):
+            cfg = reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            with patch.object(search, "BRAVE_KEY", ""), patch.object(
+                search, "TAVILY_KEYS", []
+            ), patch.object(cfg, "SERPER_KEYS", []):
+                items, diagnostics = search.execute_news_candidates_all("query")
+            self.assertEqual(items, [])
+            self.assertEqual(diagnostics, [
+                "brave: unavailable",
+                "tavily: unavailable",
+                "serper: unavailable",
+            ])
+
+    def test_all_news_candidates_keeps_items_without_valid_urls_distinct(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            missing = {"title": "Missing URL", "url": "", "source": "brave"}
+            malformed = {"title": "Malformed URL", "url": "not a url", "source": "tavily"}
+            items, diagnostics = search.execute_news_candidates_all(
+                "query",
+                providers=(
+                    ("brave", lambda _query: ([missing], [])),
+                    ("tavily", lambda _query: ([malformed], [])),
+                ),
+            )
+            self.assertEqual(items, [missing, malformed])
+            self.assertEqual(diagnostics, [])
+
+    def test_legacy_news_candidates_still_stops_after_first_success(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            brave_item = {"title": "First", "url": "https://first.test/a"}
+            with patch.object(
+                search, "_news_from_brave", return_value=([brave_item], [])
+            ) as brave, patch.object(
+                search, "_news_from_tavily", return_value=([{"title": "Second"}], [])
+            ) as tavily, patch.object(
+                search, "_news_from_serper", return_value=([{"title": "Third"}], [])
+            ) as serper:
+                items, diagnostics = search.execute_news_candidates("query")
+            self.assertEqual(items, [brave_item])
+            self.assertEqual(diagnostics, [])
+            brave.assert_called_once_with("query")
+            tavily.assert_not_called()
+            serper.assert_not_called()
+
+    def test_legacy_news_candidates_preserves_nonempty_raw_response_semantics(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            payload = json.dumps({
+                "results": [{"title": "", "url": "https://filtered.test/a"}],
+            })
+            with patch(
+                "tg_bot.tools.fetch.http_get", return_value=payload
+            ), patch.object(search, "inc_quota") as quota, patch.object(
+                search,
+                "_news_from_tavily",
+                return_value=([{"title": "Later", "url": "https://later.test/a"}], []),
+            ) as tavily:
+                items, diagnostics = search.execute_news_candidates("query")
+            self.assertEqual(items, [])
+            self.assertEqual(diagnostics, [])
+            quota.assert_called_once_with("brave")
+            tavily.assert_not_called()
+
+    def test_brave_adapter_keeps_valid_rows_when_response_is_mixed(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            payload = json.dumps({"results": [{
+                "title": "Brave valid",
+                "description": "summary",
+                "url": "https://brave.test/a",
+                "page_age": "2026-07-17T04:00:00+00:00",
+                "score": 0.9,
+            }, None, "bad"]})
+            with patch(
+                "tg_bot.tools.fetch.http_get", return_value=payload
+            ), patch.object(search, "inc_quota") as quota:
+                items, diagnostics = search._news_from_brave("query")
+            self.assertEqual([item["title"] for item in items], ["Brave valid"])
+            self.assertEqual(items[0]["source"], "brave")
+            self.assertEqual(diagnostics, ["brave: provider_error:TypeError"])
+            quota.assert_called_once_with("brave")
+
+    def test_tavily_adapter_keeps_valid_rows_when_response_is_mixed(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            payload = {"results": [{
+                "title": "Tavily valid",
+                "content": "summary",
+                "url": "https://tavily.test/a",
+                "published_date": "2026-07-17T04:00:00+00:00",
+                "score": 0.8,
+            }, None, "bad"]}
+            with patch.object(search, "_tavily_request", return_value=payload):
+                items, diagnostics = search._news_from_tavily("query")
+            self.assertEqual([item["title"] for item in items], ["Tavily valid"])
+            self.assertEqual(items[0]["source"], "tavily")
+            self.assertEqual(diagnostics, ["tavily: provider_error:TypeError"])
+
+    def test_serper_adapter_keeps_valid_rows_when_response_is_mixed(self):
+        with temporary_env(**required_env(SERPER_KEY_1=None, SERPER_KEY_2=None)):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_args):
+                    return False
+                def read(self):
+                    return json.dumps({"news": [{
+                        "title": "Serper valid",
+                        "snippet": "summary",
+                        "link": "https://serper.test/a",
+                        "date": "1 hour ago",
+                        "score": 0.7,
+                    }, None, "bad"]}).encode()
+
+            with patch.object(search, "urlopen", return_value=FakeResponse()), patch.object(
+                search, "inc_quota"
+            ) as quota:
+                items, diagnostics = search._news_from_serper("query")
+            self.assertEqual([item["title"] for item in items], ["Serper valid"])
+            self.assertEqual(items[0]["source"], "serper")
+            self.assertEqual(diagnostics, ["serper: provider_error:TypeError"])
+            quota.assert_called_once_with("serper")
+
+    def test_tavily_concurrent_retries_use_each_key_once_per_call(self):
+        with temporary_env(**required_env(TAVILY_KEY_0="t1", TAVILY_KEY_1="t2")):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            observed = {"lane-a": [], "lane-b": []}
+            results = {}
+            record_lock = threading.Lock()
+            lane_a_first = threading.Event()
+            lane_b_first = threading.Event()
+            lane_a_second = threading.Event()
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_args):
+                    return False
+                def read(self):
+                    return json.dumps({"results": [{"title": "ok"}]}).encode()
+
+            def fake_urlopen(request, **_kwargs):
+                payload = json.loads(request.data)
+                lane = payload["query"]
+                key = payload["api_key"]
+                with record_lock:
+                    observed[lane].append(key)
+                    attempt = len(observed[lane])
+                    first_key = observed[lane][0]
+                if attempt == 1:
+                    if lane == "lane-a":
+                        lane_a_first.set()
+                        lane_b_first.wait(2)
+                    else:
+                        lane_b_first.set()
+                        lane_a_second.wait(2)
+                    raise RuntimeError("429 quota")
+                if lane == "lane-a":
+                    lane_a_second.set()
+                if key == first_key:
+                    raise RuntimeError("429 quota")
+                return FakeResponse()
+
+            def run(lane):
+                results[lane] = search._tavily_request(
+                    "https://api.tavily.com/search", {"query": lane}
+                )
+
+            with patch.object(search, "urlopen", side_effect=fake_urlopen), patch.object(
+                search, "inc_quota"
+            ) as quota:
+                first = threading.Thread(target=run, args=("lane-a",), daemon=True)
+                second = threading.Thread(target=run, args=("lane-b",), daemon=True)
+                first.start()
+                self.assertTrue(lane_a_first.wait(1))
+                second.start()
+                first.join(3)
+                second.join(3)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(observed, {
+                "lane-a": ["t1", "t2"],
+                "lane-b": ["t2", "t1"],
+            })
+            self.assertTrue(all(results.values()))
+            self.assertCountEqual(
+                [item.args[0] for item in quota.call_args_list],
+                ["tavily_1", "tavily_0"],
+            )
+
+    def test_serper_concurrent_retries_use_each_key_once_per_call(self):
+        with temporary_env(**required_env(SERPER_KEY_0="s1", SERPER_KEY_1="s2")):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            observed = {"lane-a": [], "lane-b": []}
+            results = {}
+            record_lock = threading.Lock()
+            lane_a_first = threading.Event()
+            lane_b_first = threading.Event()
+            lane_a_second = threading.Event()
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_args):
+                    return False
+                def read(self):
+                    return json.dumps({
+                        "news": [{"title": "ok", "link": "https://example.test/ok"}],
+                    }).encode()
+
+            def fake_urlopen(request, **_kwargs):
+                payload = json.loads(request.data)
+                lane = payload["q"]
+                key = request.get_header("X-api-key")
+                with record_lock:
+                    observed[lane].append(key)
+                    attempt = len(observed[lane])
+                    first_key = observed[lane][0]
+                if attempt == 1:
+                    if lane == "lane-a":
+                        lane_a_first.set()
+                        lane_b_first.wait(2)
+                    else:
+                        lane_b_first.set()
+                        lane_a_second.wait(2)
+                    raise RuntimeError("429 quota")
+                if lane == "lane-a":
+                    lane_a_second.set()
+                if key == first_key:
+                    raise RuntimeError("429 quota")
+                return FakeResponse()
+
+            def run(lane):
+                results[lane] = search._news_from_serper(lane)
+
+            with patch.object(search, "urlopen", side_effect=fake_urlopen), patch.object(
+                search, "inc_quota"
+            ) as quota:
+                first = threading.Thread(target=run, args=("lane-a",), daemon=True)
+                second = threading.Thread(target=run, args=("lane-b",), daemon=True)
+                first.start()
+                self.assertTrue(lane_a_first.wait(1))
+                second.start()
+                first.join(3)
+                second.join(3)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(observed, {
+                "lane-a": ["s1", "s2"],
+                "lane-b": ["s2", "s1"],
+            })
+            self.assertTrue(all(items for items, _notes in results.values()))
+            self.assertEqual([item.args[0] for item in quota.call_args_list], ["serper", "serper"])
 
     def test_structured_news_candidates_preserve_date_and_relevance(self):
         data_dir = tempfile.mkdtemp(prefix="tg-bot-search-provider-")
@@ -1021,9 +1611,32 @@ class TelegramProgressTests(unittest.TestCase):
         edits = [data["text"] for method, data in calls if method == "editMessageText"]
         self.assertTrue(any("搜索采集中" in text for text in edits))
         self.assertTrue(any("采集 · 3条素材" in text for text in edits))
+        # 完成后面板保留（用户要能回看每一步），结尾是已发送行，绝不删除
         self.assertIn("✓ 已发送", edits[-1])
+        deleted = [method for method, _data in calls if method == "deleteMessage"]
+        self.assertEqual(deleted, [])
 
-    def test_progress_tool_items_keep_three_visible_messages(self):
+    def test_progress_review_shards_collapse_into_single_line(self):
+        from tg_bot.progress import TelegramProgress
+
+        calls, fake_tg = self._fake_telegram()
+        progress = TelegramProgress(1, fake_tg, animate=False)
+        progress.set_route("search")
+        progress.stage("review_shard", "start", "0/3")
+        progress.stage("review_shard", "done", "1/3")
+        progress.stage("review_shard", "done", "2/3")
+        progress.stage("review_shard", "done", "3/3")
+
+        edits = [data["text"] for method, data in calls if method == "editMessageText"]
+        self.assertTrue(any("分段核查中…（1/3 已完成）" in text for text in edits))
+        final = edits[-1]
+        # 全程只占一行：最终只有一条 ✓ 分段核查，且不再有"核查中"
+        self.assertEqual(final.count("分段核查"), 1)
+        self.assertIn("✓ 🧩 分段核查（3 段）", final)
+        self.assertNotIn("核查中", final)
+        progress.close()
+
+    def test_progress_tool_items_fold_into_panel_without_extra_messages(self):
         from tg_bot.progress import TelegramProgress
 
         calls, fake_tg = self._fake_telegram()
@@ -1032,12 +1645,13 @@ class TelegramProgressTests(unittest.TestCase):
         for index in range(4):
             progress.stage("gather_item", "start", f"🔍 搜索{index}")
 
-        deleted = [
-            data["message_id"]
-            for method, data in calls
-            if method == "deleteMessage"
-        ]
-        self.assertEqual(deleted, [2])
+        # 条目折叠进主面板：只有第一次 sendMessage，其余全是编辑，绝无删除
+        sends = [method for method, _data in calls if method == "sendMessage"]
+        deletes = [method for method, _data in calls if method == "deleteMessage"]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(deletes, [])
+        edits = [data["text"] for method, data in calls if method == "editMessageText"]
+        self.assertTrue(any("└ 🔍 搜索3" in text for text in edits))
         progress.close()
 
     def test_disabled_progress_never_calls_telegram(self):
@@ -1126,6 +1740,116 @@ class SearchProgressCallbackTests(unittest.TestCase):
         self.assertIn(("writer", "done", "6"), events)
 
 
+class DegradedAnswerPipelineTests(unittest.TestCase):
+    """run_search_pipeline 里 audit_required/sufficient=False 时的降级回答路径
+    （core/pipeline.py 约 217 行附近）：审计未通过不应一票否决拒答，优先用
+    审计认可的来源子集降级作答；只有采集本身一无所获时才真正拒答。"""
+
+    _CONFIG = PipelineConfig(query_fixer=False, curator=False, critic=False, patcher=False)
+
+    @staticmethod
+    def _source_dict(id_, body):
+        return {
+            "id": id_,
+            "url": f"https://example.com/{id_}",
+            "domain": "example.com",
+            "title": f"标题{id_}",
+            "snippet": body[:60],
+            "full_content": body,
+            "tool": "web_search",
+            "query": "苹果财报",
+        }
+
+    def test_partial_supported_sources_degrade_instead_of_reject(self):
+        """场景a：supported_source_ids 只认可部分来源 → 用认可子集降级作答。"""
+        supported_body = "苹果公司发布最新财报，营收同比增长12%，超出市场预期。" * 3
+        unsupported_body = "一些未经核实的传闻，缺乏可靠信源支持。" * 3
+        raw_sources_list = [
+            self._source_dict("R001", supported_body),
+            self._source_dict("R002", unsupported_body),
+        ]
+        meta = {
+            "rounds": [], "tool_calls_summary": [], "tool_results": [],
+            "fetched_pages": [], "failed_urls": [], "facts_json": {},
+            "audit_required": True, "sufficient": False,
+            "supported_source_ids": ["R001"],
+        }
+
+        with temporary_env(**required_env()):
+            from tg_bot.core.pipeline import run_search_pipeline
+            with patch("tg_bot.pipeline.gather.gather_ai", return_value=(raw_sources_list, meta)):
+                with patch("tg_bot.agents.writer.write",
+                           return_value=("苹果公司最新财报显示营收增长。", "")):
+                    reply, verify_status, out_meta = run_search_pipeline(
+                        "苹果最新财报数据怎么样",
+                        ["苹果财报"],
+                        config=self._CONFIG,
+                    )
+
+        self.assertIn("苹果公司最新财报显示营收增长。", reply)
+        self.assertIn("ⓘ 部分信息未交叉核实", reply)  # 单域名来源单薄，A方案下仍显示标注
+        self.assertNotEqual(verify_status, "insufficient_evidence")
+        self.assertEqual([s["id"] for s in out_meta["source_index"]], ["R001"])
+
+    def test_empty_supported_ids_keeps_full_source_set_and_degrades(self):
+        """场景b：supported_source_ids 为空但采集素材（source_index）非空
+        → 审计一条都没认可时保留全部采集素材，仍旧降级作答，不拒答。"""
+        body_a = "苹果公司发布最新财报，营收同比增长12%。" * 3
+        body_b = "分析师对财报数据的补充解读。" * 3
+        raw_sources_list = [
+            self._source_dict("R001", body_a),
+            self._source_dict("R002", body_b),
+        ]
+        meta = {
+            "rounds": [], "tool_calls_summary": [], "tool_results": [],
+            "fetched_pages": [], "failed_urls": [], "facts_json": {},
+            "audit_required": True, "sufficient": False,
+            "supported_source_ids": [],
+        }
+
+        with temporary_env(**required_env()):
+            from tg_bot.core.pipeline import run_search_pipeline
+            with patch("tg_bot.pipeline.gather.gather_ai", return_value=(raw_sources_list, meta)):
+                with patch("tg_bot.agents.writer.write",
+                           return_value=("综合两条来源给出的财报解读。", "")):
+                    reply, verify_status, out_meta = run_search_pipeline(
+                        "苹果最新财报数据怎么样",
+                        ["苹果财报"],
+                        config=self._CONFIG,
+                    )
+
+        self.assertIn("综合两条来源给出的财报解读。", reply)
+        self.assertIn("ⓘ 部分信息未交叉核实", reply)  # 单域名来源单薄，A方案下仍显示标注
+        self.assertNotEqual(verify_status, "insufficient_evidence")
+        self.assertEqual(
+            sorted(s["id"] for s in out_meta["source_index"]), ["R001", "R002"],
+        )
+
+    def test_completely_empty_gather_returns_rejection(self):
+        """场景c：gather 返回完全空的 source_index → 采集本身一无所获，真正拒答。"""
+        meta = {
+            "rounds": [], "tool_calls_summary": [], "tool_results": [],
+            "fetched_pages": [], "failed_urls": [], "facts_json": {},
+            "audit_required": True, "sufficient": False,
+            "supported_source_ids": [],
+        }
+
+        with temporary_env(**required_env()):
+            from tg_bot.core.pipeline import run_search_pipeline
+            with patch("tg_bot.pipeline.gather.gather_ai", return_value=([], meta)):
+                with patch("tg_bot.agents.writer.write") as mock_write:
+                    reply, verify_status, out_meta = run_search_pipeline(
+                        "苹果最新财报数据怎么样",
+                        ["苹果财报"],
+                        config=self._CONFIG,
+                    )
+
+        mock_write.assert_not_called()
+        self.assertEqual(reply, "没有搜索到可用于回答的资料。请换个问法或发「再查一下」。")
+        self.assertEqual(verify_status, "insufficient_evidence")
+        self.assertEqual(out_meta["source_index"], [])
+
+
 class MemoryContextTests(unittest.TestCase):
     def test_build_memory_context_includes_summary_and_recent_context(self):
         text = build_memory_context(
@@ -1212,10 +1936,11 @@ class ReplyIntegrationTests(unittest.TestCase):
         self.assertIn("没有调用任何搜索工具", prompt)
         self.assertIn("不要出现「根据搜索结果」", prompt)
 
-    def test_writer_prompt_declares_stable_sections(self):
+    def test_writer_prompt_declares_core_contract(self):
+        """新写作规则的核心契约：结论先行、[来源N] 标注、信息密度约束、退回处理。"""
         writer = importlib.import_module("tg_bot.agents.writer")
-        for heading in ("结论", "关键依据", "下一步", "来源"):
-            self.assertIn(heading, writer._SYS_WRITER)
+        for phrase in ("结论先行", "[来源N]", "信息密度", "来源详情由系统自动折叠附加", "SOFT", "HARD"):
+            self.assertIn(phrase, writer._SYS_WRITER)
 
     def test_today_report_pack_declares_report_mode(self):
         with temporary_env(**required_env()):
@@ -1226,6 +1951,380 @@ class ReplyIntegrationTests(unittest.TestCase):
                 "今天午报有什么", report_text="AI 新闻\n来源：example.com"
             )
         self.assertEqual(pack["reply_mode"], "report")
+
+
+class ReportResearchTests(unittest.TestCase):
+    def setUp(self):
+        self.research = importlib.import_module("tg_bot.report_research")
+        self.daily = importlib.import_module("tg_bot.daily_report")
+
+    def _source(self, domain, *, path="story", title="Seed title", summary="seed facts", source="seed"):
+        return self.daily.NewsCandidate(
+            category="global",
+            title=title,
+            summary=summary,
+            url=f"https://{domain}/{path}",
+            domain=domain,
+            published_at="2026-07-17T04:00:00+00:00",
+            relevance=0.9,
+            source=source,
+        )
+
+    def _event(self, *, sources=(), title="Acme launches Project Nova"):
+        return self.daily.ReportEvent(
+            event_id="event-1",
+            category="global",
+            title=title,
+            summary="Acme launched Project Nova with 40 percent lower cost.",
+            sources=tuple(sources),
+        )
+
+    def _bundle(self):
+        sources = (
+            self.research.EvidenceSource(
+                "S1", "brave", "q1", "Source one", "https://one.test/a",
+                "one.test", "2026-07-17T05:00:00+00:00", "snippet one",
+                "full facts one", "ok",
+            ),
+            self.research.EvidenceSource(
+                "S2", "serper", "q2", "Source two", "https://two.test/b",
+                "two.test", "2026-07-17T05:10:00+00:00", "snippet two",
+                "full facts two", "ok",
+            ),
+        )
+        return self.research.EvidenceBundle("event-1", "global", "Seed", sources)
+
+    def test_contracts_are_frozen_and_budget_validates_direct_construction(self):
+        budget = self.research.ResearchBudget()
+        with self.assertRaises(FrozenInstanceError):
+            budget.fetches = 4
+        for kwargs in (
+            {"followup_queries": 0}, {"followup_queries": 4},
+            {"fetches": 0}, {"fetches": 6},
+            {"min_sources": 0}, {"min_sources": 4},
+            {"fetches": 1, "min_sources": 2},
+            {"max_chars": 3999}, {"max_chars": 40001},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.research.ResearchBudget(**kwargs)
+        source = self.research.EvidenceSource(
+            "S1", "seed", "", "Title", "https://one.test/a", "one.test",
+            None, "snippet", "full", "ok",
+        )
+        bundle = self.research.EvidenceBundle("event-1", "global", "Title", (source,))
+        with self.assertRaises(FrozenInstanceError):
+            source.title = "changed"
+        with self.assertRaises(FrozenInstanceError):
+            bundle.sources = ()
+
+    def test_generates_two_distinct_queries_and_keeps_source_metadata(self):
+        queries = []
+
+        def search_more(query):
+            queries.append(query)
+            return ([{
+                "title": f"Result {len(queries)}",
+                "url": f"https://source{len(queries)}.test/report",
+                "summary": f"snippet {len(queries)}",
+                "source": "brave" if len(queries) == 1 else "serper",
+                "published_at": "2026-07-17T05:00:00+00:00",
+            }], [{"ignored": True}])
+
+        bundle = self.research.deepen_event(
+            self._event(), search_more, lambda url: f"[正文来源：{url}]\n\nfull facts",
+            self.research.ResearchBudget(),
+        )
+
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(len(set(queries)), 2)
+        self.assertEqual(queries[0], "Acme launches Project Nova")
+        self.assertIn("official", queries[1].lower())
+        self.assertEqual([source.source_id for source in bundle.sources], ["S1", "S2"])
+        self.assertEqual([source.provider for source in bundle.sources], ["brave", "serper"])
+        self.assertEqual([source.query for source in bundle.sources], queries)
+        self.assertEqual(bundle.sources[0].snippet, "snippet 1")
+        self.assertEqual(bundle.sources[0].published_at, "2026-07-17T05:00:00+00:00")
+        self.assertNotIn("正文来源", bundle.sources[0].full_content)
+
+    def test_third_query_is_recent_update_variant(self):
+        queries = []
+        self.research.deepen_event(
+            self._event(),
+            lambda query: (queries.append(query) or [], []),
+            lambda _url: "unused",
+            self.research.ResearchBudget(followup_queries=3, min_sources=1),
+        )
+        self.assertEqual(len(queries), 3)
+        self.assertEqual(len(set(queries)), 3)
+        self.assertRegex(queries[2], r"24|更新|update")
+
+    def test_caps_fetch_calls_and_dedupes_urls_and_domains_in_stable_order(self):
+        seed = self._source("seed.test", path="a?utm_source=feed&source=newsletter#part")
+        fetched = []
+        rows = [
+            {"title": "same canonical", "url": "https://seed.test/a", "source": "brave"},
+            {"title": "same domain", "url": "https://seed.test/b", "source": "brave"},
+            {"title": "two", "url": "https://two.test/a?gclid=x", "source": "brave"},
+            {"title": "two duplicate", "url": "https://two.test/a", "source": "brave"},
+            {"title": "three", "url": "https://three.test/a", "source": "brave"},
+            {"title": "four", "url": "https://four.test/a", "source": "brave"},
+        ]
+
+        def fetch(url):
+            fetched.append(url)
+            return "facts"
+
+        bundle = self.research.deepen_event(
+            self._event(sources=(seed,)), lambda _query: (rows, []), fetch,
+            self.research.ResearchBudget(followup_queries=1, fetches=3),
+        )
+
+        self.assertEqual(fetched, [
+            "https://seed.test/a?source=newsletter",
+            "https://two.test/a",
+            "https://three.test/a",
+        ])
+        self.assertEqual([source.domain for source in bundle.sources], [
+            "seed.test", "two.test", "three.test",
+        ])
+
+    def test_canonical_url_keeps_identity_parameters_values_and_query_order(self):
+        first, _domain = self.research._canonical_http_url(
+            "https://one.test/a?source=A&from=feed&ref=home&utm_source=x&keep=1"
+        )
+        second, _domain = self.research._canonical_http_url(
+            "https://one.test/a?source=B&from=feed&ref=home&utm_medium=x&keep=1"
+        )
+        self.assertEqual(
+            first, "https://one.test/a?source=A&from=feed&ref=home&keep=1"
+        )
+        self.assertEqual(
+            second, "https://one.test/a?source=B&from=feed&ref=home&keep=1"
+        )
+        self.assertNotEqual(first, second)
+
+    def test_rejects_unicode_authority_but_allows_explicit_ascii_punycode(self):
+        rows = [
+            {"url": "https://faß.de/story?source=A", "title": "unicode host"},
+            {"url": "https://xn--fa-hia.de/story?source=B", "title": "punycode host"},
+        ]
+        fetched = []
+        bundle = self.research.deepen_event(
+            self._event(), lambda _query: (rows, []),
+            lambda url: fetched.append(url) or "facts",
+            self.research.ResearchBudget(followup_queries=1, min_sources=1),
+        )
+        self.assertEqual(fetched, ["https://xn--fa-hia.de/story?source=B"])
+        self.assertEqual(bundle.sources[0].domain, "xn--fa-hia.de")
+
+    def test_rejects_unsafe_urls_without_fetching_them(self):
+        rows = [
+            {"url": "ftp://bad.test/a", "title": "ftp"},
+            {"url": "https://user:pass@bad.test/a", "title": "userinfo"},
+            {"url": "https://bad.test\\@good.test/a", "title": "slash"},
+            {"url": "https:///missing-host", "title": "host"},
+            {"url": "https://bad_host.test/a", "title": "invalid host"},
+            {"url": "https://one.test/a", "title": "one"},
+        ]
+        fetched = []
+        bundle = self.research.deepen_event(
+            self._event(), lambda _query: (rows, []),
+            lambda url: fetched.append(url) or "facts",
+            self.research.ResearchBudget(followup_queries=1, min_sources=1),
+        )
+        self.assertEqual(fetched, ["https://one.test/a"])
+        self.assertEqual(bundle.sources[0].domain, "one.test")
+
+    def test_fetch_failure_tries_later_independent_domains_and_isolates_errors(self):
+        rows = [
+            {"url": "https://one.test/a", "title": "one"},
+            {"url": "https://two.test/a", "title": "two"},
+            {"url": "https://three.test/a", "title": "three"},
+            {"url": "https://four.test/a", "title": "four"},
+        ]
+        fetched = []
+
+        def fetch(url):
+            fetched.append(url)
+            if "one.test" in url:
+                raise TimeoutError("slow")
+            if "two.test" in url:
+                return "正文抓取失败：upstream error"
+            return f"full content from {url}"
+
+        bundle = self.research.deepen_event(
+            self._event(), lambda _query: (rows, []), fetch,
+            self.research.ResearchBudget(followup_queries=1, fetches=4),
+        )
+        self.assertEqual(len(fetched), 4)
+        self.assertEqual([source.domain for source in bundle.sources], ["three.test", "four.test"])
+        self.assertTrue(all(source.fetch_status == "ok" for source in bundle.sources))
+
+    def test_search_exception_and_malformed_result_do_not_block_other_query(self):
+        calls = []
+
+        def search_more(query):
+            calls.append(query)
+            if len(calls) == 1:
+                raise TimeoutError("search timeout")
+            return ([
+                None,
+                {"title": "bad", "url": ["not", "a", "url"]},
+                {"title": "one", "url": "https://one.test/a"},
+                {"title": "two", "url": "https://two.test/a"},
+            ], [])
+
+        bundle = self.research.deepen_event(
+            self._event(), search_more, lambda url: f"facts {url}", self.research.ResearchBudget()
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([source.domain for source in bundle.sources], ["one.test", "two.test"])
+
+    def test_fails_closed_below_minimum_usable_independent_sources(self):
+        rows = [
+            {"url": "https://one.test/a", "title": "one"},
+            {"url": "https://two.test/a", "title": "two"},
+        ]
+        bundle = self.research.deepen_event(
+            self._event(), lambda _query: (rows, []),
+            lambda url: "facts" if "one.test" in url else "",
+            self.research.ResearchBudget(followup_queries=1),
+        )
+        self.assertIsNone(bundle)
+
+    def test_hard_character_budget_fairly_preserves_every_source(self):
+        rows = [
+            {"url": "https://one.test/a", "title": "one", "summary": "A" * 600},
+            {"url": "https://two.test/a", "title": "two", "summary": "B" * 600},
+        ]
+        bundle = self.research.deepen_event(
+            self._event(), lambda _query: (rows, []), lambda _url: "正文" * 3000,
+            self.research.ResearchBudget(followup_queries=1, max_chars=4000),
+        )
+        combined_length = sum(
+            len(source.snippet) + len(source.full_content) for source in bundle.sources
+        )
+        self.assertLessEqual(combined_length, 4000)
+        self.assertTrue(all(source.snippet for source in bundle.sources))
+        self.assertTrue(all(len(source.full_content) >= 1000 for source in bundle.sources))
+        self.assertLess(abs(
+            len(bundle.sources[0].full_content) - len(bundle.sources[1].full_content)
+        ), 100)
+
+    def test_summary_payload_contains_complete_evidence_without_opinion_channel(self):
+        payload = self.research.summary_payload(self._bundle())
+        encoded = json.dumps(payload, ensure_ascii=False)
+        for field in (
+            "source_id", "provider", "query", "title", "url", "domain",
+            "published_at", "snippet", "full_content", "fetch_status",
+        ):
+            self.assertIn(field, encoded)
+        self.assertNotIn("comment", encoded)
+        self.assertNotIn("opinion", encoded)
+
+    def test_parse_summary_rejects_unknown_drop_one_domain_and_unknown_fields(self):
+        bundle = self._bundle()
+        valid = {
+            "id": "event-1", "title": "事实标题", "summary": "事实摘要",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+        }
+        invalid = (
+            dict(valid, id="wrong"),
+            dict(valid, drop=True),
+            dict(valid, supporting_source_ids=["S1", "S9"]),
+            dict(valid, supporting_source_ids=["S1", "S1"]),
+            dict(valid, comment="主观点评"),
+            dict(valid, extra="unknown"),
+            dict(valid, conflicts="not-an-array"),
+            dict(valid, title="A" * 25),
+            dict(valid, title="Entirely English title"),
+            dict(valid, summary="Entirely English factual summary"),
+            dict(valid, title="川普擬升級行動"),
+            dict(valid, summary="據官員透露，尚未做最終決定。"),
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.assertIsNone(self.research.parse_summary(bundle, raw))
+        same_domain = replace(
+            bundle,
+            sources=(bundle.sources[0], replace(bundle.sources[1], domain="one.test")),
+        )
+        self.assertIsNone(self.research.parse_summary(same_domain, valid))
+
+    def test_parse_summary_requires_explicit_conflict_language(self):
+        bundle = self._bundle()
+        raw = {
+            "id": "event-1", "title": "数字存在分歧", "summary": "两方给出不同数字。",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": ["成本数字不同"],
+            "drop": False,
+        }
+        self.assertIsNotNone(self.research.parse_summary(bundle, raw))
+        raw["summary"] = "项目公布了成本数字。"
+        self.assertIsNone(self.research.parse_summary(bundle, raw))
+
+    def test_summarize_bundle_retries_parse_failures_with_total_call_bound(self):
+        bundle = self._bundle()
+        valid = {
+            "id": "event-1", "title": "事实标题", "summary": "事实摘要",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+        }
+        responses = iter((None, valid))
+        calls = []
+        summary = self.research.summarize_bundle(
+            bundle, lambda payload: calls.append(payload) or next(responses), retries=2,
+        )
+        self.assertEqual(summary.title, "事实标题")
+        self.assertEqual(len(calls), 2)
+        with self.assertRaises(ValueError):
+            self.research.summarize_bundle(bundle, lambda _payload: valid, retries=0)
+
+    def test_verify_summary_is_exact_and_fail_closed(self):
+        bundle = self._bundle()
+        summary = self.research.parse_summary(bundle, {
+            "id": "event-1", "title": "事实标题", "summary": "事实摘要",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+        })
+        accepted = {
+            "verdict": "pass", "unsupported_claims": [],
+            "supporting_source_ids": ["S1", "S2"],
+        }
+        payloads = []
+        self.assertTrue(self.research.verify_summary(
+            bundle, summary, lambda payload: payloads.append(payload) or accepted, retries=1,
+        ))
+        encoded = json.dumps(payloads[0], ensure_ascii=False)
+        self.assertNotIn("S3", encoded)
+        rejected = (
+            {"verdict": "fail", "unsupported_claims": [], "supporting_source_ids": ["S1"]},
+            {"verdict": "unknown", "unsupported_claims": [], "supporting_source_ids": ["S1"]},
+            {"verdict": "PASS", "unsupported_claims": [], "supporting_source_ids": ["S1"]},
+            {"verdict": "pass", "unsupported_claims": ["unsupported"], "supporting_source_ids": ["S1"]},
+            {"verdict": "pass", "unsupported_claims": [], "supporting_source_ids": ["S9"]},
+            {"verdict": "pass", "unsupported_claims": [], "supporting_source_ids": []},
+            {"verdict": "pass", "unsupported_claims": [], "supporting_source_ids": ["S1"]},
+            {"verdict": "pass", "unsupported_claims": [], "supporting_source_ids": ["S1", "S1"]},
+            {"verdict": "pass", "unsupported_claims": "none", "supporting_source_ids": ["S1"]},
+            None,
+        )
+        for response in rejected:
+            with self.subTest(response=response):
+                self.assertFalse(self.research.verify_summary(
+                    bundle, summary, lambda _payload, value=response: value, retries=1,
+                ))
+
+    def test_verify_summary_retries_exceptions_but_never_exceeds_budget(self):
+        bundle = self._bundle()
+        summary = self.research.VerifiedSummary(
+            "event-1", "事实标题", "事实摘要", ("S1", "S2")
+        )
+        calls = []
+        def verify(_payload):
+            calls.append(1)
+            if len(calls) == 1:
+                raise TimeoutError("fixture")
+            return {"verdict": "pass", "unsupported_claims": [], "supporting_source_ids": ["S1", "S2"]}
+        self.assertTrue(self.research.verify_summary(bundle, summary, verify, retries=2))
+        self.assertEqual(len(calls), 2)
 
 
 class DailyReportTests(unittest.TestCase):
@@ -1244,6 +2343,38 @@ class DailyReportTests(unittest.TestCase):
             relevance=score,
             source="fixture",
         )
+
+    def _event(self, title="Fresh event", summary="A factual summary.", *, category="global", sources=None):
+        if sources is None:
+            sources = (self.daily.NewsCandidate(
+                category=category,
+                title=title,
+                summary=summary,
+                url="https://example.test/story",
+                domain="example.test",
+                published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+                relevance=0.9,
+                source="fixture",
+            ),)
+        return self.daily.ReportEvent(
+            event_id=f"event-{category}",
+            category=category,
+            title=title,
+            summary=summary,
+            sources=tuple(sources),
+        )
+
+    def _assert_safe_report_chunks(self, chunks):
+        self.assertTrue(chunks)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 4000)
+            self.assertEqual(chunk.count("<b>"), chunk.count("</b>"))
+            self.assertEqual(chunk.count("<code>"), chunk.count("</code>"))
+            self.assertEqual(chunk.count('<a href="'), chunk.count("</a>"))
+            self.assertEqual(
+                chunk.count("<blockquote expandable>"),
+                chunk.count("</blockquote>"),
+            )
 
     def test_tracking_parameters_do_not_change_fingerprint(self):
         left = self._candidate(
@@ -1356,8 +2487,365 @@ class DailyReportTests(unittest.TestCase):
         self.assertNotIn("多源关注", basis)
 
     def test_render_daily_report_uses_requested_timezone(self):
-        text = self.daily.render_daily_report([], self.now, timezone_name="UTC")
-        self.assertIn("2026-07-12 13:00", text)
+        text = self.daily.render_daily_report([self._event()], self.now, timezone_name="UTC")
+        self.assertIn("<code>2026-07-12 13:00 · 星期日</code>", text)
+
+    def test_render_daily_report_uses_safe_html_for_headings_and_dynamic_text(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        title = "A < B & \"C\" 'D'"
+        summary = "x > y & \"quoted\" 'text'"
+        source = self.daily.NewsCandidate(
+            category="global",
+            title=title,
+            summary=summary,
+            url='https://example.test/story?a=1&b="2"',
+            domain='exa<&"mple.test',
+            published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+            relevance=0.9,
+            source="fixture",
+        )
+        text = self.daily.render_daily_report(
+            [self._event(title, summary, sources=(source,))],
+            self.now,
+            timezone_name="UTC",
+            section_specs=[sections.section_spec("global")],
+        )
+        self.assertIn("<b>🗞 午间日报</b>", text)
+        self.assertIn("<code>2026-07-12 13:00 · 星期日</code>", text)
+        self.assertIn("<b>🌍 全球要闻</b>", text)
+        self.assertIn("1. <b>A &lt; B &amp; &quot;C&quot; &#x27;D&#x27;</b>", text)
+        self.assertIn("x &gt; y &amp; &quot;quoted&quot; &#x27;text&#x27;", text)
+        self.assertIn('href="https://example.test/story?a=1&amp;b=&quot;2&quot;"', text)
+        self.assertIn(">example.test</a>", text)
+        self.assertNotIn("exa&lt;&amp;&quot;mple.test", text)
+        self.assertNotIn("A < B", text)
+
+    def test_sectioned_report_omits_empty_suppressed_and_repeated_sections(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        text = self.daily.render_daily_report(
+            [],
+            self.now,
+            section_specs=[sections.section_spec("global"), sections.section_spec("ai_tech")],
+            preserved_sections={"global": " ", "ai_tech": ""},
+            repeated_sections={"global"},
+            suppressed_sections={"global", "ai_tech"},
+        )
+        self.assertEqual(text, "")
+        for placeholder in ("今日没有", "今日暂无", "跳过重复"):
+            self.assertNotIn(placeholder, text)
+
+    def test_sectioned_report_renders_only_non_empty_current_snapshot(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        text = self.daily.render_daily_report(
+            [],
+            self.now,
+            section_specs=[sections.section_spec("weather"), sections.section_spec("global")],
+            preserved_sections={"weather": "🌤 天气预报\n安阳 < 25°C & clear"},
+        )
+        self.assertIn("<b>🌤 天气预报</b>", text)
+        self.assertEqual(text.count("天气预报"), 1)
+        self.assertIn("安阳 &lt; 25°C &amp; clear", text)
+        self.assertNotIn("全球要闻", text)
+        self.assertNotIn("今日暂无", text)
+
+    def test_hackernews_snapshot_preserves_only_its_trusted_source_fold(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        text = self.daily.render_daily_report(
+            [],
+            self.now,
+            section_specs=[sections.section_spec("hackernews")],
+            preserved_sections={
+                "hackernews": (
+                    "🗣️ 圈子在聊\n• 安全标题 <b>不可信</b>\n"
+                    "<blockquote expandable>原文链接\nhttps://example.test/a</blockquote>"
+                ),
+            },
+        )
+        self.assertIn("<blockquote expandable>原文链接", text)
+        self.assertIn("https://example.test/a</blockquote>", text)
+        self.assertIn("&lt;b&gt;不可信&lt;/b&gt;", text)
+
+    def test_render_daily_report_accepts_but_ignores_legacy_event_comments(self):
+        event = self._event()
+        text = self.daily.render_daily_report(
+            [event],
+            self.now,
+            event_comments={event.event_id: "└ legacy opinion"},
+        )
+        self.assertIn("Fresh event", text)
+        self.assertNotIn("legacy opinion", text)
+        self.assertNotIn("└", text)
+
+    def test_render_daily_report_limits_each_event_to_three_independent_source_links(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        sources = tuple(
+            self.daily.NewsCandidate(
+                category="global",
+                title="Fresh event",
+                summary="A factual summary.",
+                url=url,
+                domain=domain,
+                published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+                relevance=0.9,
+                source="fixture",
+            )
+            for domain, url in (
+                ("one.test", "https://one.test/first"),
+                ("one.test", "https://one.test/duplicate"),
+                ("two.test", "https://two.test/story"),
+                ("three.test", "https://three.test/story"),
+                ("four.test", "https://four.test/story"),
+            )
+        )
+        text = self.daily.render_daily_report(
+            [self._event(sources=sources)],
+            self.now,
+            section_specs=[sections.section_spec("global")],
+        )
+        self.assertEqual(text.count('<a href="'), 3)
+        self.assertIn("https://one.test/first", text)
+        self.assertNotIn("https://one.test/duplicate", text)
+        self.assertIn("https://two.test/story", text)
+        self.assertIn("https://three.test/story", text)
+        self.assertNotIn("https://four.test/story", text)
+        self.assertEqual(text.count("<blockquote expandable>"), 1)
+
+    def test_render_daily_report_derives_source_label_from_url_hostname(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        source = self.daily.NewsCandidate(
+            category="global",
+            title="Mismatched source",
+            summary="summary",
+            url="https://www.evil.test/story",
+            domain="reuters.com",
+            published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+            relevance=0.9,
+            source="fixture",
+        )
+        text = self.daily.render_daily_report(
+            [self._event("Mismatched source", "summary", sources=(source,))],
+            self.now,
+            section_specs=[sections.section_spec("global")],
+        )
+        self.assertIn('<a href="https://www.evil.test/story">evil.test</a>', text)
+        self.assertNotIn("reuters.com", text)
+
+    def test_render_daily_report_skips_unsafe_or_hostless_source_urls(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        sources = tuple(
+            self.daily.NewsCandidate(
+                category="global",
+                title="Unsafe source",
+                summary="summary",
+                url=url,
+                domain="trusted.example",
+                published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+                relevance=0.9,
+                source="fixture",
+            )
+            for url in (
+                "javascript:alert(1)",
+                "file:///tmp/report",
+                "https:///missing-host",
+            )
+        )
+        text = self.daily.render_daily_report(
+            [self._event("Unsafe source", "summary", sources=sources)],
+            self.now,
+            section_specs=[sections.section_spec("global")],
+        )
+        self.assertNotIn('<a href="', text)
+        self.assertNotIn("trusted.example", text)
+        self.assertNotIn("<blockquote expandable>", text)
+
+    def test_render_daily_report_rejects_ambiguous_source_authorities(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        unsafe_urls = (
+            r"https://evil.test\@trusted.test/story",
+            "https://evil.test%5c@trusted.test/story",
+            "https://user:pass@trusted.test/story",
+            "https://user:pa%3Ass@trusted.test/story",
+            "https://user%40example.test@trusted.test/story",
+            "https://trusted.test\t/story",
+            "https://trusted.test /story",
+        )
+        for url in unsafe_urls:
+            with self.subTest(url=url):
+                source = self.daily.NewsCandidate(
+                    category="global",
+                    title="Ambiguous source",
+                    summary="summary",
+                    url=url,
+                    domain="trusted.test",
+                    published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+                    relevance=0.9,
+                    source="fixture",
+                )
+                text = self.daily.render_daily_report(
+                    [self._event("Ambiguous source", "summary", sources=(source,))],
+                    self.now,
+                    section_specs=[sections.section_spec("global")],
+                )
+                self.assertNotIn('<a href="', text)
+                self.assertNotIn("trusted.test", text)
+                self.assertNotIn("<blockquote expandable>", text)
+
+    def test_render_daily_report_rejects_non_ascii_source_authorities(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        unsafe_sources = (
+            ("https://faß.de/x", "fass.de"),
+            ("https://例子.测试/x", "xn--fsqu00a.xn--0zwm56d"),
+        )
+        for url, misleading_label in unsafe_sources:
+            with self.subTest(url=url):
+                source = self.daily.NewsCandidate(
+                    category="global",
+                    title="Unicode source",
+                    summary="summary",
+                    url=url,
+                    domain="trusted.test",
+                    published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+                    relevance=0.9,
+                    source="fixture",
+                )
+                text = self.daily.render_daily_report(
+                    [self._event("Unicode source", "summary", sources=(source,))],
+                    self.now,
+                    section_specs=[sections.section_spec("global")],
+                )
+                self.assertNotIn('<a href="', text)
+                self.assertNotIn(misleading_label, text)
+                self.assertNotIn("<blockquote expandable>", text)
+
+    def test_render_daily_report_allows_ascii_punycode_authority(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        source = self.daily.NewsCandidate(
+            category="global",
+            title="Punycode source",
+            summary="summary",
+            url="https://xn--fa-hia.de/x",
+            domain="trusted.test",
+            published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+            relevance=0.9,
+            source="fixture",
+        )
+        text = self.daily.render_daily_report(
+            [self._event("Punycode source", "summary", sources=(source,))],
+            self.now,
+            section_specs=[sections.section_spec("global")],
+        )
+        self.assertIn(
+            '<a href="https://xn--fa-hia.de/x">xn--fa-hia.de</a>',
+            text,
+        )
+
+    def test_split_report_chunks_uses_section_boundaries_without_splitting_blockquotes(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        report = self.daily.render_daily_report(
+            [self._event(), self._event("AI event", category="ai_tech")],
+            self.now,
+            section_specs=[sections.section_spec("global"), sections.section_spec("ai_tech")],
+        )
+        chunks = self.daily.split_report_chunks(report)
+        self.assertEqual(len(chunks), 2)
+        self.assertIn("<b>🗞 午间日报</b>", chunks[0])
+        self.assertIn("<b>🌍 全球要闻</b>", chunks[0])
+        self.assertIn("<b>🤖 AI 速报</b>", chunks[1])
+        for chunk in chunks:
+            self.assertEqual(chunk.count("<blockquote expandable>"), chunk.count("</blockquote>"))
+
+        separator = "┄" * 14
+        nested = (
+            f"<blockquote expandable>source\n{separator}\nstill source</blockquote>\n"
+            f"{separator}\n<b>Next section</b>"
+        )
+        nested_chunks = self.daily.split_report_chunks(nested)
+        self.assertEqual(len(nested_chunks), 2)
+        self.assertIn(f"source\n{separator}\nstill source", nested_chunks[0])
+
+    def test_split_report_chunks_splits_oversized_section_at_event_boundaries(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        report = self.daily.render_daily_report(
+            [
+                self._event("Event one", "A" * 2100),
+                self._event("Event two", "B" * 2100),
+            ],
+            self.now,
+            section_specs=[sections.section_spec("global")],
+        )
+        chunks = self.daily.split_report_chunks(report)
+        self.assertGreater(len(chunks), 1)
+        self._assert_safe_report_chunks(chunks)
+        event_one_chunk = next(index for index, chunk in enumerate(chunks) if "Event one" in chunk)
+        event_two_chunk = next(index for index, chunk in enumerate(chunks) if "Event two" in chunk)
+        self.assertNotEqual(event_one_chunk, event_two_chunk)
+        self.assertEqual(sum(chunk.count("<blockquote expandable>") for chunk in chunks), 2)
+
+    def test_split_report_chunks_safely_splits_single_oversized_event(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        title = "T" * 4200
+        summary = "事实 & < > " * 1000
+        report = self.daily.render_daily_report(
+            [self._event(title, summary)],
+            self.now,
+            section_specs=[sections.section_spec("global")],
+        )
+        chunks = self.daily.split_report_chunks(report)
+        self.assertGreater(len(chunks), 2)
+        self._assert_safe_report_chunks(chunks)
+        self.assertEqual(sum(chunk.count("T") for chunk in chunks), report.count("T"))
+        self.assertEqual(sum(chunk.count("事实") for chunk in chunks), report.count("事实"))
+        self.assertEqual(sum(chunk.count("<blockquote expandable>") for chunk in chunks), 1)
+        source_chunk = next(chunk for chunk in chunks if "<blockquote expandable>" in chunk)
+        self.assertIn('<a href="https://example.test/story">', source_chunk)
+        self.assertIn("</a>", source_chunk)
+
+    def test_split_report_chunks_degrades_oversized_source_url_safely(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        long_url = "https://example.test/" + "a" * 5000
+        source = self.daily.NewsCandidate(
+            category="global",
+            title="Long URL event",
+            summary="summary",
+            url=long_url,
+            domain="example.test",
+            published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+            relevance=0.9,
+            source="fixture",
+        )
+        report = self.daily.render_daily_report(
+            [self._event("Long URL event", "summary", sources=(source,))],
+            self.now,
+            section_specs=[sections.section_spec("global")],
+        )
+        open_links = re.findall(r'<a href="[^"]*">', report)
+        self.assertTrue(all(len(tag) + len("</a>") < 4000 for tag in open_links))
+        self.assertNotIn(long_url, report)
+        self.assertIn("example.test", report)
+        chunks = self.daily.split_report_chunks(report)
+        self._assert_safe_report_chunks(chunks)
+
+    def test_split_report_chunks_drops_oversized_atomic_open_tag_and_matching_close(self):
+        report = (
+            '<b>Title</b>\n<blockquote expandable><a href="https://example.test/'
+            + "a" * 5000
+            + '">safe.example</a></blockquote>'
+        )
+        result = {}
+
+        def split():
+            result["chunks"] = self.daily.split_report_chunks(report)
+
+        worker = threading.Thread(target=split, daemon=True)
+        worker.start()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive(), "splitter did not terminate")
+        chunks = result["chunks"]
+        self._assert_safe_report_chunks(chunks)
+        combined = "".join(chunks)
+        self.assertIn("safe.example", combined)
+        self.assertNotIn('<a href="', combined)
+        self.assertNotIn("</a>", combined)
 
     def test_selection_keeps_category_quota_and_domain_diversity(self):
         events = []
@@ -1381,13 +2869,71 @@ class DailyReportTests(unittest.TestCase):
             "hackernews", "github", "steam", "cold_knowledge",
         }.issubset(ids))
         self.assertEqual(sections.section_spec("weather").kind, "snapshot")
-        self.assertEqual(sections.section_spec("steam").kind, "event")
+        # steam 已改为官方中国区 API 快照板块
+        self.assertEqual(sections.section_spec("steam").kind, "snapshot")
+        self.assertEqual(sections.section_spec("china").kind, "event")
 
         def fake_collector(*_args, **_kwargs):
             return "ok"
 
         sections.register_section_collector("steam", fake_collector)
         self.assertIs(sections.get_section_collector("steam"), fake_collector)
+
+    def test_report_section_registry_declares_ordered_reserve_event_lanes(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        reserve = [
+            (item.id, item.title, item.emoji, item.query)
+            for item in sections.DEFAULT_REPORT_SECTIONS
+            if item.kind == "event" and item.reserve
+        ]
+        self.assertEqual(reserve, [
+            ("security_privacy", "安全与隐私", "🛡", "网络安全 隐私 漏洞 今日 新闻"),
+            ("open_source", "开源与开发工具", "🧰", "开源 开发者工具 今日 发布 更新"),
+            ("science_space", "科学与太空", "🔭", "科学 太空 研究 今日 突破"),
+            ("product_updates", "产品与服务更新", "📦", "软件 产品 服务 今日 重大更新"),
+        ])
+
+    def test_visible_event_sections_fill_missing_primary_lanes_with_reserves(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        events = [
+            self._event("China", category="china"),
+            self._event("Security", category="security_privacy"),
+            self._event("Science", category="science_space"),
+        ]
+        visible = self.daily.select_visible_event_sections(
+            sections.DEFAULT_REPORT_SECTIONS, events, target=3,
+        )
+        self.assertEqual(visible, ("china", "security_privacy", "science_space"))
+
+    def test_visible_event_sections_never_displace_populated_primary_lanes(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        events = [
+            self._event("China", category="china"),
+            self._event("Global", category="global"),
+            self._event("AI", category="ai_tech"),
+            self._event("Security", category="security_privacy"),
+        ]
+        visible = self.daily.select_visible_event_sections(
+            sections.DEFAULT_REPORT_SECTIONS, events, target=3,
+        )
+        self.assertEqual(visible, ("china", "global", "ai_tech"))
+
+    def test_visible_event_sections_rank_reserves_by_their_hottest_event(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        events = [
+            replace(
+                self._event("Security", category="security_privacy"),
+                heat_score=1,
+            ),
+            replace(
+                self._event("Science", category="science_space"),
+                heat_score=100,
+            ),
+        ]
+        visible = self.daily.select_visible_event_sections(
+            sections.DEFAULT_REPORT_SECTIONS, events, target=1,
+        )
+        self.assertEqual(visible, ("science_space",))
 
     def test_same_event_is_cooldown_scoped_to_each_section(self):
         first_ai = self._candidate("A new proxy tool release", category="ai_tech")
@@ -1398,17 +2944,17 @@ class DailyReportTests(unittest.TestCase):
         )
         self.assertEqual({event.category for event in selected}, {"ai_tech", "proxy"})
 
-    def test_sectioned_report_skips_repeated_event_but_keeps_heading(self):
+    def test_sectioned_report_omits_repeated_event_and_empty_heading(self):
         script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
         spec = importlib.util.spec_from_file_location("build_daily_report_sections", script_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         candidate = module.NewsCandidate(
-            category="steam",
-            title="Steam discount event",
-            summary="A game is discounted.",
-            url="https://store.steampowered.com/app/1",
-            domain="steampowered.com",
+            category="china",
+            title="China policy event",
+            summary="A policy is announced.",
+            url="https://news.example.cn/policy/1",
+            domain="news.example.cn",
             published_at="2026-07-12T11:00:00+00:00",
             relevance=0.9,
             source="fixture",
@@ -1423,14 +2969,13 @@ class DailyReportTests(unittest.TestCase):
             published_at=(self.now + module.timedelta(days=1, hours=-2)).isoformat(),
             relevance=candidate.relevance, source=candidate.source,
         )
-        self.assertIn("Steam", first["report_text"])
+        self.assertIn("中国要闻", first["report_text"])
         second = module.build_report(
             [updated], now=self.now + module.timedelta(days=1), state=first["state"],
             section_specs=module.DEFAULT_REPORT_SECTIONS,
         )
-        self.assertIn("Steam", second["report_text"])
-        self.assertIn("跳过重复", second["report_text"])
-        self.assertNotIn("1. Steam discount event", second["report_text"])
+        self.assertEqual(second["report_text"], "")
+        self.assertNotIn("China policy event", second["report_text"])
 
     def test_repeated_event_does_not_restore_stale_external_section(self):
         script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
@@ -1438,15 +2983,15 @@ class DailyReportTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         candidate = module.NewsCandidate(
-            category="steam", title="Steam discount event", summary="A game is discounted.",
-            url="https://store.steampowered.com/app/1", domain="steampowered.com",
+            category="china", title="China policy event", summary="A policy is announced.",
+            url="https://news.example.cn/policy/1", domain="news.example.cn",
             published_at="2026-07-12T11:00:00+00:00", relevance=0.9, source="fixture",
         )
         first = module.build_report(
             [candidate], now=self.now, state={"schema_version": 1, "events": {}},
             section_specs=module.DEFAULT_REPORT_SECTIONS,
         )
-        legacy = "【Steam 优惠】\n昨日重复内容\n"
+        legacy = "【中国要闻】\n昨日重复内容\n"
         updated = module.NewsCandidate(
             category=candidate.category, title=candidate.title, summary=candidate.summary,
             url=candidate.url, domain=candidate.domain,
@@ -1457,7 +3002,7 @@ class DailyReportTests(unittest.TestCase):
             [updated], now=self.now + module.timedelta(days=1), state=first["state"],
             section_specs=module.DEFAULT_REPORT_SECTIONS, legacy_report_text=legacy,
         )
-        self.assertIn("跳过重复", second["report_text"])
+        self.assertEqual(second["report_text"], "")
         self.assertNotIn("昨日重复内容", second["report_text"])
 
     def test_stale_event_is_not_described_as_duplicate(self):
@@ -1466,20 +3011,20 @@ class DailyReportTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         candidate = module.NewsCandidate(
-            category="steam", title="Old Steam event", summary="old", url="https://store.steampowered.com/app/2",
-            domain="steampowered.com", published_at="2026-07-10T11:00:00+00:00", relevance=0.9,
+            category="china", title="Old China event", summary="old", url="https://news.example.cn/policy/2",
+            domain="news.example.cn", published_at="2026-07-10T11:00:00+00:00", relevance=0.9,
             source="fixture",
         )
         result = module.build_report(
             [candidate], now=self.now, state={"schema_version": 1, "events": {}},
             section_specs=module.DEFAULT_REPORT_SECTIONS,
-            legacy_report_text="【Steam 降价优惠】\n昨日旧活动",
+            legacy_report_text="【中国要闻】\n昨日旧活动",
         )
-        self.assertIn("今日暂无可验证的新内容", result["report_text"])
+        self.assertEqual(result["report_text"], "")
         self.assertNotIn("跳过重复", result["report_text"])
         self.assertNotIn("昨日旧活动", result["report_text"])
 
-    def test_external_sections_are_preserved_when_no_new_candidates(self):
+    def test_build_report_does_not_restore_snapshots_from_legacy_report_text(self):
         script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
         spec = importlib.util.spec_from_file_location("build_daily_report_external_sections", script_path)
         module = importlib.util.module_from_spec(spec)
@@ -1499,8 +3044,8 @@ class DailyReportTests(unittest.TestCase):
             [candidate], now=self.now, state={"schema_version": 1, "events": {}},
             section_specs=module.DEFAULT_REPORT_SECTIONS, legacy_report_text=legacy,
         )
-        self.assertIn("安阳 25°C", result["report_text"])
-        self.assertIn("sing-box 更新", result["report_text"])
+        self.assertNotIn("安阳 25°C", result["report_text"])
+        self.assertNotIn("sing-box 更新", result["report_text"])
 
     def test_legacy_circle_heading_starts_a_new_hackernews_section(self):
         sections = importlib.import_module("tg_bot.report_sections")
@@ -1514,7 +3059,9 @@ class DailyReportTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("build_daily_report_queries", script_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for section_id in ("ai_tech", "proxy", "hackernews", "github", "steam", "cold_knowledge"):
+        # proxy / hackernews / github 已改为真实数据源的 snapshot 板块，不再走新闻搜索
+        # steam / cold_knowledge 已改为真实 API 快照 / 编辑 AI 生成，不再走新闻搜索
+        for section_id in ("china", "global", "ai_tech"):
             self.assertTrue(module._CATEGORY_QUERIES[section_id])
 
     def test_strict_section_history_does_not_cross_match_missing_category(self):
@@ -1538,13 +3085,145 @@ class DailyReportTests(unittest.TestCase):
         spec.loader.exec_module(module)
         module.register_section_collector("weather", lambda: "安阳当前 26°C")
         diagnostics = []
+        weather_specs = [s for s in module.DEFAULT_REPORT_SECTIONS if s.id == "weather"]
         sections = module.collect_snapshot_sections(
-            module.DEFAULT_REPORT_SECTIONS,
+            weather_specs,
             "【天气预报】\n昨日 20°C",
             diagnostics,
         )
         self.assertIn("安阳当前 26°C", sections["weather"])
         self.assertEqual(diagnostics, [])
+
+    def test_snapshot_collection_does_not_resurrect_legacy_proxy_or_hn(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_snapshot_current_only", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.register_section_collector("proxy", lambda: "")
+        module.register_section_collector("hackernews", lambda: "")
+        snapshot_specs = [
+            section for section in module.DEFAULT_REPORT_SECTIONS
+            if section.id in {"proxy", "hackernews"}
+        ]
+        current = module.collect_snapshot_sections(
+            snapshot_specs,
+            "🔒 代理圈动态\n昨日版本\n\n🗣️ 圈子在聊\n昨日热帖",
+            [],
+        )
+        self.assertEqual(current, {})
+
+    def test_cold_knowledge_collector_is_registered_and_degrades_cleanly(self):
+        """cold_knowledge 曾经在 register_builtin_snapshot_collectors 里完全漏注册，
+        导致板块每天被 collect_snapshot_sections 的 `if collector is None: continue`
+        静默吞掉，连诊断信息都没有。这里确认采集器已注册，且 AI 调用失败时走的是
+        「记录诊断 + 跳过整块」的正常降级路径，不是继续被静默吃掉。"""
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_cold_knowledge_registered", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sections = importlib.import_module("tg_bot.report_sections")
+        module.register_builtin_snapshot_collectors(True)
+        self.assertIsNotNone(sections.get_section_collector("cold_knowledge"))
+        with patch.object(module, "generate_cold_knowledge", return_value=None) as fake_generate:
+            diagnostics = []
+            cold_specs = [s for s in module.DEFAULT_REPORT_SECTIONS if s.id == "cold_knowledge"]
+            sections_out = module.collect_snapshot_sections(cold_specs, "", diagnostics)
+        fake_generate.assert_called_once()
+        self.assertEqual(sections_out, {})
+        self.assertIn("cold_knowledge: collector_empty", diagnostics)
+
+    def test_cold_knowledge_collector_uses_generated_content_when_available(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_cold_knowledge_success", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.register_builtin_snapshot_collectors(True)
+        with patch.object(module, "generate_cold_knowledge", return_value="鮟鱇鱼靠头顶的发光诱饵吸引猎物。") as fake_generate:
+            diagnostics = []
+            cold_specs = [s for s in module.DEFAULT_REPORT_SECTIONS if s.id == "cold_knowledge"]
+            sections_out = module.collect_snapshot_sections(cold_specs, "", diagnostics)
+        fake_generate.assert_called_once()
+        topic_arg, avoid_arg = fake_generate.call_args[0]
+        self.assertEqual(topic_arg, module.cold_topic_for())
+        self.assertIsInstance(avoid_arg, list)
+        self.assertIn("鮟鱇鱼靠头顶的发光诱饵吸引猎物。", sections_out["cold_knowledge"])
+        self.assertEqual(diagnostics, [])
+
+    def test_generate_cold_knowledge_returns_none_without_ai_access(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_cold_knowledge_ai_failure", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with temporary_env(**required_env()):
+            reload_config()
+            self.assertIsNone(module.generate_cold_knowledge("深海生物", ["深海生物·发光诱饵"]))
+
+    def test_cold_knowledge_novelty_label_is_ledger_safe(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_cold_knowledge_label", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        storage = importlib.import_module("tg_bot.storage")
+        body = "深海鮟鱇鱼利用头顶的发光诱饵吸引猎物，其光来自共生细菌，而非自身产生。"
+        label = module.cold_knowledge_novelty_label("深海生物", body)
+        self.assertEqual(storage.normalize_novelty_summary(label, limit=40), label)
+        self.assertEqual(module.cold_knowledge_novelty_label("深海生物", ""), "深海生物")
+
+    def test_proxy_releases_returns_empty_when_every_release_is_old(self):
+        with temporary_env(**required_env()):
+            native = importlib.import_module("tg_bot.tools.native")
+            old_release = json.dumps({
+                "tag_name": "v1.0.0",
+                "published_at": "2000-01-01T00:00:00Z",
+                "body": "old",
+            })
+            with patch("tg_bot.tools.fetch.http_get", return_value=old_release):
+                self.assertEqual(native.execute_proxy_releases(days=7), "")
+
+    def test_hn_front_page_hides_metrics_but_sorts_by_points(self):
+        with temporary_env(**required_env()):
+            native = importlib.import_module("tg_bot.tools.native")
+            fixture = json.dumps({"hits": [
+                {
+                    "objectID": "1", "title": "Lower ranked headline",
+                    "points": 10, "num_comments": 2,
+                    "url": "https://example.test/low",
+                },
+                {
+                    "objectID": "42", "title": "A neutral headline",
+                    "points": 857, "num_comments": 512,
+                    "url": "https://example.test/story",
+                },
+            ]})
+            with patch("tg_bot.tools.fetch.http_get", return_value=fixture):
+                text = native.execute_hn_front_page(limit=2)
+        self.assertLess(text.index("A neutral headline"), text.index("Lower ranked headline"))
+        for marker in ("热度", "讨论", "👍", "💬", "└"):
+            self.assertNotIn(marker, text)
+
+    def test_legacy_event_editor_is_removed(self):
+        """事件摘要走 report_research 的证据+核查流程，不再用旧版无约束编辑器。"""
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_no_comments", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for name in (
+            "_EVENTS_EDITOR_PROMPT", "editorialize_events",
+            "_SECTIONS_EDITOR_PROMPT", "compose_sections",
+        ):
+            self.assertFalse(hasattr(module, name), name)
+        self.assertNotIn("comment", module._SUMMARY_PROMPT.lower())
+        self.assertNotIn("点评", module._SUMMARY_PROMPT)
+
+    def test_snapshot_enrichment_forbids_fabricated_opinions(self):
+        """Steam/HN 的补充说明基于真实抓取/搜索资料撰写，明确禁止编造评分、销量等数字。"""
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_snapshot_enrich", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        prompt = module._SNAPSHOT_ENRICH_PROMPT
+        self.assertIn("绝不编造评分", prompt)
+        self.assertIn("不确定的细节不要编", prompt)
 
     def test_section_cooldown_controls_state_retention(self):
         sections = importlib.import_module("tg_bot.report_sections")
@@ -1562,6 +3241,16 @@ class DailyReportTests(unittest.TestCase):
 
 
 class DailyReportStorageTests(unittest.TestCase):
+    def _load_builder(self, name):
+        script_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "scripts", "build-daily-report.py",
+        )
+        spec = importlib.util.spec_from_file_location(name, script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     def _reload_storage(self, data_dir):
         with temporary_env(**required_env(TG_BOT_DATA_DIR=data_dir)):
             for module_name in ("tg_bot.storage", "tg_bot.config"):
@@ -1612,9 +3301,49 @@ class DailyReportStorageTests(unittest.TestCase):
             source="fixture",
         )
         result = module.build_report([candidate], now=now, state={"schema_version": 1, "events": {}})
-        self.assertIn("今日热点日报", result["report_text"])
+        self.assertIn("午间日报", result["report_text"])
         self.assertIn("events", result["state"])
         self.assertEqual(len(result["selected"]), 1)
+
+    def test_build_report_selected_and_state_include_only_visible_event_lanes(self):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location("build_daily_report_visible_lanes", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        now = module.datetime(2026, 7, 12, 13, 0, tzinfo=module.timezone.utc)
+        categories = ("china", "global", "ai_tech", "security_privacy")
+        candidates = [
+            module.NewsCandidate(
+                category=category,
+                title=f"{category} event",
+                summary="A verified event.",
+                url=f"https://{category}.example.test/story",
+                domain=f"{category}.example.test",
+                published_at="2026-07-12T11:00:00+00:00",
+                relevance=0.9,
+                source="fixture",
+            )
+            for category in categories
+        ]
+        result = module.build_report(
+            candidates,
+            now=now,
+            state={"schema_version": 1, "events": {}},
+            section_specs=module.DEFAULT_REPORT_SECTIONS,
+            event_section_target=2,
+        )
+        self.assertEqual(
+            tuple(dict.fromkeys(event.category for event in result["selected"])),
+            ("china", "global"),
+        )
+        published_ids = {event.event_id for event in result["selected"]}
+        self.assertEqual(set(result["state"]["events"]), published_ids)
+        self.assertEqual(
+            {event.category for event in result.get("eligible_selected", [])},
+            set(categories),
+        )
+        self.assertNotIn("AI 速报", result["report_text"])
+        self.assertNotIn("安全与隐私", result["report_text"])
 
     def test_build_report_prunes_old_state_entries(self):
         script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
@@ -1644,10 +3373,14 @@ class DailyReportStorageTests(unittest.TestCase):
         result = module.build_report([], now=now, state={"schema_version": 1, "events": {"missing": {"title": "old"}}})
         self.assertNotIn("missing", result["state"]["events"])
 
-    def test_main_provider_failure_keeps_previous_report(self):
+    def test_main_provider_failure_with_no_snapshot_keeps_previous_report(self):
         data_dir = tempfile.mkdtemp(prefix="tg-bot-report-cli-")
         try:
-            with temporary_env(**required_env(TG_BOT_DATA_DIR=data_dir)):
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_SECTIONS="global",
+            )):
                 for module_name in ("tg_bot.storage", "tg_bot.config"):
                     sys.modules.pop(module_name, None)
                 script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
@@ -1658,11 +3391,11 @@ class DailyReportStorageTests(unittest.TestCase):
                 with open(report_path, "w", encoding="utf-8") as handle:
                     handle.write("previous report")
                 with patch.object(module, "collect_candidates", return_value=([], ["global: provider_error:TimeoutError"])):
-                    self.assertEqual(module.main([]), 1)
+                    self.assertEqual(module.main([]), 0)
                 with open(report_path, encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), "previous report")
                 with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
-                    self.assertEqual(json.load(handle)["status"], "stale_previous")
+                    self.assertEqual(json.load(handle)["status"], "no_publishable_content")
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
@@ -1677,10 +3410,62 @@ class DailyReportStorageTests(unittest.TestCase):
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 with patch.object(module, "collect_candidates", return_value=([], ["global: provider_error:TimeoutError"])):
-                    self.assertEqual(module.main(["--dry-run"]), 1)
+                    self.assertEqual(module.main(["--dry-run"]), 0)
                 self.assertFalse(os.path.exists(os.path.join(data_dir, "daily_report_status.json")))
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_main_provider_failure_still_publishes_current_snapshot(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-provider-snapshot-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_SECTIONS="weather,global",
+                DAILY_REPORT_PUSH="false",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_provider_snapshot")
+                snapshots = {"weather": "🌤 天气预报\n安阳晴 25°C"}
+                with patch.object(module, "collect_candidates", return_value=([], ["global: provider_error:TimeoutError"])), \
+                     patch.object(module, "collect_snapshot_sections", return_value=snapshots):
+                    self.assertEqual(module.main([]), 0)
+                with open(os.path.join(data_dir, "today_report.txt"), encoding="utf-8") as handle:
+                    report = handle.read()
+                self.assertIn("安阳晴 25°C", report)
+                with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
+                    status = json.load(handle)
+                self.assertEqual(status["status"], "fresh")
+                self.assertIn("global: provider_error:TimeoutError", status["diagnostics"])
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_snapshot_translation_failure_keeps_original_instead_of_dropping_section(self):
+        """翻译彻底失败或仍带专有名词（仓库名/版本号）都不该整块删除板块——
+        GitHub 热榜曾因为仓库名合法保留英文，被 _needs_translation 误判"没翻译完"
+        整块 pop 掉，日报里直接消失。现在必须保留内容（能翻译则用译文，否则用原文）。"""
+        module = self._load_builder("build_daily_report_snapshot_translation_closed")
+        english_hn = "🗣️ 圈子在聊\n  • This English headline contains enough descriptive words to require translation"
+        repo_snapshot = "🛠 开源热榜\n  • a/b v1.2.3"
+
+        # 主翻译 + 逐行兜底都失败：保留原文，不删除 key
+        with patch.object(module, "_translate_section_text", return_value=None), \
+             patch.object(module, "_translate_section_lines_fallback", return_value=None):
+            result = module.localize_snapshot_sections({
+                "hackernews": english_hn,
+                "github": repo_snapshot,
+            })
+        self.assertEqual(result["hackernews"], english_hn)
+        self.assertEqual(result["github"], repo_snapshot)
+
+        # 译文里仍含专有名词、被 _needs_translation 判定"还需要翻译"：
+        # 这是仓库名/版本号合法保留英文的正常情况，必须使用这份译文而不是删除
+        translated_but_has_proper_nouns = "🛠 开源热榜\n  • a/b v1.2.3 一个示例仓库的更新说明文字足够长"
+        with patch.object(module, "_translate_section_text", return_value=translated_but_has_proper_nouns):
+            result = module.localize_snapshot_sections({"github": repo_snapshot})
+        self.assertIn("github", result)
+        self.assertEqual(result["github"], translated_but_has_proper_nouns)
 
     def test_empty_event_candidates_still_render_snapshot_sections(self):
         data_dir = tempfile.mkdtemp(prefix="tg-bot-report-empty-")
@@ -1695,6 +3480,7 @@ class DailyReportStorageTests(unittest.TestCase):
                 spec = importlib.util.spec_from_file_location("build_daily_report_empty", script_path)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
+                module.register_section_collector("weather", lambda: "安阳当前 26°C")
                 with patch.object(module, "collect_candidates", return_value=([], ["global: no_candidates"])):
                     self.assertEqual(module.main([]), 0)
                 with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
@@ -1702,7 +3488,7 @@ class DailyReportStorageTests(unittest.TestCase):
                 self.assertEqual(status["status"], "fresh")
                 with open(os.path.join(data_dir, "today_report.txt"), encoding="utf-8") as handle:
                     report = handle.read()
-                self.assertIn("【天气预报】", report)
+                self.assertIn("天气预报", report)
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
@@ -1741,12 +3527,35 @@ class FetchSecurityTests(unittest.TestCase):
 
 
 class BotUtilsTests(unittest.TestCase):
+    def setUp(self):
+        with temporary_env(**required_env()):
+            for module_name in ("tg_bot.bot_utils", "tg_bot.config"):
+                sys.modules.pop(module_name, None)
+            self.bot_utils = importlib.import_module("tg_bot.bot_utils")
+
     def test_send_returns_delivery_status(self):
-        bot_utils = importlib.import_module("tg_bot.bot_utils")
-        with patch.object(bot_utils, "http_post", return_value={"ok": True}):
-            self.assertTrue(bot_utils.send(1, "hello"))
-        with patch.object(bot_utils, "http_post", return_value={"ok": False}):
-            self.assertFalse(bot_utils.send(1, "hello"))
+        with patch.object(self.bot_utils, "http_post", return_value={"ok": True}):
+            self.assertTrue(self.bot_utils.send(1, "hello"))
+        with patch.object(self.bot_utils, "http_post", return_value={"ok": False}):
+            self.assertFalse(self.bot_utils.send(1, "hello"))
+
+    def test_send_report_html_sends_complete_non_empty_sections_without_reprocessing_html(self):
+        sent = []
+        with patch.object(
+            self.bot_utils,
+            "_send_chunk",
+            side_effect=lambda chat_id, body: sent.append((chat_id, body)) or len(sent) == 1,
+        ), patch.object(self.bot_utils.time, "sleep") as sleep:
+            delivered = self.bot_utils.send_report_html(
+                "1",
+                ["<b>A</b>\n正文", "", "   ", "<b>B &amp; C</b>\n正文"],
+            )
+        self.assertFalse(delivered)
+        self.assertEqual(sent, [
+            ("1", "<b>A</b>\n正文"),
+            ("1", "<b>B &amp; C</b>\n正文"),
+        ])
+        sleep.assert_called_once_with(0.3)
 
 
 class DailyReportCollectionTests(unittest.TestCase):
@@ -1759,6 +3568,167 @@ class DailyReportCollectionTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_research_selected_events_runs_bounded_evidence_summary_and_verify(self):
+        module = self._load_builder("build_daily_report_verified_orchestration")
+        daily = importlib.import_module("tg_bot.daily_report")
+        research = importlib.import_module("tg_bot.report_research")
+        seed = module.NewsCandidate(
+            category="global", title="Seed", summary="seed facts",
+            url="https://seed.test/a", domain="seed.test",
+            published_at="2026-07-17T04:00:00+00:00", relevance=0.9, source="seed",
+        )
+        event = daily.ReportEvent(
+            "e1", "global", "Seed", "seed facts", (seed,), heat_score=91.0,
+        )
+        queries, fetched, summary_payloads, verify_payloads = [], [], [], []
+
+        def search_more(query):
+            queries.append(query)
+            index = len(queries)
+            return ([{
+                "title": f"source {index}", "summary": f"facts {index}",
+                "url": f"https://source{index}.test/story", "source": "fixture",
+            }], [])
+
+        def fetch(url):
+            fetched.append(url)
+            return f"full evidence from {url}"
+
+        def summarize(payload):
+            summary_payloads.append(payload)
+            return {
+                "id": "e1", "title": "已核查标题", "summary": "已核查事实摘要",
+                "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+            }
+
+        def verify(payload):
+            verify_payloads.append(payload)
+            return {
+                "verdict": "pass", "unsupported_claims": [],
+                "supporting_source_ids": ["S1", "S2"],
+            }
+
+        diagnostics = []
+        verified = module.research_selected_events(
+            [event], research.ResearchBudget(), search_more, fetch, summarize, verify,
+            evidence_top_k=3, summary_retries=2, verify_retries=1,
+            diagnostics=diagnostics,
+        )
+        self.assertEqual(len(queries), 2)
+        self.assertLessEqual(len(fetched), 3)
+        self.assertEqual(len(summary_payloads), 1)
+        self.assertEqual(len(verify_payloads), 1)
+        self.assertEqual([item.title for item in verified], ["已核查标题"])
+        self.assertEqual([item.summary for item in verified], ["已核查事实摘要"])
+        self.assertEqual({source.domain for source in verified[0].sources}, {"seed.test", "source1.test"})
+        self.assertIn("global:e1:verified", diagnostics)
+
+    def test_research_selected_events_drops_individual_failures_and_continues(self):
+        module = self._load_builder("build_daily_report_verified_failure_isolation")
+        daily = importlib.import_module("tg_bot.daily_report")
+        research = importlib.import_module("tg_bot.report_research")
+        events = [
+            daily.ReportEvent(
+                event_id, "global", event_id, "facts", (), heat_score=heat,
+            )
+            for event_id, heat in (("bad", 100.0), ("good", 90.0))
+        ]
+        diagnostics = []
+        def search_more(query):
+            event_id = "bad" if query == "bad" else "good"
+            return ([
+                {"title": "one", "url": f"https://one-{event_id}.test/a"},
+                {"title": "two", "url": f"https://two-{event_id}.test/a"},
+            ], [])
+        def summarize(payload):
+            if payload["id"] == "bad":
+                return None
+            return {
+                "id": "good", "title": "已核查事件", "summary": "已核查事实摘要",
+                "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+            }
+        verified = module.research_selected_events(
+            events, research.ResearchBudget(followup_queries=1), search_more,
+            lambda _url: "full facts", summarize,
+            lambda _payload: {"verdict": "pass", "unsupported_claims": [], "supporting_source_ids": ["S1", "S2"]},
+            evidence_top_k=2, summary_retries=1, verify_retries=1,
+            diagnostics=diagnostics,
+        )
+        self.assertEqual([event.event_id for event in verified], ["good"])
+        self.assertIn("global:bad:summary_failed", diagnostics)
+
+    def test_summary_and_verify_calls_use_separate_rotating_key_pools(self):
+        module = self._load_builder("build_daily_report_model_pools")
+        captured = []
+        response = {
+            "choices": [{"message": {"content": json.dumps({"ok": True})}}]
+        }
+        with temporary_env(**required_env(
+            DEEPSEEK_KEY_0="write-0", DEEPSEEK_KEY_1="write-1",
+            DEEPSEEK_VERIFY_KEY_0="verify-0", DEEPSEEK_VERIFY_KEY_1="verify-1",
+        )):
+            config = reload_config()
+            with patch("tg_bot.tools.fetch.http_post", side_effect=lambda *args, **kwargs: captured.append((args, kwargs)) or response):
+                self.assertEqual(module._summary_call({"id": "e1", "sources": []}), {"ok": True})
+                self.assertEqual(module._verify_call({"summary": {}, "sources": []}), {"ok": True})
+        auth = [entry[1]["headers"]["Authorization"] for entry in captured]
+        self.assertEqual(auth, ["Bearer write-1", "Bearer verify-1"])
+        summary_prompt = captured[0][0][1]["messages"][0]["content"]
+        verify_prompt = captured[1][0][1]["messages"][0]["content"]
+        self.assertIn("supporting_source_ids", summary_prompt)
+        self.assertIn("unsupported_claims", verify_prompt)
+        self.assertNotIn("comment", summary_prompt.lower())
+        self.assertNotIn("点评", summary_prompt)
+
+    def test_main_publishes_verified_html_with_daily_sender_and_commits_after_success(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-verified-send-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_PUSH="true",
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_SECTIONS="global",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_verified_send")
+                candidate = module.NewsCandidate(
+                    category="global", title="Draft headline", summary="draft",
+                    url="https://seed.test/a", domain="seed.test",
+                    published_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                    relevance=0.9, source="fixture",
+                )
+
+                def verified(events, *_args, **_kwargs):
+                    return [replace(
+                        events[0], title="Verified <headline>", summary="facts & figures",
+                        sources=(
+                            candidate,
+                            replace(candidate, url="https://second.test/b", domain="second.test"),
+                        ),
+                    )]
+
+                sent_chunks = []
+                with patch.object(module, "collect_candidates", return_value=([candidate], [])), \
+                     patch.object(module, "research_selected_events", side_effect=verified), \
+                     patch("tg_bot.bot_utils.send_report_html", side_effect=lambda chat, chunks: sent_chunks.extend(chunks) or True) as report_send, \
+                     patch("tg_bot.bot_utils.send", side_effect=AssertionError("ordinary sender called")) as ordinary_send:
+                    self.assertEqual(module.main([]), 0)
+                report_send.assert_called_once()
+                ordinary_send.assert_not_called()
+                html_text = "\n".join(sent_chunks)
+                self.assertIn("<b>Verified &lt;headline&gt;</b>", html_text)
+                self.assertIn("facts &amp; figures", html_text)
+                self.assertIn("seed.test", html_text)
+                self.assertIn("second.test", html_text)
+                for marker in ("└", "👍", "💬"):
+                    self.assertNotIn(marker, html_text)
+                with open(os.path.join(data_dir, "daily_report_state.json"), encoding="utf-8") as handle:
+                    state = json.load(handle)
+                self.assertEqual(len(state["events"]), 1)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
 
     def test_collect_candidates_preserves_requested_order_when_workers_finish_out_of_order(self):
         module = self._load_builder("build_daily_report_parallel_order")
@@ -1775,10 +3745,20 @@ class DailyReportCollectionTests(unittest.TestCase):
                 "source": "fixture",
             }], [])
 
-        with patch("tg_bot.tools.search.execute_news_candidates", side_effect=fake_search):
-            candidates, diagnostics = module.collect_candidates(("china", "global", "ai_tech"))
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            with patch.object(
+                search, "execute_news_candidates_all", side_effect=fake_search
+            ), patch.object(
+                search, "execute_news_candidates",
+                side_effect=AssertionError("legacy search must not serve daily reports"),
+            ) as legacy_search:
+                candidates, diagnostics = module.collect_candidates(("china", "global", "ai_tech"))
         self.assertEqual([item.category for item in candidates], ["china", "global", "ai_tech"])
         self.assertEqual(diagnostics, [])
+        legacy_search.assert_not_called()
 
     def test_collect_candidates_isolates_provider_exception(self):
         module = self._load_builder("build_daily_report_parallel_errors")
@@ -1794,31 +3774,115 @@ class DailyReportCollectionTests(unittest.TestCase):
                 "source": "fixture",
             }], [])
 
-        with patch("tg_bot.tools.search.execute_news_candidates", side_effect=fake_search):
-            candidates, diagnostics = module.collect_candidates(("china", "global"))
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            with patch.object(search, "execute_news_candidates_all", side_effect=fake_search):
+                candidates, diagnostics = module.collect_candidates(("china", "global"))
         self.assertEqual([item.category for item in candidates], ["china"])
         self.assertEqual(diagnostics, ["global: provider_error:TimeoutError"])
 
-    def test_report_content_hash_ignores_generation_timestamp(self):
+    def test_report_content_hash_ignores_only_html_header_timestamp(self):
         module = self._load_builder("build_daily_report_hash")
-        first = module.build_report([], now=module.datetime(2026, 7, 12, 13, tzinfo=module.timezone.utc))
-        second = dict(first, generated_at="2026-07-13T13:00:00+00:00")
-        second["report_text"] = first["report_text"].replace("2026-07-12 21:00", "2026-07-13 21:00", 1)
+        candidate = module.NewsCandidate(
+            category="global",
+            title="Stable headline",
+            summary="Stable summary.",
+            url="https://example.com/stable",
+            domain="example.com",
+            published_at="2026-07-12T12:00:00+00:00",
+            relevance=0.9,
+            source="fixture",
+        )
+        specs = module.resolve_sections(("global",))
+        first = module.build_report(
+            [candidate],
+            now=module.datetime(2026, 7, 12, 13, 0, tzinfo=module.timezone.utc),
+            state={"schema_version": 1, "events": {}},
+            section_specs=specs,
+        )
+        second = module.build_report(
+            [candidate],
+            now=module.datetime(2026, 7, 12, 13, 5, tzinfo=module.timezone.utc),
+            state={"schema_version": 1, "events": {}},
+            section_specs=specs,
+        )
+        first_lines = first["report_text"].splitlines()
+        second_lines = second["report_text"].splitlines()
+        self.assertNotEqual(first_lines[1], second_lines[1])
+        self.assertEqual(first_lines[:1] + first_lines[2:], second_lines[:1] + second_lines[2:])
         self.assertEqual(module._report_content_hash(first), module._report_content_hash(second))
 
-    def test_push_is_idempotent_for_unchanged_report(self):
+        body_code_first = dict(first, report_text=first["report_text"] + "\n<code>body-a</code>")
+        body_code_second = dict(first, report_text=first["report_text"] + "\n<code>body-b</code>")
+        self.assertNotEqual(
+            module._report_content_hash(body_code_first),
+            module._report_content_hash(body_code_second),
+        )
+
+    def test_report_content_hash_changes_with_event_title_or_summary(self):
+        module = self._load_builder("build_daily_report_hash_event_content")
+        now = module.datetime(2026, 7, 12, 13, tzinfo=module.timezone.utc)
+        specs = module.resolve_sections(("global",))
+
+        def report(title, summary):
+            candidate = module.NewsCandidate(
+                category="global",
+                title=title,
+                summary=summary,
+                url="https://example.com/stable",
+                domain="example.com",
+                published_at="2026-07-12T12:00:00+00:00",
+                relevance=0.9,
+                source="fixture",
+            )
+            return module.build_report(
+                [candidate],
+                now=now,
+                state={"schema_version": 1, "events": {}},
+                section_specs=specs,
+            )
+
+        baseline = report("Stable headline", "Stable summary.")
+        title_changed = report("Changed headline", "Stable summary.")
+        summary_changed = report("Stable headline", "Changed summary.")
+        self.assertNotEqual(
+            module._report_content_hash(baseline),
+            module._report_content_hash(title_changed),
+        )
+        self.assertNotEqual(
+            module._report_content_hash(baseline),
+            module._report_content_hash(summary_changed),
+        )
+
+    def test_push_is_idempotent_for_unchanged_nonempty_report(self):
         data_dir = tempfile.mkdtemp(prefix="tg-bot-report-push-")
         try:
             with temporary_env(**required_env(
                 TG_BOT_DATA_DIR=data_dir,
                 DAILY_REPORT_PUSH="true",
                 DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_SECTIONS="global",
             )):
                 for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
                     sys.modules.pop(module_name, None)
                 module = self._load_builder("build_daily_report_push")
-                with patch.object(module, "collect_candidates", return_value=([], [])), \
-                     patch("tg_bot.bot_utils.send", return_value=True) as send:
+                candidate = module.NewsCandidate(
+                    category="global",
+                    title="Stable headline",
+                    summary="summary",
+                    url="https://example.com/stable",
+                    domain="example.com",
+                    published_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                    relevance=0.9,
+                    source="fixture",
+                )
+                empty_state = {"schema_version": 1, "events": {}}
+                with patch.object(module, "collect_candidates", return_value=([candidate], [])), \
+                     patch.object(module, "research_selected_events", side_effect=lambda events, *_a, **_k: list(events)), \
+                     patch("tg_bot.storage.load_daily_report_state", return_value=empty_state), \
+                     patch("tg_bot.bot_utils.send_report_html", return_value=True) as send:
                     self.assertEqual(module.main([]), 0)
                     self.assertEqual(module.main([]), 0)
                 self.assertEqual(send.call_count, 1)
@@ -1845,20 +3909,310 @@ class DailyReportCollectionTests(unittest.TestCase):
                     summary="summary",
                     url="https://example.com/stable",
                     domain="example.com",
-                    published_at="2026-07-14T10:00:00+00:00",
+                    published_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
                     relevance=0.9,
                     source="fixture",
                 )
                 with patch.object(module, "collect_candidates", return_value=([candidate], [])), \
-                     patch("tg_bot.bot_utils.send", side_effect=[False, True]) as send:
+                     patch.object(module, "research_selected_events", side_effect=lambda events, *_a, **_k: list(events)), \
+                     patch("tg_bot.bot_utils.send_report_html", side_effect=[False, True]) as send:
                     self.assertEqual(module.main([]), 1)
                     self.assertEqual(module.main([]), 0)
                     self.assertEqual(module.main([]), 0)
                 self.assertEqual(send.call_count, 2)
                 with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
                     status = json.load(handle)
-                self.assertEqual(status["push"]["status"], "skipped_unchanged")
+                self.assertEqual(status["status"], "fresh")
+                self.assertIn(status["push"]["status"], {"sent", "skipped_unchanged"})
                 self.assertEqual(status["event_count"], 1)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_main_applies_event_section_target_to_report_json_and_cooldown_state(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-visible-lanes-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_PUSH="false",
+                DAILY_REPORT_SECTIONS="china,security_privacy",
+                DAILY_REPORT_EVENT_SECTION_TARGET="1",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_main_visible_lanes")
+                candidates = [
+                    module.NewsCandidate(
+                        category=category,
+                        title=f"{category} headline",
+                        summary="summary",
+                        url=f"https://{category}.example.test/story",
+                        domain=f"{category}.example.test",
+                        published_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                        relevance=0.9,
+                        source="fixture",
+                    )
+                    for category in ("china", "security_privacy")
+                ]
+                with patch.object(module, "collect_candidates", return_value=(candidates, [])), \
+                     patch.object(module, "research_selected_events", side_effect=lambda events, *_a, **_k: list(events)):
+                    self.assertEqual(module.main([]), 0)
+                with open(os.path.join(data_dir, "daily_report.json"), encoding="utf-8") as handle:
+                    report_json = json.load(handle)
+                self.assertEqual(
+                    [event["category"] for event in report_json["events"]],
+                    ["china"],
+                )
+                self.assertFalse(os.path.exists(os.path.join(data_dir, "daily_report_state.json")))
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_main_fills_dropped_primary_lane_from_eligible_reserve(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-reserve-after-edit-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_PUSH="false",
+                DAILY_REPORT_SECTIONS="china,security_privacy",
+                DAILY_REPORT_EVENT_SECTION_TARGET="1",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_reserve_after_edit")
+                candidates = [
+                    module.NewsCandidate(
+                        category=category,
+                        title=f"{category} headline",
+                        summary="summary",
+                        url=f"https://{category}.example.test/story",
+                        domain=f"{category}.example.test",
+                        published_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                        relevance=0.9,
+                        source="fixture",
+                    )
+                    for category in ("china", "security_privacy")
+                ]
+
+                def verify_only_reserve(selected, *_args, **_kwargs):
+                    return [event for event in selected if event.category == "security_privacy"]
+
+                with patch.object(module, "collect_candidates", return_value=(candidates, [])), \
+                     patch.object(module, "research_selected_events", side_effect=verify_only_reserve):
+                    self.assertEqual(module.main([]), 0)
+                with open(os.path.join(data_dir, "daily_report.json"), encoding="utf-8") as handle:
+                    report_json = json.load(handle)
+                with open(os.path.join(data_dir, "today_report.txt"), encoding="utf-8") as handle:
+                    report_text = handle.read()
+                self.assertEqual(
+                    [event["category"] for event in report_json["events"]],
+                    ["security_privacy"],
+                )
+                self.assertNotIn("eligible_selected", report_json)
+                self.assertFalse(os.path.exists(os.path.join(data_dir, "daily_report_state.json")))
+                self.assertIn("安全与隐私", report_text)
+                self.assertNotIn("中国要闻", report_text)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_research_pipeline_failure_does_not_publish_unverified_draft(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-editorial-transaction-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_PUSH="false",
+                DAILY_REPORT_SECTIONS="global",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_editorial_transaction")
+                candidate = module.NewsCandidate(
+                    category="global",
+                    title="Original headline",
+                    summary="summary",
+                    url="https://example.test/transaction",
+                    domain="example.test",
+                    published_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                    relevance=0.9,
+                    source="fixture",
+                )
+
+                with patch.object(module, "collect_candidates", return_value=([candidate], [])), \
+                     patch.object(module, "research_selected_events", side_effect=RuntimeError("fixture")):
+                    self.assertEqual(module.main([]), 0)
+                self.assertFalse(os.path.exists(os.path.join(data_dir, "today_report.txt")))
+                self.assertFalse(os.path.exists(os.path.join(data_dir, "daily_report.json")))
+                self.assertFalse(os.path.exists(os.path.join(data_dir, "daily_report_state.json")))
+                with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
+                    status = json.load(handle)
+                self.assertEqual(status["status"], "no_publishable_content")
+                self.assertIn("research_pipeline_error:RuntimeError", status["diagnostics"])
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_main_empty_report_only_writes_no_publishable_content_status(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-no-content-")
+        try:
+            report_path = os.path.join(data_dir, "today_report.txt")
+            json_path = os.path.join(data_dir, "daily_report.json")
+            state_path = os.path.join(data_dir, "daily_report_state.json")
+            previous_json = {"schema_version": 1, "marker": "keep-json"}
+            previous_state = {
+                "schema_version": 1,
+                "events": {
+                    "previous": {
+                        "last_published": datetime.now(timezone.utc).isoformat(),
+                        "category": "global",
+                        "title": "Previous event",
+                    },
+                },
+            }
+            with open(report_path, "w", encoding="utf-8") as handle:
+                handle.write("previous report")
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(previous_json, handle)
+            with open(state_path, "w", encoding="utf-8") as handle:
+                json.dump(previous_state, handle)
+
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_PUSH="true",
+                DAILY_REPORT_SECTIONS="global",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_no_content")
+                with patch.object(module, "collect_candidates", return_value=([], ["global: no_candidates"])), \
+                     patch("tg_bot.bot_utils.send_report_html", return_value=True) as send:
+                    self.assertEqual(module.main([]), 0)
+                send.assert_not_called()
+
+            with open(report_path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "previous report")
+            with open(json_path, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), previous_json)
+            with open(state_path, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), previous_state)
+            with open(os.path.join(data_dir, "daily_report_status.json"), encoding="utf-8") as handle:
+                status = json.load(handle)
+            self.assertEqual(status["status"], "no_publishable_content")
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_main_empty_report_does_not_overwrite_concurrent_status(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-empty-race-")
+        try:
+            concurrent_status = {
+                "schema_version": 1,
+                "status": "fresh",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "content_sha256": "concurrent-success",
+                "event_count": 2,
+                "push": {
+                    "enabled": False,
+                    "status": "disabled",
+                    "marker": "keep-concurrent-metadata",
+                },
+            }
+            status_path = os.path.join(data_dir, "daily_report_status.json")
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_PUSH="false",
+                DAILY_REPORT_SECTIONS="global",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_empty_race")
+
+                def publish_concurrently(_events, *_args, **_kwargs):
+                    with open(status_path, "w", encoding="utf-8") as handle:
+                        json.dump(concurrent_status, handle)
+                    return []
+
+                with patch.object(module, "collect_candidates", return_value=([], [])), \
+                     patch.object(module, "research_selected_events", side_effect=publish_concurrently):
+                    self.assertEqual(module.main([]), 0)
+                with open(status_path, encoding="utf-8") as handle:
+                    self.assertEqual(json.load(handle), concurrent_status)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_same_day_sent_status_survives_empty_cooldown_rerun(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-empty-after-sent-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_PUSH="true",
+                DAILY_REPORT_SECTIONS="global",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_empty_after_sent")
+                status_path = os.path.join(data_dir, "daily_report_status.json")
+                candidate = module.NewsCandidate(
+                    category="global",
+                    title="Stable headline",
+                    summary="summary",
+                    url="https://example.com/stable",
+                    domain="example.com",
+                    published_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                    relevance=0.9,
+                    source="fixture",
+                )
+                with patch.object(module, "collect_candidates", return_value=([candidate], [])), \
+                     patch.object(module, "research_selected_events", side_effect=lambda events, *_a, **_k: list(events)), \
+                     patch("tg_bot.bot_utils.send_report_html", return_value=True) as send:
+                    self.assertEqual(module.main([]), 0)
+                    with open(status_path, encoding="utf-8") as handle:
+                        sent_status = json.load(handle)
+                    self.assertEqual(module.main([]), 0)
+                self.assertEqual(send.call_count, 1)
+                with open(status_path, encoding="utf-8") as handle:
+                    final_status = json.load(handle)
+                self.assertEqual(final_status, sent_status)
+                self.assertEqual(final_status["push"]["status"], "sent")
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_verified_rerender_uses_no_comment_channel(self):
+        data_dir = tempfile.mkdtemp(prefix="tg-bot-report-editorial-compat-")
+        try:
+            with temporary_env(**required_env(
+                TG_BOT_DATA_DIR=data_dir,
+                DAILY_REPORT_NATIVE_SNAPSHOTS="false",
+                DAILY_REPORT_PUSH="false",
+                DAILY_REPORT_SECTIONS="global",
+            )):
+                for module_name in ("tg_bot.storage", "tg_bot.config", "tg_bot.bot_utils"):
+                    sys.modules.pop(module_name, None)
+                module = self._load_builder("build_daily_report_editorial_compat")
+                candidate = module.NewsCandidate(
+                    category="global",
+                    title="Original headline",
+                    summary="summary",
+                    url="https://example.com/editorial-compat",
+                    domain="example.com",
+                    published_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                    relevance=0.9,
+                    source="fixture",
+                )
+
+                def fake_research(selected, *_args, **_kwargs):
+                    return [replace(selected[0], title="Verified headline")]
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(module, "collect_candidates", return_value=([candidate], [])), \
+                     patch.object(module, "research_selected_events", side_effect=fake_research), \
+                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    self.assertEqual(module.main(["--dry-run"]), 0)
+                self.assertIn("Verified headline", stdout.getvalue())
+                self.assertNotIn("└", stdout.getvalue())
+                self.assertNotIn("TypeError", stderr.getvalue())
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
@@ -2023,6 +4377,39 @@ class SourceBackfillTests(unittest.TestCase):
 
 
 class CuratorTests(unittest.TestCase):
+    def test_direct_scheme_source_exempt_from_short_body_filter(self):
+        """direct:// 来源（天气/汇率等本地直连工具）正文可以很短，
+        不适用「少于 200 字符即空页」的网页启发式过滤；普通 http 短正文仍应被过滤。"""
+        direct_source = Source(
+            id="D001",
+            url="direct://check_weather",
+            domain="direct://check_weather",
+            title="天气",
+            snippet="",
+            full_content=("北京今天晴，气温18到27度，东南风3级，空气质量优。" * 5)[:100],
+            tool="check_weather",
+        )
+        short_source = Source(
+            id="R001",
+            url="https://example.com/short",
+            domain="example.com",
+            title="无关网页",
+            snippet=("这是一段过短的普通网页正文，" * 5)[:50],
+            tool="web_search",
+        )
+        # 先确认构造的正文长度符合用例设计（direct 100 字符，普通 http 50 字符）。
+        self.assertEqual(len(direct_source.full_content), 100)
+        self.assertEqual(len(short_source.snippet), 50)
+
+        req = curate(
+            [direct_source, short_source],
+            user_query="今天北京天气怎么样",
+            keywords=["天气"],
+        )
+        kept_ids = {s.id for s in req.sources}
+        self.assertIn("D001", kept_ids)
+        self.assertNotIn("R001", kept_ids)
+
     def test_single_item_hint_for_one_fun_fact(self):
         req = curate(
             [
@@ -2043,6 +4430,104 @@ class CuratorTests(unittest.TestCase):
         self.assertEqual(req.target_words, (80, 200))
 
 
+class GatherParallelToolCallTests(unittest.TestCase):
+    """gather_ai 同一轮模型并列发起多个工具调用时（pipeline/gather.py ~612-718 行），
+    并发执行后必须按原始 tool_calls 顺序合并回 msgs/meta，且不产生重复来源。"""
+
+    def test_same_round_parallel_tool_calls_merge_in_original_order(self):
+        tool_calls = [
+            {"id": "call_1", "type": "function", "function": {
+                "name": "web_search", "arguments": json.dumps({"query": "苹果发布会"})}},
+            {"id": "call_2", "type": "function", "function": {
+                "name": "web_search", "arguments": json.dumps({"query": "苹果股价"})}},
+            {"id": "call_3", "type": "function", "function": {
+                "name": "web_search", "arguments": json.dumps({"query": "苹果新品"})}},
+        ]
+        round1_response = {
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "",
+                    "tool_calls": tool_calls,
+                },
+            }]
+        }
+        round2_response = {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps({
+                        "sufficient": True,
+                        "reason": "三次搜索已覆盖问题",
+                        "reason_code": "coverage_complete",
+                        "suggested_length": "short",
+                    }),
+                    "reasoning_content": "",
+                },
+            }]
+        }
+        responses = [round1_response, round2_response]
+        captured_payloads = []
+
+        def fake_http_post(url, payload, headers=None, timeout=None):
+            captured_payloads.append(payload)
+            return responses[len(captured_payloads) - 1]
+
+        def fake_execute_gather_tool(fn, args, ctx):
+            # 每个 query 返回可区分的结果，并把新条目写回本次调用专属的
+            # local ctx（gather_ai 并发执行时每个工具调用都有独立的 ctx）。
+            query = args.get("query", "")
+            entry = {
+                "id": f"S_{query}",
+                "url": f"https://example.com/{query}",
+                "domain": "example.com",
+                "title": f"title-{query}",
+                "snippet": f"snippet-{query}",
+                "full_content": "",
+                "tool": fn,
+                "query": query,
+            }
+            ctx.source_index.append(entry)
+            ctx.url_to_entry[entry["url"]] = entry
+            return f"result-for-{query}"
+
+        with temporary_env(**required_env()):
+            from tg_bot.pipeline.gather import gather_ai
+            with patch("tg_bot.pipeline.gather.http_post", side_effect=fake_http_post), \
+                 patch("tg_bot.pipeline.gather.execute_gather_tool",
+                       side_effect=fake_execute_gather_tool):
+                source_index, meta = gather_ai(
+                    "苹果最新动态", ["苹果"],
+                    chat_id=None,
+                    evidence_audit_enabled=False,
+                )
+
+        # 只应发生两轮 API 调用：一轮并列工具调用 + 一轮采集完成 JSON。
+        self.assertEqual(len(captured_payloads), 2)
+
+        # ① 第二轮请求里 3 条 tool 回复的 tool_call_id 顺序需与原始 tool_calls 顺序一致。
+        round2_msgs = captured_payloads[1]["messages"]
+        tool_reply_ids = [m["tool_call_id"] for m in round2_msgs if m.get("role") == "tool"]
+        self.assertEqual(tool_reply_ids, ["call_1", "call_2", "call_3"])
+
+        # ② meta["tool_calls_summary"] 恰好 3 条且顺序正确。
+        self.assertEqual(
+            meta["tool_calls_summary"],
+            ["web_search(苹果发布会)", "web_search(苹果股价)", "web_search(苹果新品)"],
+        )
+
+        # ③ source_index 无重复 id。
+        self.assertEqual(len(source_index), 3)
+        ids = [s["id"] for s in source_index]
+        self.assertEqual(len(ids), len(set(ids)))
+
+        self.assertTrue(meta["sufficient"])
+        self.assertEqual(meta["gather_reason_code"], "coverage_complete")
+
+
 class GatherFallbackTests(unittest.TestCase):
     def test_parse_gather_completion(self):
         parsed = parse_gather_completion('说明 {"sufficient": false, "reason": "素材不足", "suggested_length": "short"}')
@@ -2052,7 +4537,9 @@ class GatherFallbackTests(unittest.TestCase):
 
     def test_finalize_round_limit(self):
         sources, meta = finalize_round_limit([{"id": "R001"}], {})
-        self.assertTrue(meta["sufficient"])
+        # 采集轮次耗尽属于"未充分"完成，fail-closed 语义下 sufficient 为 False
+        self.assertFalse(meta["sufficient"])
+        self.assertEqual(meta["gather_reason_code"], "quota_exhausted")
         self.assertEqual(meta["source_index"], sources)
 
 

@@ -278,6 +278,7 @@ def write_ai(user_text, fact_list, history_context=None, reject_feedback="", fac
         "detailed": "建议深度展开（1200～2500字）：用户明确要全面介绍，素材丰富，充分利用所有来源。",
     }
     _sl_max_map = {"short": 1200, "medium": 2500, "long": 4500, "detailed": 7000}
+    _max_tokens = 3500  # 默认预算；suggested_length / 用户显式字数按需覆盖
     if _sl in _sl_map:
         user_content += f"\n\n【字数参考（采集AI基于素材和问题给出）】\n{_sl_map[_sl]}\n这是参考，你仍需根据实际内容判断，不要硬凑字数也不要无故缩短。"
         if not _len_hint:  # 用户没有明确指定字数时，才用 suggested_length 调整
@@ -292,7 +293,6 @@ def write_ai(user_text, fact_list, history_context=None, reject_feedback="", fac
         )
         _max_tokens = min(max(int(hi * 2.5), 2200), 4000)  # 至少 2200：thinking budget(1500) + 700 输出
     else:
-        _max_tokens = 3500
         user_content += (
             "\n\n【基础长度要求】"
             "\n搜索类问题，除非事实清单确实不足 2 条，否则不要只输出一句话。"
@@ -306,8 +306,8 @@ def write_ai(user_text, fact_list, history_context=None, reject_feedback="", fac
 
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL_WRITER,
              "messages": [{"role": "system", "content": _SYS_WRITE}] + msgs_write,
              "max_tokens": _max_tokens,
              "temperature": 0.7,

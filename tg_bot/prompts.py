@@ -42,6 +42,18 @@ _SYS_DISAMBIG = """\
 - search_daily_summaries : 搜索历史日总结
 - read_daily_summary   : 读某天完整日总结
 - search_chat_history  : 搜索对话历史里的消息
+- exchange_rate        : 任意币种实时汇率/金额换算（问汇率必用，别搜网页）
+- stock_quote          : 股票/指数实时报价（问股价必用，别搜网页）
+- world_time           : 世界任意城市当前时间/时差
+- steam_specials       : Steam 中国区当前特价游戏（官方数据）
+- hn_front_page        : Hacker News 首页热帖（技术圈在聊什么）
+- proxy_releases       : sing-box/Xray-core/mihomo 最新版本（官方 releases）
+- chinese_holiday      : 中国法定节假日/调休查询（问放假补班必用）
+- github_release       : 任意 GitHub 项目最新版本（问开源软件版本必用）
+- epic_free_games      : Epic 本周免费游戏
+- cn_hot_topics        : 微博热搜/知乎热榜/B站热门（问国内热点必用）
+- earthquake_recent    : 近期全球显著地震（USGS）
+- x_trends             : X(推特) 全球热门话题榜
 
 输出严格遵守以下 JSON 格式，不输出任何其他内容：
 
@@ -60,8 +72,15 @@ _SYS_DISAMBIG = """\
   "confidence": 0.0 到 1.0,
   "reason": "一句话说明为什么选这条路径",
   "clarify_question": "如果 clear 为 false，这里写你要反问用户的问题；否则为空字符串",
-  "suggested_tool": "从上方工具菜单中选最合适的一个工具名；不确定时填 web_search"
+  "suggested_tool": "从上方工具菜单中选最合适的一个工具名；不确定时填 web_search",
+  "suggested_words": 预估这个问题值得回答的字数（整数）
 }
+
+suggested_words 由你自己判断，没有固定档位。只看用户问题本身的分量——
+这个问题答到几个字刚好够、再多就是啰嗦？与之后能搜到多少素材完全无关。
+参考感觉（不是规定）："刘备是谁"这种一段话讲得清的 ≈ 120～200；
+"XX事件怎么回事"这种要几个维度的 ≈ 400；用户明说"详细/全面介绍"的 ≈ 1200 以上。
+拿不准时往少估——用户觉得不够会自己说"再详细点"。
 
 字段关系：
 - needs_search 兼容旧流程，表示是否进入外部证据/工具路径。
@@ -217,17 +236,30 @@ _SYS_GATHER = """
 第一步：调用工具收集信息（web_search、wikipedia_lookup、check_weather 等）。
 第二步：阅读已收集的素材，判断：
   ① 素材是否足以回答问题（sufficient）
-  ② 根据问题类型和素材丰富程度，建议写作AI输出多少字（suggested_length）
+  ② 用标准原因码说明该判断（reason_code）
+  ③ 根据问题类型和素材丰富程度，建议写作AI输出多少字（suggested_length）
 第三步：输出 JSON 结论：
 
 {
   "sufficient": true,
   "reason": "一句话说明素材充足的依据，或为何已无法获取更多",
+  "reason_code": "direct_api_complete/coverage_complete/missing_requirements/conflicting_evidence/no_full_text/no_novelty/quota_exhausted 之一",
   "suggested_length": "short/medium/long/detailed 之一，见下方说明"
 }
 
+reason_code 必须从上面枚举中选择，不能省略或自造：
+- direct_api_complete：直接 API 返回完整结果；sufficient 必须为 true。
+- coverage_complete：至少两条独立来源已覆盖问题；sufficient 必须为 true。
+- missing_requirements：仍缺少问题所需信息；sufficient 必须为 false。
+- conflicting_evidence：来源结论冲突，尚未核实；sufficient 必须为 false。
+- no_full_text：只有摘要、缺少关键原文；sufficient 必须为 false。
+- no_novelty：连续搜索没有新增有效信息；sufficient 必须为 false。
+- quota_exhausted：工具或轮次额度耗尽；sufficient 必须为 false。
+
 ━━━ suggested_length 判断标准 ━━━
-结合问题类型和素材内容综合判断：
+先看用户问法的分量，再看素材；素材丰富绝不是加长的理由：
+用户只问"XX是谁/XX是什么"而没要求详述时，即使抓到了整篇百科全文，
+也只给 short 或 medium——用户想深入自然会追问。
 
 - short（80～200字）：
   单一事实查询（"今天几号""XX股价""明天天气"），一个数据点即可回答
@@ -240,6 +272,16 @@ _SYS_GATHER = """
 
 - detailed（1200～2500字）：
   "详细介绍""多说点""全面了解"，素材丰富且问题明确要求深度，充分展开所有维度
+
+━━━ 来源广度 ━━━
+- 当问题涉及舆论、大家的看法、网上的讨论、社区反响、玩家/用户口碑、
+  或用户点名社交平台（推特/X、Reddit、知乎、微博、论坛）时，除常规
+  搜索外，必须补充社区来源查询，例如在查询词中加入
+  site:reddit.com、site:x.com、site:news.ycombinator.com、
+  或"知乎"“微博”"贴吧"等平台词。
+- 社区来源的说法属于观点/传闻，不是核实过的事实；采集时照常收录，
+  由写作层负责区分标注。不要因为它们不权威就丢弃——用户明确要求
+  能看到社区声音。
 
 ━━━ 停止条件 ━━━
 满足以下任一条件即可停止搜索：

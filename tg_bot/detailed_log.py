@@ -10,8 +10,13 @@ from datetime import datetime, timezone, timedelta
 log = logging.getLogger(__name__)
 
 _BJ = timezone(timedelta(hours=8))
-_LOG_DIR = "/var/lib/morning-report/detailed_logs"
-os.makedirs(_LOG_DIR, exist_ok=True)
+def _log_dir() -> str:
+    """跟随 config.DATA_DIR，且把 makedirs 推迟到首次写入：
+    import 阶段建目录会在无权限环境（本地跑测试）直接炸掉进程。"""
+    from tg_bot.config import DATA_DIR
+    path = os.path.join(DATA_DIR, "detailed_logs")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def save_detailed_log(
@@ -32,13 +37,15 @@ def save_detailed_log(
     now = datetime.now(tz=_BJ)
     date_str = now.strftime("%Y%m%d")
     ts_str   = now.strftime("%Y-%m-%d %H:%M:%S")
+    redact_reasoning = bool((meta or {}).get("raw_reasoning_redacted"))
 
     # gather_ai 的每一轮思考和工具调用
     gather_rounds = []
     for r in (meta.get("rounds") or []):
         gather_rounds.append({
             "round":      r.get("round"),
-            "thinking":   r.get("reasoning", ""),   # 完整 thinking
+            "thinking":   "" if redact_reasoning else r.get("reasoning", ""),
+            "reasoning_present": bool(r.get("reasoning_present") or r.get("reasoning")),
             "tool_calls": r.get("tool_calls", []),
         })
 
@@ -99,7 +106,8 @@ def save_detailed_log(
 
         # write_ai 输出
         "write": {
-            "reasoning": write_reasoning,   # 完整 thinking
+            "reasoning": "" if redact_reasoning else write_reasoning,
+            "reasoning_present": bool((meta or {}).get("writer_state", {}).get("reasoning_present") or write_reasoning),
             "reply":     write_reply,
             "reply_len": len(write_reply),
         },
@@ -108,8 +116,8 @@ def save_detailed_log(
         "verify": verifier_result or {},
     }
 
-    path = os.path.join(_LOG_DIR, f"{date_str}.jsonl")
     try:
+        path = os.path.join(_log_dir(), f"{date_str}.jsonl")
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         log.info(f"📝 详细日志已保存 → {date_str}.jsonl（{len(write_reply)}字回复）")

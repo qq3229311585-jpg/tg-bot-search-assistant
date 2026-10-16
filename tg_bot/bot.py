@@ -25,7 +25,7 @@ from tg_bot.storage import (
     save_write_thinking, save_toollog_entry, fmt_toollog_for_prompt,
     load_quota, save_quota, fmt_quota, save_worklog_entry, fmt_worklog,
     auto_cleanup, save_sources_file, load_today_index, list_sources_files,
-    read_sources_file,
+    read_sources_file, NOVELTY_UNTRUSTED_BOUNDARY,
 )
 from tg_bot.facts import build_facts_json
 from tg_bot.memory import build_memory_context
@@ -77,6 +77,34 @@ def _render_display_reply(raw_reply, *, meta=None, mode="answer"):
     return clean_reply_for_user(raw_reply or "")
 
 
+def _html_escape_min(text):
+    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _build_sources_message(source_index, tool_calls=None, max_items=10):
+    """来源详情单独折叠发送，避免正文被 URL 和检索记录打断。"""
+    entries = [entry for entry in (source_index or []) if entry.get("title") or entry.get("url")]
+    if not entries:
+        return ""
+    queries = []
+    for tool_call in tool_calls or []:
+        match = re.search(r"\(([^()]+)\)", str(tool_call))
+        if match and match.group(1).strip() and match.group(1).strip() not in queries:
+            queries.append(match.group(1).strip())
+    lines = []
+    if queries:
+        lines.append("🔍 搜索过：" + "、".join(queries[:6]))
+    for entry in entries[:max_items]:
+        title = _html_escape_min((entry.get("title") or entry.get("domain") or "")[:70])
+        domain = _html_escape_min(entry.get("domain") or entry.get("tool") or "")
+        lines.append(f"· {title}（{domain}）")
+        url = (entry.get("url") or "").strip()
+        if url:
+            lines.append(f"  {_html_escape_min(url[:150])}")
+    body = "\n".join(lines)[:1500]
+    return f"📎 来源详情（{len(entries)} 则）\n<blockquote expandable>{body}</blockquote>"
+
+
 def _run_search_with_progress(progress, runner, *args, **kwargs):
     """Attach the visible progress callback to one search-pipeline run."""
     kwargs["progress_cb"] = progress.stage
@@ -101,7 +129,20 @@ def _build_fast_system_prompt(parts):
         "没有查询外部网络。回答时不要出现「根据搜索结果」「据我查询」"
         "「刚才搜索到」等措辞；如涉及可能变化的信息，要明确说明没有实时核验。"
     )
-    return "\n".join(list(parts or []) + [reminder])
+    return "\n".join(list(parts or []) + [reminder, f"【安全边界】{NOVELTY_UNTRUSTED_BOUNDARY}"])
+
+
+def _report_sections_block():
+    """午报板块清单从真实注册表生成，板块调整后提示词自动同步，不再手写漂移。"""
+    try:
+        from tg_bot.report_sections import DEFAULT_REPORT_SECTIONS
+        lines = ["午报包含以下板块（储备板块仅在当天有核实内容时出现）：\n"]
+        for spec in DEFAULT_REPORT_SECTIONS:
+            reserve_tag = "（储备板块）" if getattr(spec, "reserve", False) else ""
+            lines.append(f"  {spec.emoji} {spec.title}{reserve_tag}\n")
+        return "".join(lines)
+    except Exception:
+        return "午报包含天气、汇率、美股、要闻、圈子在聊、Steam 特价、冷知识等板块。\n"
 
 
 _BLOCKED_SOURCE_DOMAINS = {"baike.baidu.com", "www.baike.baidu.com"}
@@ -274,9 +315,24 @@ def _detect_knowledge(text):
 def sync_to_openhuman_memory(user_text, reply_text, source="telegram",
                              tools_used=None, sources=None):
     """
-    把本轮对话写入 OpenHuman 记忆树。失败不抛异常，仅记日志。
+    把本轮对话异步写入 OpenHuman 记忆树。失败不抛异常，仅记日志。
+    主循环是单线程轮询，同步 urlopen(timeout=10) 会在 OpenHuman 变慢/挂掉时
+    拖住下一条 Telegram 消息，所以丢进后台线程执行。
     source: "telegram" 或 "openhuman"（区分对话发起渠道）
     """
+    import threading
+
+    worker = threading.Thread(
+        target=_sync_to_openhuman_memory_blocking,
+        args=(user_text, reply_text, source, tools_used, sources),
+        daemon=True,
+        name="openhuman-sync",
+    )
+    worker.start()
+
+
+def _sync_to_openhuman_memory_blocking(user_text, reply_text, source="telegram",
+                                       tools_used=None, sources=None):
     from tg_bot.config import OPENHUMAN_RPC_URL, OPENHUMAN_RPC_TOKEN, OPENHUMAN_NS, _ctx
     try:
         ts = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
@@ -448,7 +504,12 @@ def handle(chat_id, text, http_mode=False, brief=False):
         "· 能用一句话说清的不写两句，能用具体数字的不写'一些/很多'\n"
         "· 最后不加'希望对你有帮助''如有疑问欢迎继续问'之类的结尾废话\n\n"
         "【格式】\n"
-        "纯文本 + emoji（适度），不用任何 Markdown（不加粗、不斜体、不用#标题、不用---）。\n\n"
+        "结论先行，第一句直接回答。简单问题用 1-2 个自然段的连贯短文说完，不硬凑列表；\n"
+        "内容多时才分组，分组标题用 **emoji + 短标题** 加粗独立成行，组间空行。\n"
+        "任何自然段不超过 3 句；并列事实用「· 」逐行列出。全文顶格，不用空格缩进。\n"
+        "Markdown 只允许分组标题的 **粗体**，其余（斜体、#标题、---）都不用。\n"
+        "语气像可靠的同事：不用「值得注意的是」「综上所述」「总的来说」等套话，\n"
+        "不复读问题，结尾不加总结和客套。\n\n"
         "【工具使用流程】\n"
         "▶ 知识/概念/定义/历史/科学/人物等可核查的问题：\n"
         "  先调 wikipedia_lookup → 有结果直接用，不再调 web_search。\n"
@@ -512,18 +573,8 @@ def handle(chat_id, text, http_mode=False, brief=False):
         "没有相关记录时，再如实说明只能查看已保存的日志或摘要。",
         "\n【午报说明】\n"
         "每天北京时间 13:00 自动生成并推送一份「午报」给用户。\n"
-        "午报固定包含以下板块：\n"
-        "  🌤 天气预报（安阳，含早/午/晚/夜四段）\n"
-        "  💱 汇率（USD/CNY 及近期走势分析）\n"
-        "  📈 行情速览（BTC / ETH 等）\n"
-        "  📰 中国要闻 / 全球要闻（当天重要事件）\n"
-        "  🤖 AI 速报（当日 AI 领域重要新闻，含点评）\n"
-        "  🔒 代理圈动态（sing-box / Xray-core 等工具更新）\n"
-        "  🗣️ 圈子在聊（HackerNews 热议话题）\n"
-        "  🛠 GitHub 热榜（当日 star 增长最快的仓库）\n"
-        "  🎮 Steam 降价优惠（游戏折扣与促销）\n"
-        "  ⚡ 今日冷知识（科学/历史趣味小知识）\n"
-        "用户问'午报几点发/什么时候发'→ 回答：每天北京时间 13:00。\n"
+        + _report_sections_block()
+        + "用户问'午报几点发/什么时候发'→ 回答：每天北京时间 13:00。\n"
         "用户问'今天午报有什么/回顾午报/午报里的XX'→ 调用 read_today_report 工具读取全文后回答。\n"
         "如果午报还没生成（当天 13:00 前被问到）→ 告知'今天的午报还没发，每天 13:00 推送'。\n",
     ]
@@ -717,7 +768,9 @@ def handle(chat_id, text, http_mode=False, brief=False):
         except Exception as _report_e:
             log.warning(f"read_today_report 证据构建失败: {_report_e}")
             local_evidence_pack = None
-            local_evidence_kind = ""
+            # Preserve the report lane so a failed local read cannot be
+            # silently reclassified as ordinary chat/search.
+            local_evidence_kind = "today_report"
 
     lane_decision = decide_lane(
         needs_search=needs_search,
@@ -756,13 +809,26 @@ def handle(chat_id, text, http_mode=False, brief=False):
         ]
         _fast_messages.append({"role": "user", "content": text})
         progress.stage("writer", "start", "")
+        from tg_bot.storage import NOVELTY_REQUEST_RE, append_novelty_entry, extract_novelty_topic, format_novelty_avoid_block
+        _is_novelty = bool(NOVELTY_REQUEST_RE.search(text))
+        _fast_system = _build_fast_system_prompt(parts)
+        if _is_novelty:
+            _avoid = format_novelty_avoid_block()
+            if _avoid:
+                _fast_system += "\n\n" + _avoid
         reply = fast_chat(
             _fast_messages,
-            system=_build_fast_system_prompt(parts),
+            system=_fast_system,
             max_tokens=900,
             temp=0.6,
         )
         write_reasoning = ""
+        if _is_novelty and (reply or "").strip():
+            try:
+                first_line = next((line.strip() for line in reply.splitlines() if line.strip()), "")
+                append_novelty_entry("chat", extract_novelty_topic(first_line))
+            except Exception as exc:
+                log.debug("novelty ledger 记录失败: %s", exc)
         reply = _mark_no_references(reply)
         display_reply = _render_display_reply(reply, meta=meta, mode="answer")
         progress.stage("writer", "done", str(len(display_reply)))
@@ -933,14 +999,83 @@ def handle(chat_id, text, http_mode=False, brief=False):
         log.info(f"🎯 对话焦点注入: goal={_focus_task['goal'][:40]} deferred={_focus_task['user_deferred']}")
     # ────────────────────────────────────────────────────────────────
     source_index_result = []
+    pipeline_config = None
+    pipeline_gather_fn = None
+    report_failure_meta = None
+    if lane_decision.name in ("report", "local_tool") and local_evidence_pack:
+        # Daily-report text and local direct tools (vps_traffic) are local
+        # evidence, not an ordinary web search.  Keep the write path compatible
+        # while explicitly bypassing Gather's web search + evidence auditor and
+        # Critic's long-answer review sharder — previously the local_tool lane
+        # built this evidence pack and then silently discarded it by running a
+        # full web gather anyway.
+        from tg_bot.core.contracts import PipelineConfig
+
+        report_sources = list(meta.get("source_index") or [])
+        report_meta = {
+            "rounds": list(meta.get("rounds") or []),
+            "tool_calls_summary": list(meta.get("tool_calls_summary") or []),
+            "tool_results": list(meta.get("tool_results") or []),
+            "fetched_pages": list(meta.get("fetched_pages") or []),
+            "source_index": list(report_sources),
+            "failed_urls": [],
+            "facts_json": dict(meta.get("facts_json") or {}),
+            "reply_mode": str(meta.get("reply_mode") or "report"),
+            "audit_required": False,
+            "sufficient": True,
+            "raw_reasoning_redacted": True,
+        }
+
+        def _report_gather(*_args, **_kwargs):
+            return list(report_sources), dict(report_meta)
+
+        pipeline_config = PipelineConfig(
+            query_fixer=False,
+            critic=False,
+            patcher=False,
+            chat_evidence_audit=False,
+        )
+        pipeline_gather_fn = _report_gather
+        report_failure_meta = dict(report_meta)
+    elif lane_decision.name == "report":
+        # A report question is intentionally local-only.  Missing local
+        # material is a failed report read, never a reason to search the web.
+        report_failure_meta = {
+            "rounds": [], "tool_calls_summary": [], "tool_results": [], "fetched_pages": [],
+            "source_index": [], "failed_urls": [], "facts_json": {}, "reply_mode": "report",
+            "raw_reasoning_redacted": True,
+        }
     try:
         from tg_bot.core.pipeline import run_search_pipeline
         history_context = history[:-1]
         if summary or memory_turns:
             history_context = [{"role": "assistant", "content": memory_context}] + history_context
+        pipeline_runner = run_search_pipeline
+        if lane_decision.name == "report" and not local_evidence_pack:
+            def _missing_report_runner(*_runner_args, **_runner_kwargs):
+                return (
+                    "日报读取或整理失败，请稍后再试。",
+                    "report_write_failed",
+                    dict(report_failure_meta or {}),
+                )
+
+            pipeline_runner = _missing_report_runner
+        elif lane_decision.name == "report":
+            def _safe_report_runner(*runner_args, **runner_kwargs):
+                try:
+                    return run_search_pipeline(*runner_args, **runner_kwargs)
+                except Exception as report_error:
+                    log.warning("日报本地材料整理失败，不回退外部搜索: %s", report_error)
+                    return (
+                        "日报读取或整理失败，请稍后再试。",
+                        "report_write_failed",
+                        dict(report_failure_meta or {}),
+                    )
+
+            pipeline_runner = _safe_report_runner
         reply, verify_status, meta = _run_search_with_progress(
             progress,
-            run_search_pipeline,
+            pipeline_runner,
             text,
             keywords,
             chat_id=chat_id if not http_mode else None,
@@ -951,6 +1086,9 @@ def handle(chat_id, text, http_mode=False, brief=False):
             prev_searches=_prev_searches,
             focus_task=_focus_task,
             suggested_length=(pre or {}).get("suggested_length", ""),
+            suggested_words=int((pre or {}).get("suggested_words") or 0),
+            config=pipeline_config,
+            gather_fn=pipeline_gather_fn,
         )
         meta = meta or {}
         source_index_result = meta.get("source_index", []) or []
@@ -961,61 +1099,89 @@ def handle(chat_id, text, http_mode=False, brief=False):
             "verdict": verify_status,
             "summary": "core.pipeline",
         })
-        log.info(f"🧱 新搜索 pipeline 已接入: verify={verify_status}, sources={len(source_index_result)}")
-    except Exception as _pipe_e:
-        log.warning(f"⚠️ 新搜索 pipeline 失败，回退旧流程: {_pipe_e}", exc_info=True)
-        progress.stage("gather_item", "start", "⚠️ 主搜索流程异常，切换备用方案…")
-        source_index_result, meta = gather_ai(
-            text,
-            keywords,
-            None if progress.enabled else (chat_id if not http_mode else None),
-            pre_results=pre_results,
-            retry_hint=_retry_hint,
-            prev_searches=_prev_searches,
-            pre_source_entries=pre_source_entries,
-            focus_task=_focus_task,
-            status_cb=progress.stage if progress.enabled else None,
-        )
-        _override = _maybe_override_first_gold_answer(text, meta)
-        if _override:
-            source_index_result, meta = _override
-            log.warning("⚠️ 首枚奥运金牌问题触发直接答案兜底，跳过模型归纳")
-
-        progress.stage("writer", "start", "")
-        if not meta.get("tool_calls_summary") and not meta.get("source_index"):
-            log.warning("⚠️ 搜索路径但采集AI未调用任何工具，回复基于纯模型知识")
-            reply, write_reasoning = write_ai(
-                text, "", history_context=history_context, facts_json=None,
-                source_index=source_index_result,
-                suggested_length=meta.get("suggested_length", ""),
-                tool_results=meta.get("tool_results", [])
-            )
-            reply = "ℹ️ 以下回复基于AI知识生成，未经搜索验证。如需确认可发送「再查一下」。\n\n" + reply
-            _wl_verifier["final"] = "skip_no_tools_warned"
-            verify_status = "skip_no_tools_warned"
+        if lane_decision.name == "report":
+            log.info("📋 日报本地材料流程完成: verify=%s, sources=%s", verify_status, len(source_index_result))
         else:
-            reply, write_reasoning = write_ai(
-                text, "", history_context=history_context, facts_json=None,
-                source_index=source_index_result,
-                suggested_length=meta.get("suggested_length", ""),
-                tool_results=meta.get("tool_results", [])
+            log.info(f"🧱 新搜索 pipeline 已接入: verify={verify_status}, sources={len(source_index_result)}")
+    except Exception as _pipe_e:
+        # A local report must never escape into the unrelated web-search lane.
+        # Likewise, the evidence-audit path fails closed: an exception is not
+        # permission to send an unreviewed legacy answer.  Only the explicit
+        # rollback switch preserves the historical fallback behavior.
+        if lane_decision.name == "report":
+            log.warning("日报本地流程失败，已阻止外部搜索回退: %s", _pipe_e)
+            reply = "日报读取或整理失败，请稍后再试。"
+            verify_status = "report_write_failed"
+            meta = dict(report_failure_meta or {})
+            source_index_result = list(meta.get("source_index") or [])
+            write_reasoning = ""
+            _wl_verifier["final"] = verify_status
+            _wl_verifier["rounds"].append({"attempt": 0, "verdict": verify_status, "summary": "report local failure"})
+        elif getattr(_cfg, "CHAT_EVIDENCE_AUDIT", True):
+            log.warning("搜索流程失败，已阻止未核验旧流程回退: %s", _pipe_e)
+            reply = "搜索流程暂时不可用，未发送未经核验的回答。请稍后再试。"
+            verify_status = "pipeline_failed_safe"
+            meta = {"rounds": [], "tool_calls_summary": [], "tool_results": [], "fetched_pages": [],
+                    "source_index": [], "failed_urls": [], "facts_json": {},
+                    "raw_reasoning_redacted": True, "pipeline_failure": "safe"}
+            source_index_result = []
+            write_reasoning = ""
+            _wl_verifier["final"] = verify_status
+            _wl_verifier["rounds"].append({"attempt": 0, "verdict": verify_status, "summary": "pipeline safe failure"})
+        else:
+            log.warning(f"⚠️ 新搜索 pipeline 失败，回退旧流程: {_pipe_e}", exc_info=True)
+            progress.stage("gather_item", "start", "⚠️ 主搜索流程异常，切换备用方案…")
+            source_index_result, meta = gather_ai(
+                text,
+                keywords,
+                None if progress.enabled else (chat_id if not http_mode else None),
+                pre_results=pre_results,
+                retry_hint=_retry_hint,
+                prev_searches=_prev_searches,
+                pre_source_entries=pre_source_entries,
+                focus_task=_focus_task,
+                status_cb=progress.stage if progress.enabled else None,
             )
-            _verdict, _flagged, _checks = verify_reply(
-                reply, "", user_text=text, attempt=0,
-                source_index=source_index_result,
-                facts_json=None)
-            verify_status = _verdict
-            _wl_verifier["final"] = _verdict
-            _wl_verifier["rounds"].append({
-                "attempt": 0,
-                "verdict": _verdict,
-                "summary": _flagged[:200],
-            })
-            if _verdict != "pass":
-                log.warning(f"⚠️ 旧流程 fallback 审核未通过: {_flagged[:200]}")
-        progress.stage("writer", "done", str(len(reply or "")))
-        if verify_status != "skip_no_tools_warned":
-            progress.stage("critic", "done", verify_status)
+            _override = _maybe_override_first_gold_answer(text, meta)
+            if _override:
+                source_index_result, meta = _override
+                log.warning("⚠️ 首枚奥运金牌问题触发直接答案兜底，跳过模型归纳")
+
+            progress.stage("writer", "start", "")
+            if not meta.get("tool_calls_summary") and not meta.get("source_index"):
+                log.warning("⚠️ 搜索路径但采集AI未调用任何工具，回复基于纯模型知识")
+                reply, write_reasoning = write_ai(
+                    text, "", history_context=history_context, facts_json=None,
+                    source_index=source_index_result,
+                    suggested_length=meta.get("suggested_length", ""),
+                    tool_results=meta.get("tool_results", [])
+                )
+                reply = "ℹ️ 以下回复基于AI知识生成，未经搜索验证。如需确认可发送「再查一下」。\n\n" + reply
+                _wl_verifier["final"] = "skip_no_tools_warned"
+                verify_status = "skip_no_tools_warned"
+            else:
+                reply, write_reasoning = write_ai(
+                    text, "", history_context=history_context, facts_json=None,
+                    source_index=source_index_result,
+                    suggested_length=meta.get("suggested_length", ""),
+                    tool_results=meta.get("tool_results", [])
+                )
+                _verdict, _flagged, _checks = verify_reply(
+                    reply, "", user_text=text, attempt=0,
+                    source_index=source_index_result,
+                    facts_json=None)
+                verify_status = _verdict
+                _wl_verifier["final"] = _verdict
+                _wl_verifier["rounds"].append({
+                    "attempt": 0,
+                    "verdict": _verdict,
+                    "summary": _flagged[:200],
+                })
+                if _verdict != "pass":
+                    log.warning(f"⚠️ 旧流程 fallback 审核未通过: {_flagged[:200]}")
+            progress.stage("writer", "done", str(len(reply or "")))
+            if verify_status != "skip_no_tools_warned":
+                progress.stage("critic", "done", verify_status)
 
     if not pre_searched:
         pre_searched = " ".join(keywords)[:40]  # 无缓存命中时回退到关键词记录
@@ -1183,6 +1349,12 @@ def handle(chat_id, text, http_mode=False, brief=False):
         send(chat_id, w)
     _cfg._quota_warnings.clear()
     _send_reply_with_progress(progress, send, chat_id, display_reply)
+    _src_msg = _build_sources_message(source_index_result, meta.get("tool_calls_summary"))
+    if _src_msg:
+        try:
+            send(chat_id, _src_msg)
+        except Exception as exc:
+            log.debug("来源详情消息发送失败: %s", exc)
 
     # 同步到 OpenHuman 记忆（来自 Telegram 渠道）
     sync_to_openhuman_memory(
@@ -1263,36 +1435,45 @@ def main():
                 if _cleanup_counter % 100 == 0:
                     auto_cleanup()
 
-                if text == "/start":
-                    handle_start(chat_id)
-                elif text == "/help":
-                    handle_help(chat_id)
-                elif text == "/clear":
-                    handle_clear(chat_id)
-                elif text == "/recap":
-                    handle_recap(chat_id)
-                elif text == "/thinking":
-                    handle_thinking(chat_id)
-                elif text == "/tools":
-                    handle_tools(chat_id)
-                elif text == "/sources":
-                    handle_sources(chat_id)
-                elif text.startswith("/source "):
-                    handle_source_detail(chat_id, text)
-                elif text == "/worklog" or text.startswith("/worklog "):
-                    handle_worklog(chat_id, text)
-                elif text == "/diary" or text.startswith("/diary "):
-                    handle_diary(chat_id, text)
-                elif text == "/balance":
-                    handle_balance(chat_id)
-                elif text == "/quota":
-                    handle_quota(chat_id)
-                elif text.startswith("/quota set "):
-                    handle_quota_set(chat_id, text)
-                elif text.startswith("/ask "):
-                    handle_ask(chat_id, text, handle)
-                else:
-                    handle(chat_id, text)
+                # 单条消息的处理失败不能只被最外层 except 吞掉：offset 已保存，
+                # 这条消息不会重投，用户会一无所知地等不到任何回复。
+                try:
+                    if text == "/start":
+                        handle_start(chat_id)
+                    elif text == "/help":
+                        handle_help(chat_id)
+                    elif text == "/clear":
+                        handle_clear(chat_id)
+                    elif text == "/recap":
+                        handle_recap(chat_id)
+                    elif text == "/thinking":
+                        handle_thinking(chat_id)
+                    elif text == "/tools":
+                        handle_tools(chat_id)
+                    elif text == "/sources":
+                        handle_sources(chat_id)
+                    elif text.startswith("/source "):
+                        handle_source_detail(chat_id, text)
+                    elif text == "/worklog" or text.startswith("/worklog "):
+                        handle_worklog(chat_id, text)
+                    elif text == "/diary" or text.startswith("/diary "):
+                        handle_diary(chat_id, text)
+                    elif text == "/balance":
+                        handle_balance(chat_id)
+                    elif text == "/quota":
+                        handle_quota(chat_id)
+                    elif text.startswith("/quota set "):
+                        handle_quota_set(chat_id, text)
+                    elif text.startswith("/ask "):
+                        handle_ask(chat_id, text, handle)
+                    else:
+                        handle(chat_id, text)
+                except Exception as e:
+                    log.error(f"消息处理失败（已跳过该条）: {e}", exc_info=True)
+                    try:
+                        send(chat_id, "这条消息处理时出了异常，我没能完成回复。你可以把问题重发一遍再试。")
+                    except Exception:
+                        pass
 
         except KeyboardInterrupt:
             log.info("停止。")

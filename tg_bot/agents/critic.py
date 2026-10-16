@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import replace
 
 from tg_bot.core.contracts import CriticReport, Issue, Source
 from tg_bot.workers.source_utils import format_sources_for_writer
@@ -67,11 +68,13 @@ verdict 规则：
 """
 
 
-def critique(
+def _critique_once(
     reply: str,
     sources: list[Source],
     user_query: str = "",
     attempt: int = 0,
+    *,
+    shard_label: str = "",
 ) -> CriticReport:
     """
     对 reply 进行事实核查。
@@ -80,6 +83,8 @@ def critique(
     import tg_bot.config as _cfg
     from tg_bot.tools.fetch import http_post
     from tg_bot.storage import save_verifier_thinking
+
+    audit_identity = f"critic_audit[{shard_label or 'single'}]"
 
     if not (reply or "").strip():
         return CriticReport(verdict="rewrite", issues=[])
@@ -93,9 +98,9 @@ def critique(
 
     def _call():
         return http_post(
-            "https://api.deepseek.com/chat/completions",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
             {
-                "model": "deepseek-v4-flash",
+                "model": _cfg.DEEPSEEK_MODEL_VERIFY,
                 "messages": [
                     {"role": "system", "content": _SYS_CRITIC},
                     {"role": "user", "content": user_msg},
@@ -119,9 +124,9 @@ def critique(
             return ""
         try:
             resp = http_post(
-                "https://api.deepseek.com/chat/completions",
+                f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
                 {
-                    "model": "deepseek-v4-flash",
+                    "model": _cfg.DEEPSEEK_MODEL_VERIFY,
                     "messages": [
                         {
                             "role": "system",
@@ -149,20 +154,40 @@ def critique(
             log.warning(f"Critic JSON 修复调用失败: {e}")
         return ""
 
-    def _format_error_report(kind: str, reasoning: str) -> CriticReport:
+    def _audit_summary(verdict: str, issues: list[Issue] | None = None, error_code: str = "") -> str:
+        refs = sorted({issue.source_ref for issue in (issues or []) if issue.source_ref})
+        parts = [f"verdict={verdict}", f"issues={len(issues or [])}"]
+        if refs:
+            parts.append("refs=" + ",".join(refs[:8]))
+        if error_code:
+            parts.append("error=" + error_code)
+        if shard_label:
+            parts.append("shard=" + shard_label)
+        return ";".join(parts)
+
+    def _format_error_report(kind: str) -> CriticReport:
         log.warning(f"Critic {kind}，JSON 修复失败，转为 unknown，不触发整篇重写")
-        save_verifier_thinking(user_query, f"format_error({kind})", reasoning, attempt)
+        error_code = {
+            "未返回 JSON": "format_missing_json",
+            "JSON 解析失败": "format_invalid_json",
+        }.get(kind, "format_error")
+        save_verifier_thinking(
+            audit_identity,
+            f"format_error({kind})",
+            _audit_summary("unknown", error_code=error_code),
+            attempt,
+        )
         return CriticReport(verdict="unknown", issues=[])
 
-    def _parse(raw: str, reasoning: str, repaired: bool = False) -> CriticReport:
+    def _parse(raw: str, repaired: bool = False) -> CriticReport:
         json_text = _extract_json_text(raw)
         if not json_text:
             if not repaired:
                 fixed = _repair_json(raw)
                 if fixed:
                     log.info("Critic 未返回 JSON，已通过 JSON 修复器恢复")
-                    return _parse(fixed, reasoning, repaired=True)
-            return _format_error_report("未返回 JSON", reasoning)
+                    return _parse(fixed, repaired=True)
+            return _format_error_report("未返回 JSON")
         try:
             data = json.loads(json_text)
         except Exception:
@@ -170,8 +195,8 @@ def critique(
                 fixed = _repair_json(raw)
                 if fixed:
                     log.info("Critic JSON 解析失败，已通过 JSON 修复器恢复")
-                    return _parse(fixed, reasoning, repaired=True)
-            return _format_error_report("JSON 解析失败", reasoning)
+                    return _parse(fixed, repaired=True)
+            return _format_error_report("JSON 解析失败")
 
         raw_issues = data.get("issues") or []
         issues = []
@@ -194,10 +219,10 @@ def critique(
 
         if issues:
             log.warning(f"❌ Critic 发现 {len(issues)} 个问题（verdict={verdict}）")
-            save_verifier_thinking(user_query, verdict, reasoning, attempt)
+            save_verifier_thinking(audit_identity, verdict, _audit_summary(verdict, issues), attempt)
         else:
             log.info(f"✅ Critic 审核通过（attempt={attempt}）")
-            save_verifier_thinking(user_query, "pass", reasoning, attempt)
+            save_verifier_thinking(audit_identity, "pass", _audit_summary("pass"), attempt)
 
         return CriticReport(verdict=verdict, issues=issues)
 
@@ -206,9 +231,8 @@ def critique(
         if not resp or not resp.get("choices"):
             raise ValueError("空响应")
         msg = resp["choices"][0]["message"]
-        reasoning = (msg.get("reasoning_content") or "").strip()
         raw = (msg.get("content") or "").strip()
-        return _parse(raw, reasoning)
+        return _parse(raw)
 
     except Exception as e:
         log.warning(f"Critic 第1次失败: {e}，切换 key 重试")
@@ -220,9 +244,107 @@ def critique(
                 msg2 = resp2["choices"][0]["message"]
                 return _parse(
                     (msg2.get("content") or "").strip(),
-                    (msg2.get("reasoning_content") or "").strip(),
                 )
         except Exception as e2:
             log.warning(f"Critic 重试也失败: {e2}，返回 unknown")
-        save_verifier_thinking(user_query, "unknown", f"critic_retry_failed: {e}", attempt)
+        save_verifier_thinking(
+            audit_identity,
+            "unknown",
+            _audit_summary("unknown", error_code="retry_failed"),
+            attempt,
+        )
         return CriticReport(verdict="unknown")
+
+
+def _single_review_report(report: CriticReport) -> CriticReport:
+    """Attach additive audit fields without changing one-shot verdict semantics."""
+    return replace(
+        report,
+        mode="single",
+        chunks_total=1,
+        chunks_passed=1 if report.verdict == "pass" else 0,
+        chunks_unknown=1 if report.verdict == "unknown" else 0,
+    )
+
+
+def critique(
+    reply: str,
+    sources: list[Source],
+    user_query: str = "",
+    attempt: int = 0,
+    *,
+    shard_threshold: int = 1200,
+    max_chunks: int = 6,
+    chunk_evidence_chars: int = 6000,
+    progress_cb=None,
+    call_once=None,
+) -> CriticReport:
+    """Review short drafts once and long drafts in citation-scoped shards."""
+    from tg_bot.review_shards import (
+        aggregate_critic_reports,
+        preflight_shard_issues,
+        route_shard_sources,
+        should_shard_review,
+        split_review_text,
+    )
+
+    if not (reply or "").strip():
+        return _single_review_report(CriticReport(verdict="rewrite", issues=[]))
+
+    source_text_length = len(format_sources_for_writer(sources, max_body=2500))
+    review_once = call_once or _critique_once
+    if not should_shard_review(reply, source_text_length, shard_threshold):
+        return _single_review_report(
+            review_once(reply, sources, user_query=user_query, attempt=attempt)
+        )
+
+    shards = split_review_text(reply, threshold=shard_threshold, max_chunks=max_chunks)
+    if len(shards) <= 1 and len(reply or "") <= shard_threshold and source_text_length <= 8000:
+        return _single_review_report(
+            review_once(reply, sources, user_query=user_query, attempt=attempt)
+        )
+
+    total = len(shards)
+
+    def _notify(status: str, detail: str) -> None:
+        if not progress_cb:
+            return
+        try:
+            progress_cb("review_shard", status, detail)
+        except Exception as exc:
+            log.debug("review shard progress callback failed (non-fatal): %s", exc)
+
+    def _review_one_shard(shard) -> CriticReport:
+        routed_sources, routing_issues = route_shard_sources(
+            shard, sources, evidence_budget=chunk_evidence_chars,
+        )
+        preflight_issues = (*preflight_shard_issues(shard), *routing_issues)
+        if preflight_issues:
+            # Invalid citations or missing routed evidence are code-verified HARD
+            # failures; never ask the model to invent a judgement for that shard.
+            return CriticReport(verdict="patch", issues=list(preflight_issues))
+        return review_once(
+            shard.text,
+            routed_sources,
+            user_query=user_query,
+            attempt=attempt,
+            shard_label=f"{shard.index}/{total}",
+        )
+
+    # 每段核查互相独立（各自路由证据、各自一次模型调用），并发执行；
+    # 结果按段序合并，聚合结论与串行版本一致。进度回调按实际完成数上报。
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    _notify("start", f"0/{total}")
+    reports: list[CriticReport | None] = [None] * total
+    completed = 0
+    with ThreadPoolExecutor(
+        max_workers=min(4, total), thread_name_prefix="review-shard"
+    ) as pool:
+        futures = {pool.submit(_review_one_shard, shard): i for i, shard in enumerate(shards)}
+        for future in as_completed(futures):
+            reports[futures[future]] = future.result()
+            completed += 1
+            _notify("done", f"{completed}/{total}")
+
+    return aggregate_critic_reports([report for report in reports if report is not None])

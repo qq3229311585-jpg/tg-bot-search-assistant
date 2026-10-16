@@ -29,17 +29,17 @@ log = logging.getLogger(__name__)
 # 每个档位的字数区间 (min, max)
 _LENGTH_MAP = {
     "short":    (80,   200),
-    "medium":   (250,  500),
-    "long":     (600,  1200),
-    "detailed": (1200, 2500),
+    "medium":   (400,  800),
+    "long":     (800,  1600),
+    "detailed": (1500, 3000),
 }
 
 # 每个档位对应的 max_tokens
 _TOKEN_MAP = {
     "short":    1200,
-    "medium":   2500,
-    "long":     4500,
-    "detailed": 7000,
+    "medium":   3000,
+    "long":     5000,
+    "detailed": 8000,
 }
 
 _USER_LENGTH_RE = re.compile(
@@ -64,7 +64,7 @@ def _extract_length_constraint(user_query: str) -> tuple[int, int] | None:
     if _BRIEF_HINT_RE.search(q):
         return (30, 120)
     if _LONG_HINT_RE.search(q):
-        return (500, 1200)
+        return (800, 1600)
     return None
 
 
@@ -73,6 +73,7 @@ def curate(
     user_query: str,
     keywords: list[str],
     suggested_length: str = "",
+    suggested_words: int = 0,
     history_context: Optional[list[dict]] = None,
     max_sources: int = 8,
 ) -> WriteRequest:
@@ -84,8 +85,15 @@ def curate(
     # 1. 去重
     deduped = deduplicate(sources)
 
-    # 2. 过滤空页/导航页
-    valid = [s for s in deduped if not is_nav_or_empty(s.title, s.body)]
+    # 2. 过滤空页/导航页。direct:// 与 local:// 是本地工具的权威结果
+    # （天气/汇率/GitHub release/今日日报及其"尚未生成"状态回执），正文可以
+    # 很短，不适用"少于 200 字符即空页"的网页启发式，一律保留——否则
+    # "日报尚未生成"这类回执被过滤后，用户只会收到莫名其妙的"素材不足"。
+    valid = [
+        s for s in deduped
+        if str(s.url or "").startswith(("direct://", "local://"))
+        or not is_nav_or_empty(s.title, s.body)
+    ]
 
     # 3. 打分
     for s in valid:
@@ -104,6 +112,9 @@ def curate(
 
     if explicit_words:
         target_words = explicit_words
+    elif suggested_words:
+        # 消歧层按问题分量自估的自由字数：素材多少不改变目标，只决定写不写得出
+        target_words = (int(suggested_words * 0.85), int(suggested_words * 1.15))
     elif single_item:
         target_words = _LENGTH_MAP["short"]
     elif sl in _LENGTH_MAP:
@@ -148,5 +159,5 @@ def curate(
 def target_words_to_max_tokens(target_words: tuple[int, int]) -> int:
     """根据目标字数推算 max_tokens（中文 1 字 ≈ 1.5 token + thinking budget）。"""
     _, hi = target_words
-    # thinking budget 固定 500；1 中文字 ≈ 1.5 token；留 20% 余量
-    return min(max(int(hi * 1.8) + 500, 1500), 7000)
+    # thinking budget 固定 1200；1 中文字 ≈ 1.5 token；留 20% 余量
+    return min(max(int(hi * 1.8) + 1300, 1800), 8000)

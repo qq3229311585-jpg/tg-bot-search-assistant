@@ -74,19 +74,30 @@ _ds_verify_idx = 0
 DEEPSEEK_KEY        = DEEPSEEK_KEYS[0]
 DEEPSEEK_VERIFY_KEY = DEEPSEEK_VERIFY_KEYS[0]
 
+DEEPSEEK_API_BASE = (os.getenv("DEEPSEEK_API_BASE") or "https://api.deepseek.com").strip().rstrip("/")
+DEEPSEEK_MODEL = (os.getenv("DEEPSEEK_MODEL") or "deepseek-v4-flash").strip()
+# 角色级覆盖:不设置时用全局 DEEPSEEK_MODEL
+DEEPSEEK_MODEL_WRITER = (os.getenv("DEEPSEEK_MODEL_WRITER") or DEEPSEEK_MODEL).strip()
+DEEPSEEK_MODEL_VERIFY = (os.getenv("DEEPSEEK_MODEL_VERIFY") or DEEPSEEK_MODEL).strip()
+
+_ds_key_lock = threading.Lock()
+
+
 def _next_ds_key() -> str:
-    """写作 AI：轮换到下一个 key（遇到 rate limit 时调用）"""
+    """写作 AI：轮换到下一个 key（遇到 rate limit 时调用）；日报核查会并发调用，须加锁。"""
     global _ds_key_idx, DEEPSEEK_KEY
-    _ds_key_idx = (_ds_key_idx + 1) % len(DEEPSEEK_KEYS)
-    DEEPSEEK_KEY = DEEPSEEK_KEYS[_ds_key_idx]
-    return DEEPSEEK_KEY
+    with _ds_key_lock:
+        _ds_key_idx = (_ds_key_idx + 1) % len(DEEPSEEK_KEYS)
+        DEEPSEEK_KEY = DEEPSEEK_KEYS[_ds_key_idx]
+        return DEEPSEEK_KEY
 
 def _next_verify_key() -> str:
-    """核查 AI：轮换到下一个 key"""
+    """核查 AI：轮换到下一个 key；日报核查会并发调用，须加锁。"""
     global _ds_verify_idx, DEEPSEEK_VERIFY_KEY
-    _ds_verify_idx = (_ds_verify_idx + 1) % len(DEEPSEEK_VERIFY_KEYS)
-    DEEPSEEK_VERIFY_KEY = DEEPSEEK_VERIFY_KEYS[_ds_verify_idx]
-    return DEEPSEEK_VERIFY_KEY
+    with _ds_key_lock:
+        _ds_verify_idx = (_ds_verify_idx + 1) % len(DEEPSEEK_VERIFY_KEYS)
+        DEEPSEEK_VERIFY_KEY = DEEPSEEK_VERIFY_KEYS[_ds_verify_idx]
+        return DEEPSEEK_VERIFY_KEY
 
 BRAVE_KEY    = _require("BRAVE_KEY")
 TAVILY_KEYS  = _getenv_list("TAVILY_KEY_0", "TAVILY_KEY_1")
@@ -167,11 +178,42 @@ DAILY_REPORT_COOLDOWN_DAYS = _parse_int_env(
 DAILY_REPORT_ITEMS_PER_SECTION = _parse_int_env(
     "DAILY_REPORT_ITEMS_PER_SECTION", DAILY_REPORT_ITEMS_PER_CATEGORY, minimum=1, maximum=10
 )
+DAILY_REPORT_EVENT_COOLDOWN_EXPLICIT = (
+    "DAILY_REPORT_EVENT_COOLDOWN_DAYS" in os.environ
+    or "DAILY_REPORT_COOLDOWN_DAYS" in os.environ
+)
 DAILY_REPORT_EVENT_COOLDOWN_DAYS = _parse_int_env(
     "DAILY_REPORT_EVENT_COOLDOWN_DAYS", DAILY_REPORT_COOLDOWN_DAYS, minimum=1, maximum=60
 )
 DAILY_REPORT_MAX_WORKERS = _parse_int_env(
     "DAILY_REPORT_MAX_WORKERS", 4, minimum=1, maximum=8
+)
+DAILY_REPORT_EVENT_SECTION_TARGET = _parse_int_env(
+    "DAILY_REPORT_EVENT_SECTION_TARGET", 3, minimum=1, maximum=6
+)
+DAILY_REPORT_FOLLOWUP_QUERIES_PER_EVENT = _parse_int_env(
+    "DAILY_REPORT_FOLLOWUP_QUERIES_PER_EVENT", 2, minimum=1, maximum=3
+)
+DAILY_REPORT_FETCHES_PER_EVENT = _parse_int_env(
+    "DAILY_REPORT_FETCHES_PER_EVENT", 3, minimum=1, maximum=5
+)
+DAILY_REPORT_MIN_INDEPENDENT_SOURCES = _parse_int_env(
+    # 降到 1 只是放开"能不能开始核查"的证据收集门槛；真正决定能不能过关的
+    # 是 report_research.py 里的规则：单一信源必须是权威/官方域名才放行，
+    # 否则依旧要求至少两个独立域名互证。
+    "DAILY_REPORT_MIN_INDEPENDENT_SOURCES", 1, minimum=1, maximum=3
+)
+DAILY_REPORT_EVIDENCE_TOP_K = _parse_int_env(
+    "DAILY_REPORT_EVIDENCE_TOP_K", 3, minimum=1, maximum=6
+)
+DAILY_REPORT_MAX_EVIDENCE_CHARS = _parse_int_env(
+    "DAILY_REPORT_MAX_EVIDENCE_CHARS", 18000, minimum=4000, maximum=40000
+)
+DAILY_REPORT_SUMMARY_RETRIES = _parse_int_env(
+    "DAILY_REPORT_SUMMARY_RETRIES", 2, minimum=1, maximum=4
+)
+DAILY_REPORT_VERIFY_RETRIES = _parse_int_env(
+    "DAILY_REPORT_VERIFY_RETRIES", 1, minimum=1, maximum=3
 )
 DAILY_REPORT_PUSH = _env_bool("DAILY_REPORT_PUSH", False)
 DAILY_REPORT_MAX_STALE_HOURS = _parse_int_env(
@@ -179,12 +221,31 @@ DAILY_REPORT_MAX_STALE_HOURS = _parse_int_env(
 )
 FETCH_REMOTE_EXTRACT = _env_bool("FETCH_REMOTE_EXTRACT", False)
 DAILY_REPORT_NATIVE_SNAPSHOTS = _env_bool("DAILY_REPORT_NATIVE_SNAPSHOTS", True)
+
+# ── 聊天证据审计/分段核查（Codex 增设,勿删——core/contracts.py 依赖） ──
+CHAT_EVIDENCE_AUDIT = _env_bool("CHAT_EVIDENCE_AUDIT", True)
+CHAT_EVIDENCE_CORRECTIVE_ROUNDS = _parse_int_env(
+    "CHAT_EVIDENCE_CORRECTIVE_ROUNDS", 2, minimum=0, maximum=2
+)
+CHAT_EVIDENCE_MAX_REQUIREMENTS = _parse_int_env(
+    "CHAT_EVIDENCE_MAX_REQUIREMENTS", 5, minimum=1, maximum=5
+)
+CHAT_REVIEW_SHARD_THRESHOLD = _parse_int_env(
+    "CHAT_REVIEW_SHARD_THRESHOLD", 1200, minimum=800, maximum=4000
+)
+CHAT_REVIEW_MAX_CHUNKS = _parse_int_env(
+    "CHAT_REVIEW_MAX_CHUNKS", 6, minimum=2, maximum=8
+)
+CHAT_REVIEW_CHUNK_EVIDENCE_CHARS = _parse_int_env(
+    "CHAT_REVIEW_CHUNK_EVIDENCE_CHARS", 6000, minimum=2000, maximum=12000
+)
 DAILY_REPORT_TIMEZONE = os.getenv("DAILY_REPORT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
 try:
     ZoneInfo(DAILY_REPORT_TIMEZONE)
 except Exception as exc:
     raise RuntimeError(f"环境变量 DAILY_REPORT_TIMEZONE 不是有效时区：{DAILY_REPORT_TIMEZONE}") from exc
 THINKING_FILE = DATA_DIR + "/thinking.json"
+NOVELTY_LEDGER_FILE = DATA_DIR + "/novelty_ledger.json"
 TOOLLOG_FILE  = DATA_DIR + "/tool_log.json"
 CONTEXT_FILE  = DATA_DIR + "/context_summary.json"
 FOCUS_FILE    = DATA_DIR + "/dialog_focus.json"
@@ -252,7 +313,8 @@ WMO_ZH = {
     85:"阵雪",86:"强阵雪",95:"雷阵雨",96:"雷暴夹雹",99:"强雷暴夹雹"
 }
 
-_DIRECT_API_TOOLS = {"check_weather", "vps_traffic", "wikipedia_lookup", "github_trending"}
+from tg_bot.direct_api import DIRECT_API_TOOLS
+_DIRECT_API_TOOLS = DIRECT_API_TOOLS
 OFFSET_FILE = DATA_DIR + "/tg_offset.txt"
 _ctx = ssl.create_default_context()
 
@@ -290,7 +352,7 @@ def daily_report_health(now=None):
     report_status = str(status.get("status") or "unknown")
     if report_status in {"stale_previous", "invalid"}:
         return {"ok": False, "status": report_status, "errors": [f"日报状态为 {report_status}"]}
-    if report_status != "fresh":
+    if report_status not in {"fresh", "no_publishable_content"}:
         return {"ok": False, "status": "invalid", "errors": [f"日报状态未知：{report_status}"]}
     generated_at = status.get("generated_at")
     try:
@@ -308,6 +370,8 @@ def daily_report_health(now=None):
             "errors": [f"日报已超过 {DAILY_REPORT_MAX_STALE_HOURS} 小时未更新"],
         }
     warnings = []
+    if report_status == "no_publishable_content":
+        warnings.append("本次无可发布内容，沿用上一份成功日报")
     push = status.get("push")
     if isinstance(push, dict) and push.get("status") == "failed":
         warnings.append("日报已生成但 Telegram 推送失败")

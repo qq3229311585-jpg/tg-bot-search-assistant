@@ -46,9 +46,9 @@ def execute_wikipedia(query: str) -> str:
     return _impl(query)
 
 
-def execute_weather() -> str:
+def execute_weather(city: str = "") -> str:
     from tg_bot.tools.native import execute_weather as _impl
-    return _impl()
+    return _impl(city=city)
 
 
 def execute_vps_traffic() -> str:
@@ -64,6 +64,67 @@ def execute_github_trending(language: str = "") -> str:
 def execute_api_balance() -> str:
     from tg_bot.tools.native import execute_api_balance as _impl
     return _impl()
+
+
+def execute_exchange_rate(base: str = "USD", target: str = "CNY", amount=0) -> str:
+    from tg_bot.tools.native import execute_exchange_rate as _impl
+    return _impl(base=base, target=target, amount=amount)
+
+
+def execute_stock_quote(query: str = "") -> str:
+    from tg_bot.tools.native import execute_stock_quote as _impl
+    return _impl(query=query)
+
+
+def execute_world_time(place: str = "") -> str:
+    from tg_bot.tools.native import execute_world_time as _impl
+    return _impl(place=place)
+
+
+def execute_steam_specials() -> str:
+    from tg_bot.tools.native import execute_steam_specials as _impl
+    return _impl() or "Steam 特惠列表暂时无法获取。"
+
+
+def execute_hn_front_page() -> str:
+    from tg_bot.tools.native import execute_hn_front_page as _impl
+    return _impl()
+
+
+def execute_chinese_holiday(date_str: str = "") -> str:
+    from tg_bot.tools.native import execute_chinese_holiday as _impl
+    return _impl(date_str=date_str)
+
+
+def execute_github_release(repo: str = "") -> str:
+    from tg_bot.tools.native import execute_github_release as _impl
+    return _impl(repo=repo)
+
+
+def execute_epic_free_games() -> str:
+    from tg_bot.tools.native import execute_epic_free_games as _impl
+    return _impl()
+
+
+def execute_cn_hot_topics(platform: str = "all") -> str:
+    from tg_bot.tools.native import execute_cn_hot_topics as _impl
+    return _impl(platform=platform)
+
+
+def execute_earthquake_recent(min_magnitude=5.0, limit=5) -> str:
+    from tg_bot.tools.native import execute_earthquake_recent as _impl
+    return _impl(min_magnitude=min_magnitude, limit=limit)
+
+
+def execute_x_trends() -> str:
+    from tg_bot.tools.native import execute_x_trends as _impl
+    return _impl()
+
+
+def execute_proxy_releases(days: int = 30) -> str:
+    from tg_bot.tools.native import execute_proxy_releases as _impl
+    # 窗口内没有新版本时放宽到全部历史，聊天场景要的是"最新版本是什么"
+    return _impl(days=days) or _impl(days=3650) or "代理内核版本信息暂时无法获取。"
 
 
 def execute_calendar_query(days: int = 7, calendar_names=None) -> str:
@@ -203,13 +264,48 @@ def execute_gather_tool(fn: str, args: dict, ctx: GatherExecContext) -> str:
     if fn == "wikipedia_lookup":
         return _execute_wikipedia(args, ctx)
     if fn == "check_weather":
-        return execute_weather()
+        return execute_weather(city=str(args.get("city") or ""))
     if fn == "vps_traffic":
         return execute_vps_traffic()
     if fn == "github_trending":
         return execute_github_trending(language=args.get("language", ""))
     if fn == "check_api_balance":
         return execute_api_balance()
+    if fn == "exchange_rate":
+        return execute_exchange_rate(
+            base=str(args.get("base") or "USD"),
+            target=str(args.get("target") or "CNY"),
+            amount=args.get("amount") or 0,
+        )
+    if fn == "stock_quote":
+        return execute_stock_quote(query=str(args.get("query") or ""))
+    if fn == "world_time":
+        return execute_world_time(place=str(args.get("place") or ""))
+    if fn == "steam_specials":
+        return execute_steam_specials()
+    if fn == "hn_front_page":
+        return execute_hn_front_page()
+    if fn == "chinese_holiday":
+        return execute_chinese_holiday(date_str=str(args.get("date") or ""))
+    if fn == "github_release":
+        return execute_github_release(repo=str(args.get("repo") or ""))
+    if fn == "epic_free_games":
+        return execute_epic_free_games()
+    if fn == "cn_hot_topics":
+        return execute_cn_hot_topics(platform=str(args.get("platform") or "all"))
+    if fn == "earthquake_recent":
+        return execute_earthquake_recent(
+            min_magnitude=args.get("min_magnitude") or 5.0,
+            limit=args.get("limit") or 5,
+        )
+    if fn == "x_trends":
+        return execute_x_trends()
+    if fn == "proxy_releases":
+        try:
+            days = int(args.get("days") or 30)
+        except (TypeError, ValueError):
+            days = 30
+        return execute_proxy_releases(days=days)
     if fn == "calendar_query":
         return execute_calendar_query(
             days=int(args.get("days", 7)),

@@ -261,17 +261,40 @@ def deduplicate(sources: list[Source]) -> list[Source]:
     return result
 
 
-def format_sources_for_writer(sources: list[Source], max_body: int = 2500) -> str:
-    """把编号 sources 格式化为 Writer 使用的 [来源N] 素材文本。"""
+def format_sources_for_writer(
+    sources: list[Source], max_body: int = 2500, total_budget: int = 20000,
+) -> str:
+    """把编号 sources 格式化为 Writer 使用的 [来源N] 素材文本。
+
+    按排序分配总正文预算，同时尊重分段核查传回的 citation_label。
+    """
     lines = []
+    remaining = max(int(total_budget), 0)
     for i, s in enumerate(sources, 1):
         title = (s.title or s.domain or "")[:80]
         domain = (s.domain or s.tool or "")[:40]
-        body = s.body.replace("\n", " ").strip()[:max_body]
+        body = s.body.replace("\n", " ").strip()
         if not body:
             continue
-        lines.append(f"[来源{i}] {title}（{domain}）")
-        lines.append(body)
+        if i == 1:
+            cap = int(max_body * 1.6)
+        elif i <= 3:
+            cap = int(max_body * 1.2)
+        else:
+            cap = max_body
+        cap = min(cap, remaining)
+        label = s.citation_label or str(i)
+        lines.append(f"[来源{label}] {title}（{domain}）")
+        if cap < 400:
+            brief = body[:150]
+            if len(body) > 150:
+                brief += "……（素材预算已满，正文略）"
+            lines.append(brief)
+            remaining = max(remaining - len(brief), 0)
+        else:
+            body = body[:cap]
+            lines.append(body)
+            remaining -= len(body)
         lines.append("")
     return "\n".join(lines)
 

@@ -185,6 +185,13 @@ DAILY_REPORT_NATIVE_SNAPSHOTS=true
 DAILY_REPORT_ITEMS_PER_CATEGORY=4
 DAILY_REPORT_COOLDOWN_DAYS=14
 DAILY_REPORT_MAX_WORKERS=4
+DAILY_REPORT_FOLLOWUP_QUERIES_PER_EVENT=2
+DAILY_REPORT_FETCHES_PER_EVENT=3
+DAILY_REPORT_MIN_INDEPENDENT_SOURCES=2
+DAILY_REPORT_EVIDENCE_TOP_K=3
+DAILY_REPORT_MAX_EVIDENCE_CHARS=18000
+DAILY_REPORT_SUMMARY_RETRIES=2
+DAILY_REPORT_VERIFY_RETRIES=1
 DAILY_REPORT_PUSH=false          # 默认只生成文件；开启后内容变化才推送 ALLOWED_CHAT
 DAILY_REPORT_MAX_STALE_HOURS=30  # /readyz 日报新鲜度窗口
 FETCH_REMOTE_EXTRACT=false       # 默认本地抓取；需时才显式启用 Tavily/12ft 远端提取
@@ -193,9 +200,9 @@ DAILY_REPORT_STATE_FILE=/var/lib/morning-report/daily_report_state.json
 DAILY_REPORT_STATUS_FILE=/var/lib/morning-report/daily_report_status.json
 ```
 
-日报按注册表保留天气、汇率、行情、中国/全球/AI、代理工具、Hacker News、GitHub、Steam 优惠和冷知识等板块。天气/汇率/行情属于每天刷新的快照；其余事件板块各自按事件指纹和 14 天冷却轮换，因此相近板块可以出现同一事件，但同一板块不会每天重复。事件优先按新鲜度、独立来源覆盖、权威性和相关性排序；没有真实互动字段时只显示“多源关注”，不会把搜索排名冒充为全网热度。若事件候选存在但都在冷却期，板块会保留并明确标记已跳过重复；如果专用采集器暂不可用，则兼容保留旧 `today_report.txt` 板块。所有供应商失败时保留旧日报，并在 `daily_report_status.json` 写入 `stale_previous`。
+日报聚合 Brave、Tavily、Serper 的全部可用结果。每个入围事件默认执行 2 次后续检索、最多抓取 3 篇正文，只有引用至少 2 个独立域名且通过独立核查的摘要才会发布；失败事件单独丢弃，绝不回退到标题加搜索摘要。正文以 Telegram 安全 HTML 输出，标题加粗并显示可折叠来源。空板块完全隐藏，主事件板块不足时才用安全、开源、科学、产品等候补板块补位；没有当前证据的冷知识不会生成。聊天、记忆和普通搜索链保持不变。
 
-日报定时任务默认只写入 `today_report.txt`、JSON 和状态文件，不会因为重跑而重复发消息。需要 Telegram 推送时设置 `DAILY_REPORT_PUSH=true` 或手动执行 `build-daily-report.py --push`；状态文件记录 `content_sha256` 和 `push.status`，相同内容会标记为 `skipped_unchanged`。候选采集使用最多 4 个并发工作线程，并保持板块/诊断顺序稳定；`DAILY_REPORT_MAX_WORKERS` 可在 1–8 之间调整。
+日报定时任务默认只生成预览和 JSON，不把事件记为“已发布”。需要 Telegram 推送时设置 `DAILY_REPORT_PUSH=true` 或使用 `--push`；只有 HTML 全部分块发送成功后才提交冷却状态。推送失败返回退出码 1、状态标记 `failed`，但保留事件供下次重试；全无可发布内容时保留上一份成功日报。相同已发送内容继续标记 `skipped_unchanged`。
 
 旧部署若只配置 `DAILY_REPORT_CATEGORIES` 仍可继续运行；要启用全部板块和 Steam/代理等新事件搜索，请迁移到 `DAILY_REPORT_SECTIONS`。
 

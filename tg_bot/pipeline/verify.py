@@ -171,11 +171,15 @@ def verify_reply(reply, fact_list, user_text="", attempt=0, source_index=None,
             checks = []
         parsed_checks = []
         flagged_lines = []
+        # 提示词让模型输出 OK/WRONG/MISSING，历史解析只认 SOFT/HARD 导致全部
+        # 检查项被丢弃、核查永远放行。两套枚举都接受：WRONG/MISSING 属于
+        # 事实性问题，映射为 HARD（下游 Writer 按 [HARD] 删除或替换）。
+        _status_map = {"WRONG": "HARD", "MISSING": "HARD", "SOFT": "SOFT", "HARD": "HARD"}
         for c in checks:
             if not isinstance(c, dict):
                 continue
-            status = str(c.get("status", "")).upper()
-            if status not in ("SOFT", "HARD"):
+            status = _status_map.get(str(c.get("status", "")).upper(), "")
+            if not status:
                 continue
             sentence = str(c.get("sentence", "")).strip()
             fact_id = c.get("fact_id")
@@ -204,8 +208,8 @@ def verify_reply(reply, fact_list, user_text="", attempt=0, source_index=None,
 
     def _call_verifier(timeout=60):
         return http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL_VERIFY,
              "messages": [
                  {"role": "system", "content": _SYS_VERIFIER},
                  {"role": "user",   "content": user_msg},
@@ -265,8 +269,8 @@ def patch_by_verifier(reply, exec_report, audit_report, user_text=""):
     )
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL_VERIFY,
              "messages": [
                  {"role": "system", "content": sys_prompt},
                  {"role": "user",   "content": user_msg},
@@ -323,8 +327,8 @@ def regenerate_reply(messages, system, exec_report, rejected_reply, audit_report
     msgs = [{"role": "system", "content": system}] + retry_msgs
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL_VERIFY,
              "messages": msgs,
              "max_tokens": 3000,
              "temperature": 0.5,

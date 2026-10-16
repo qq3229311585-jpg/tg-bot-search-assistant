@@ -14,7 +14,8 @@ def _load_features_brief():
     """从 features.md 提取功能名（· 开头行），拼成一行供 disambig 注入"""
     try:
         import os
-        path = "/var/lib/morning-report/features.md"
+        from tg_bot.config import DATA_DIR
+        path = os.path.join(DATA_DIR, "features.md")
         lines = open(path, encoding="utf-8").readlines()
         names = []
         for ln in lines:
@@ -27,6 +28,15 @@ def _load_features_brief():
         return "、".join(names) if names else ""
     except Exception:
         return ""
+
+
+def _safe_words(value):
+    """消歧 AI 自估的回答字数：限定在合理区间，非法值归零（表示未提供）。"""
+    try:
+        words = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    return words if 40 <= words <= 3000 else 0
 
 
 def _pre_check(text, ctx=None, focus=None):
@@ -147,8 +157,8 @@ def _pre_check(text, ctx=None, focus=None):
 
     try:
         resp = http_post(
-            "https://api.deepseek.com/chat/completions",
-            {"model": "deepseek-v4-flash",
+            f"{_cfg.DEEPSEEK_API_BASE}/chat/completions",
+            {"model": _cfg.DEEPSEEK_MODEL,
              "messages": [
                  {"role": "system", "content": _SYS_DISAMBIG + _features_note + f"\n\n【当前日期】今天是 {datetime.now(timezone(timedelta(hours=8))).strftime('%Y年%m月%d日')}，提取关键词时如需年份请用此日期。"},
                  {"role": "user",   "content": user_content}
@@ -178,6 +188,8 @@ def _pre_check(text, ctx=None, focus=None):
             "local_tool_hint":   str(data.get("local_tool_hint", "")),
             "topic_continuity":  str(data.get("topic_continuity", "none")),
             "user_intent":      str(data.get("user_intent", "")),
+            "suggested_length": str(data.get("suggested_length", "")).strip().lower(),
+            "suggested_words":  _safe_words(data.get("suggested_words")),
             "confidence":       float(data.get("confidence", 0.0) or 0.0),
             "reason":           str(data.get("reason", "")),
             "clarify_question": str(data.get("clarify_question", "")),

@@ -4,7 +4,7 @@
 import logging
 
 from tg_bot.bot_utils import send
-from tg_bot.storage import load_quota, save_quota, fmt_quota
+from tg_bot.storage import load_quota, save_quota, fmt_quota, _quota_lock, _quota_file_lock
 from tg_bot.tools.native import execute_api_balance
 
 log = logging.getLogger(__name__)
@@ -56,10 +56,12 @@ def handle_quota_set(chat_id, text):
             pct = int(parts_qs[2])
             if not 1 <= pct <= 99:
                 raise ValueError("范围 1-99")
-            d = load_quota()
-            d["warn_pct"] = pct
-            d["warned"]   = {}
-            save_quota(d)
+            # 与 storage.inc_quota 用同一把锁，避免和后台配额自增互相覆盖
+            with _quota_lock, _quota_file_lock():
+                d = load_quota()
+                d["warn_pct"] = pct
+                d["warned"]   = {}
+                save_quota(d)
             send(chat_id, f"✅ 配额预警阈值已设为 {pct}%")
         except Exception as e:
             send(chat_id, f"用法：/quota set 70（预警阈值，1-99）\n{e}")

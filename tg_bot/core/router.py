@@ -28,6 +28,18 @@ _DIRECT_TOOL_MAP = {
     "check_api_balance": "tool",
     "calendar_query": "tool",
     "calendar_add": "tool",
+    "exchange_rate": "tool",
+    "stock_quote": "tool",
+    "world_time": "tool",
+    "steam_specials": "tool",
+    "hn_front_page": "tool",
+    "proxy_releases": "tool",
+    "chinese_holiday": "tool",
+    "github_release": "tool",
+    "epic_free_games": "tool",
+    "cn_hot_topics": "tool",
+    "earthquake_recent": "tool",
+    "x_trends": "tool",
 }
 
 _HISTORY_TOOLS = {"read_daily_log", "search_daily_summaries", "read_daily_summary", "search_chat_history"}
