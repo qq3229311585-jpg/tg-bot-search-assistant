@@ -300,23 +300,37 @@ def corroborate(claims, quotes, sources):
 
 
 def _rejected_lines(rejected, quotes, sources):
-    """未通过项的文字行;若带 quote_ids,附上所引来源网址,方便复查。"""
+    """未通过项的文字行(来源只写编号);返回 (行列表, 涉及的 sid 列表)。"""
     qid_to_sid = {qu.get("qid"): qu.get("sid") for qu in quotes}
-    out = []
+    out, used = [], []
     for item in rejected:
-        urls = []
+        sids = []
         for qid in item.get("quote_ids") or []:
-            url = sources.get(qid_to_sid.get(qid), {}).get("url")
-            if url and url not in urls:
-                urls.append(url)
-        tail = f" (来源: {'; '.join(urls)})" if urls else ""
+            sid = qid_to_sid.get(qid)
+            if sid and sid in sources and sid not in sids:
+                sids.append(sid)
+        for sid in sids:
+            if sid not in used:
+                used.append(sid)
+        tail = f" (来源: {'; '.join('[' + sid + ']' for sid in sids)})" if sids else ""
         out.append(f"- {item.get('text')}: {item.get('reason')}{tail}")
-    return out
+    return out, used
+
+
+def _source_lines(used, sources):
+    """来源列表:每个来源只列一次(标题 | 网站 | 日期 | 网址)。"""
+    lines = ["## 来源"]
+    for sid in used:
+        src = sources.get(sid, {})
+        lines.append(f"- [{sid}] {src.get('title', '')} | {src.get('site', '')} | "
+                     f"{src.get('date') or '未知'} | {src.get('url', '')}")
+    lines.append("")
+    return lines
 
 
 def render_markdown(q, time_range, generated_at_iso, queries, accepted, quotes,
                     sources, conflicts, rejected):
-    """把核查结果渲染为 Markdown 报告文本。"""
+    """把核查结果渲染为 Markdown 报告文本;来源信息只在末尾“来源”一节列一次。"""
     lines = [
         f"# 查询: {q}",
         f"时间范围: {time_range} | 生成: {generated_at_iso} | 变体: {'; '.join(queries)}",
@@ -324,30 +338,32 @@ def render_markdown(q, time_range, generated_at_iso, queries, accepted, quotes,
     ]
     if not accepted and not conflicts:
         lines.append("## 没有找到")
-        lines.extend(_rejected_lines(rejected, quotes, sources))
+        rej_lines, used = _rejected_lines(rejected, quotes, sources)
+        lines.extend(rej_lines)
         if not rejected:
             lines.append("- 未找到可互证的结论")
-        return "\n".join(lines) + "\n"
+        if used:
+            lines.append("")
+            lines.extend(_source_lines(used, sources))
+        return "\n".join(lines).rstrip("\n") + "\n"
 
     qid_map = {qu["qid"]: qu for qu in quotes}
+    used = []
+
+    def mark(sid):
+        if sid and sid not in used:
+            used.append(sid)
+
     lines.append("## 结论")
     if not accepted:
         lines.append("- 无通过核查的结论")
     for idx, claim in enumerate(accepted, 1):
         lines.append(f"### C{idx} {claim['text']}")
         lines.append(f"可信度: {claim['credibility']}")
-        seen_sids = []
         for qid in claim["quote_ids"]:
             sid = qid_map[qid]["sid"]
-            if sid not in seen_sids:
-                seen_sids.append(sid)
-        for sid in seen_sids:
-            src = sources.get(sid, {})
-            lines.append(f"- [{sid}] {src.get('title', '')} | {src.get('site', '')} | "
-                         f"{src.get('date') or '未知'} | {src.get('url', '')}")
-            for qid in claim["quote_ids"]:
-                if qid_map[qid]["sid"] == sid:
-                    lines.append(f'  > "{qid_map[qid]["quote"]}"')
+            mark(sid)
+            lines.append(f'- [{sid}] "{qid_map[qid]["quote"]}"')
         lines.append("")
 
     if conflicts:
@@ -356,14 +372,20 @@ def render_markdown(q, time_range, generated_at_iso, queries, accepted, quotes,
             lines.append(f"- {conflict.get('point')}:")
             for pos in conflict.get("positions", []):
                 sid = pos.get("sid")
-                url = sources.get(sid, {}).get("url", "")
-                lines.append(f'  - [{sid}] "{pos.get("quote")}" | {url}')
+                mark(sid)
+                lines.append(f'  - [{sid}] "{pos.get("quote")}"')
         lines.append("")
 
     if rejected:
         lines.append("## 没有找到 / 未通过核查")
-        lines.extend(_rejected_lines(rejected, quotes, sources))
+        rej_lines, rej_used = _rejected_lines(rejected, quotes, sources)
+        lines.extend(rej_lines)
+        for sid in rej_used:
+            mark(sid)
         lines.append("")
+
+    if used:
+        lines.extend(_source_lines(used, sources))
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
