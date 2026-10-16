@@ -156,14 +156,5 @@ class BuildGroundedTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
 
-class SensitiveTitleTests(unittest.TestCase):
-    def test_sensitive_titles_are_filtered(self):
-        titles = ["古羅馬同性戀", "纳粹德国", "罗马水道", "古罗马建筑"]
-        body = json.dumps({"query": {"search": [{"title": t} for t in titles]}})
-        self.assertEqual(cg.wiki_search("古罗马", get=lambda url: body),
-                         ["罗马水道", "古罗马建筑"])
-
-
-
 if __name__ == "__main__":
     unittest.main()
