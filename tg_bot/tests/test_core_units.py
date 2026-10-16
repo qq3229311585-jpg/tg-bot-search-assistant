@@ -2354,6 +2354,67 @@ class ReportResearchTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class SiteKeyTests(unittest.TestCase):
+    def setUp(self):
+        self.research = importlib.import_module("tg_bot.report_research")
+
+    def test_sina_variants_same(self):
+        for domain in ("k.sina.cn", "k.sina.com.cn", "finance.sina.com.cn", "www.sina.cn"):
+            with self.subTest(domain=domain):
+                self.assertEqual(self.research.site_key(domain), "sina.com.cn")
+
+    def test_21jingji(self):
+        self.assertEqual(
+            self.research.site_key("m.21jingji.com"),
+            self.research.site_key("21jingji.com"),
+        )
+
+    def test_distinct(self):
+        self.assertNotEqual(
+            self.research.site_key("reuters.com"), self.research.site_key("bbc.com"),
+        )
+        self.assertEqual(self.research.site_key("news.bbc.co.uk"), "bbc.co.uk")
+
+    def test_parse_summary_rejects_same_site(self):
+        base = importlib.import_module("tg_bot.report_research")
+        bundle = base.EvidenceBundle(
+            "event-1", "global", "Seed", (
+                base.EvidenceSource(
+                    "S1", "brave", "q1", "Source one", "https://k.sina.cn/a",
+                    "k.sina.cn", "2026-07-17T05:00:00+00:00", "snippet one",
+                    "full facts one", "ok",
+                ),
+                base.EvidenceSource(
+                    "S2", "serper", "q2", "Source two", "https://k.sina.com.cn/b",
+                    "k.sina.com.cn", "2026-07-17T05:10:00+00:00", "snippet two",
+                    "full facts two", "ok",
+                ),
+            ),
+        )
+        raw = {
+            "id": "event-1", "title": "事实标题", "summary": "事实摘要",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+        }
+        self.assertIsNone(self.research.parse_summary(bundle, raw))
+
+    def test_authority_raw_kept(self):
+        base = importlib.import_module("tg_bot.report_research")
+        bundle = base.EvidenceBundle(
+            "event-1", "global", "Seed", (
+                base.EvidenceSource(
+                    "S1", "brave", "q1", "Source one", "https://reuters.com/a",
+                    "reuters.com", "2026-07-17T05:00:00+00:00", "snippet one",
+                    "full facts one", "ok",
+                ),
+            ),
+        )
+        raw = {
+            "id": "event-1", "title": "事实标题", "summary": "事实摘要",
+            "supporting_source_ids": ["S1"], "conflicts": [], "drop": False,
+        }
+        self.assertIsInstance(self.research.parse_summary(bundle, raw), self.research.VerifiedSummary)
+
+
 class DailyReportTests(unittest.TestCase):
     def setUp(self):
         self.daily = importlib.import_module("tg_bot.daily_report")

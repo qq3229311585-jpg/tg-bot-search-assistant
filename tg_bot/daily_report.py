@@ -11,6 +11,7 @@ from typing import Iterable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+from tg_bot.report_research import site_key
 
 _TRACKING_KEYS = {"gclid", "fbclid", "ref", "source", "from"}
 _STOPWORDS = {
@@ -282,7 +283,7 @@ def cluster_candidates(candidates: Iterable[NewsCandidate]) -> list[ReportEvent]
         unique_sources: list[NewsCandidate] = []
         seen_domains: set[str] = set()
         for item in group:
-            key = item.domain or _domain_from_url(item.url) or item.url
+            key = site_key(item.domain or _domain_from_url(item.url)) or item.url
             if key in seen_domains:
                 continue
             seen_domains.add(key)
@@ -335,7 +336,7 @@ def _authority_score(event: ReportEvent) -> tuple[float, str]:
     domains = {item.domain or _domain_from_url(item.url) for item in event.sources}
     if any(domain.endswith((".gov", ".gov.cn", ".edu")) or domain in _AUTHORITY_DOMAINS for domain in domains):
         return 100.0, "权威来源"
-    if len(domains) >= 2:
+    if len({site_key(domain) for domain in domains}) >= 2:
         return 70.0, "多源交叉"
     return 45.0, "普通来源"
 
@@ -343,20 +344,21 @@ def _authority_score(event: ReportEvent) -> tuple[float, str]:
 def score_event(event: ReportEvent, now: datetime) -> tuple[float, tuple[str, ...]]:
     freshness, freshness_label = _freshness_score(event, now)
     domains = {item.domain or _domain_from_url(item.url) for item in event.sources if item.domain or item.url}
-    coverage = min(5, len(domains)) / 5 * 100
+    sites = {site_key(domain) for domain in domains}
+    coverage = min(5, len(sites)) / 5 * 100
     authority, authority_label = _authority_score(event)
     relevance_values = [item.relevance for item in event.sources if item.relevance > 0]
     relevance = (sum(relevance_values) / len(relevance_values) * 100) if relevance_values else 50.0
     explicit_values = [item.explicit_heat for item in event.sources if item.explicit_heat is not None]
     parts = [(freshness, 0.35), (coverage, 0.25), (authority, 0.15), (relevance, 0.15)]
-    basis = [freshness_label, f"{len(domains)} 个独立来源", authority_label]
+    basis = [freshness_label, f"{len(sites)} 个独立来源", authority_label]
     if explicit_values:
         explicit = sum(explicit_values) / len(explicit_values)
         parts.append((explicit, 0.10))
         basis.append("显式热度")
         total_weight = 1.0
     else:
-        basis.append("多源关注" if len(domains) >= 2 else "未提供显式热度")
+        basis.append("多源关注" if len(sites) >= 2 else "未提供显式热度")
         total_weight = 0.9
     score = round(sum(value * weight for value, weight in parts) / total_weight, 2)
     return score, tuple(basis)
@@ -471,7 +473,7 @@ def select_events(
         for event in sorted(buckets[category], key=lambda item: (-item.heat_score, item.event_id)):
             if count >= max(0, int(per_category)):
                 break
-            domains = {item.domain for item in event.sources if item.domain}
+            domains = {site_key(item.domain) for item in event.sources if item.domain}
             if any(domain_counts.get(domain, 0) >= 2 for domain in domains):
                 continue
             selected.append(event)

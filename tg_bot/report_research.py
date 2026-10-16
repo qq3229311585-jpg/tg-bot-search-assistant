@@ -31,6 +31,36 @@ def _is_authority_domain(domain: str) -> bool:
         or domain in _AUTHORITY_DOMAINS
         or any(domain.endswith(f".{suffix}") for suffix in _AUTHORITY_DOMAINS)
     )
+
+
+_SITE_PREFIXES = ("www.", "m.", "k.", "mobile.", "wap.", "3g.")
+_MULTI_PART_SUFFIXES = (
+    ".com.cn", ".net.cn", ".org.cn", ".gov.cn", ".com.tw", ".com.hk",
+    ".com.sg", ".co.uk", ".co.jp",
+)
+_SITE_ALIASES = {"sina.cn": "sina.com.cn", "sina.com": "sina.com.cn"}
+
+
+def site_key(domain: str) -> str:
+    """Collapse subdomains and aliases of one website to a single site key."""
+    host = (domain or "").strip().lower().split(":", 1)[0]
+    if not host:
+        return ""
+    stripped = True
+    while stripped:
+        stripped = False
+        for prefix in _SITE_PREFIXES:
+            if host.startswith(prefix) and len(host) > len(prefix):
+                host = host[len(prefix):]
+                stripped = True
+    parts = host.split(".")
+    if host.endswith(_MULTI_PART_SUFFIXES):
+        main = ".".join(parts[-3:])
+    else:
+        main = ".".join(parts[-2:])
+    return _SITE_ALIASES.get(main, main)
+
+
 _TRADITIONAL_ONLY_CHARS = frozenset(
     "擬級對軍動慮奪島據員傾擴選項襲轟鎬隧設終決變開討視壓談輸願"
     "發後裡這個為與從時會來還過應將於國門間實體現點數處學業產萬億"
@@ -286,10 +316,10 @@ def deepen_event(
     seen_urls: set[str] = set()
     seen_domains: set[str] = set()
     for candidate in candidates:
-        if candidate.url in seen_urls or candidate.domain in seen_domains:
+        if candidate.url in seen_urls or site_key(candidate.domain) in seen_domains:
             continue
         seen_urls.add(candidate.url)
-        seen_domains.add(candidate.domain)
+        seen_domains.add(site_key(candidate.domain))
         distinct.append(candidate)
 
     usable: list[EvidenceSource] = []
@@ -407,8 +437,9 @@ def parse_summary(bundle: EvidenceBundle, raw: object) -> VerifiedSummary | Drop
     if any(source_id not in sources_by_id for source_id in source_ids):
         return None
     cited_domains = {sources_by_id[source_id].domain for source_id in source_ids}
-    # 至少两个独立域名互证；单一信源时，只有权威/官方域名才放行。
-    if len(cited_domains) < 2 and not any(_is_authority_domain(domain) for domain in cited_domains):
+    cited_sites = {site_key(domain) for domain in cited_domains}
+    # 至少两个独立站点互证（同站不同域名不算）；单一信源时，只有权威/官方域名才放行。
+    if len(cited_sites) < 2 and not any(_is_authority_domain(domain) for domain in cited_domains):
         return None
     if conflicts and not re.search(r"分歧|不一致|冲突|来源说法不同|不同", summary):
         return None
