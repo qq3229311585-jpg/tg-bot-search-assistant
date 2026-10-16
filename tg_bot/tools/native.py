@@ -82,7 +82,7 @@ def execute_weather(city=""):
             f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
             f"weather_code,precipitation,wind_speed_10m"
             f"&hourly=temperature_2m,precipitation_probability,weather_code"
-            f"&daily=temperature_2m_max,temperature_2m_min,"
+            f"&daily=weather_code,temperature_2m_max,temperature_2m_min,"
             f"precipitation_probability_max,uv_index_max"
             f"&timezone=Asia%2FShanghai&forecast_days=3"
         )
@@ -245,9 +245,9 @@ def execute_github_trending(language="", since="daily"):
             return "GitHub 热榜暂时无法获取（页面结构已变）"
         # /sponsors/xxx、/login 等站内链接会被宽泛的 href 正则误当仓库名抓走
         _non_repo_prefixes = {"sponsors", "login", "signup", "topics", "trending", "features", "site", "about"}
-        lines = [f"📦 GitHub 今日热榜（Top {min(8, len(articles))}）"]
+        lines = [f"📦 GitHub 今日热榜（Top {min(5, len(articles))}）"]
         count = 0
-        for art in articles[:8]:
+        for art in articles[:5]:
             name = ""
             for candidate in re.findall(r'href="/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"', art):
                 if candidate.split("/")[0].lower() not in _non_repo_prefixes:

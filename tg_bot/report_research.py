@@ -96,6 +96,11 @@ class VerifiedSummary:
 
 
 @dataclass(frozen=True)
+class DroppedSummary:
+    event_id: str
+
+
+@dataclass(frozen=True)
 class _Candidate:
     provider: str
     query: str
@@ -348,15 +353,26 @@ def summary_payload(bundle: EvidenceBundle) -> dict[str, object]:
     }
 
 
-def parse_summary(bundle: EvidenceBundle, raw: object) -> VerifiedSummary | None:
+def parse_summary(bundle: EvidenceBundle, raw: object) -> VerifiedSummary | DroppedSummary | None:
     """Parse the exact summary JSON contract, rejecting every ambiguity."""
     allowed = {
         "id", "title", "summary", "supporting_source_ids", "conflicts", "drop",
     }
     if not isinstance(raw, Mapping) or set(raw) != allowed:
         return None
-    if raw.get("id") != bundle.event_id or raw.get("drop") is not False:
+    if raw.get("id") != bundle.event_id:
         return None
+    drop = raw.get("drop")
+    if not isinstance(drop, bool):
+        return None
+    if drop is True:
+        drop_title = raw.get("title")
+        drop_summary = raw.get("summary")
+        if not isinstance(drop_title, str) or not drop_title.strip():
+            return None
+        if not isinstance(drop_summary, str) or not drop_summary.strip():
+            return None
+        return DroppedSummary(bundle.event_id)
     title = raw.get("title")
     summary = raw.get("summary")
     source_ids = raw.get("supporting_source_ids")
@@ -415,7 +431,7 @@ def summarize_bundle(
     bundle: EvidenceBundle,
     call: Callable[[dict[str, object]], object],
     retries: int = 2,
-) -> VerifiedSummary | None:
+) -> VerifiedSummary | DroppedSummary | None:
     """Call the summarizer at most ``retries`` total times and parse strictly."""
     attempts = _retry_count(retries)
     payload = summary_payload(bundle)

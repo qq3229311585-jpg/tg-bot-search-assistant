@@ -189,7 +189,7 @@ def research_selected_events(
     这是日报生成里最大的串行耗时；结果与诊断按原板块/热度顺序合并，
     输出与串行版本完全一致。
     """
-    from tg_bot.report_research import deepen_event, summarize_bundle, verify_summary
+    from tg_bot.report_research import DroppedSummary, deepen_event, summarize_bundle, verify_summary
 
     notes = diagnostics if diagnostics is not None else []
     lane_order = list(dict.fromkeys(event.category for event in eligible_selected))
@@ -212,6 +212,8 @@ def research_selected_events(
         if bundle is None:
             return None, f"{prefix}:evidence_insufficient"
         summary = summarize_bundle(bundle, summary_call, retries=summary_retries)
+        if isinstance(summary, DroppedSummary):
+            return None, f"{prefix}:dropped"
         if summary is None:
             return None, f"{prefix}:summary_failed"
         if not verify_summary(bundle, summary, verify_call, retries=verify_retries):
@@ -321,7 +323,7 @@ id、title、summary、supporting_source_ids、conflicts、drop。
 id 原样返回；title 必须非空且不超过24个汉字（含标点，超出会被直接拒绝，请务必精简）；
 summary 必须非空；supporting_source_ids 至少引用两个独立域名，
 除非唯一可用来源是官方/权威域名（如政府网站、官方 GitHub、路透/美联社等通讯社），
-这种情况下允许只引用这一个来源；conflicts 是字符串数组；drop 必须为 false。
+这种情况下允许只引用这一个来源；conflicts 是字符串数组；drop 是布尔值。只有以下两种情况才设为 true:①材料明显不是一条具体新闻/事件，如栏目页、频道首页、聚合/汇总页、排行榜页、纯广告；②内容与 category 明显无关。拿不准时一律为 false。drop 为 true 时 title 和 summary 仍须填非空占位文字（如“丢弃”），其他字段照常给出。
 若来源说法冲突，summary 必须明确写出分歧。不得输出任何额外字段。"""
 
 _VERIFY_PROMPT = """\
@@ -441,7 +443,7 @@ _SNAPSHOT_ENRICH_PROMPT = """\
 
 hn_items：每条给了标题，以及抓取到的原文正文（可能为空）。为每条给出 desc：
   2～4 句话，基于正文讲清楚这件事具体是什么、有什么关键信息或进展；
-  禁止只是换个说法复述标题；正文为空时可基于标题合理推断话题方向，但不确定的细节不要编。
+  禁止只是换个说法复述标题；正文为空时只依据标题和已知事实，说明保持简短，不要推断任何细节。
 
 steam_items：每条给了游戏名、官方简介、类型标签，以及一段网上搜到的相关资料（可能为空）。
   为每条给出 desc：2～4 句话，综合官方简介和搜索资料写清楚这是什么类型/题材的游戏、
@@ -881,7 +883,7 @@ def register_builtin_snapshot_collectors(enabled=True):
 
     def hackernews_collector():
         from tg_bot.tools.native import execute_hn_front_page
-        raw = str(execute_hn_front_page() or "").strip("\n")
+        raw = str(execute_hn_front_page(limit=5) or "").strip("\n")
         return "" if "无法获取" in raw else raw
 
     def proxy_collector():
@@ -1388,7 +1390,10 @@ def main(argv=None) -> int:
             else:
                 status_outcome = "concurrent_status_preserved"
         for item in diagnostics:
-            print(f"WARNING {item}")
+            if item.endswith(":dropped"):
+                print(f"INFO {item}")
+            else:
+                print(f"WARNING {item}")
         if status_outcome == "same_day_sent_preserved":
             print("OK daily report unchanged; previous sent status kept")
         elif status_outcome == "concurrent_status_preserved":
@@ -1419,7 +1424,10 @@ def main(argv=None) -> int:
                 # through the cooldown state and render a misleading empty
                 # placeholder. Keep the last sent payload byte-for-byte.
                 for item in result.get("diagnostics") or []:
-                    print(f"WARNING {item}")
+                    if item.endswith(":dropped"):
+                        print(f"INFO {item}")
+                    else:
+                        print(f"WARNING {item}")
                 from tg_bot.file_io import atomic_write_json
                 status_payload = dict(previous_status)
                 push_payload = dict(previous_push) if isinstance(previous_push, dict) else {}
@@ -1486,7 +1494,10 @@ def main(argv=None) -> int:
             print("ERROR daily_report_push_failed", file=sys.stderr)
             return 1
     for item in diagnostics:
-        print(f"WARNING {item}")
+        if item.endswith(":dropped"):
+            print(f"INFO {item}")
+        else:
+            print(f"WARNING {item}")
     print(f"OK daily report generated; events={len(result['selected'])}")
     return 0
 

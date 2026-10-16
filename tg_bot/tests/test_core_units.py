@@ -2230,7 +2230,9 @@ class ReportResearchTests(unittest.TestCase):
         }
         invalid = (
             dict(valid, id="wrong"),
-            dict(valid, drop=True),
+            dict(valid, drop="true"),
+            dict(valid, drop=None),
+            dict(valid, drop=1),
             dict(valid, supporting_source_ids=["S1", "S9"]),
             dict(valid, supporting_source_ids=["S1", "S1"]),
             dict(valid, comment="主观点评"),
@@ -2277,6 +2279,31 @@ class ReportResearchTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         with self.assertRaises(ValueError):
             self.research.summarize_bundle(bundle, lambda _payload: valid, retries=0)
+
+    def test_parse_summary_returns_dropped_sentinel(self):
+        bundle = self._bundle()
+        raw = {
+            "id": "event-1", "title": "丢弃", "summary": "丢弃",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": True,
+        }
+        result = self.research.parse_summary(bundle, raw)
+        self.assertIsInstance(result, self.research.DroppedSummary)
+        self.assertEqual(result.event_id, "event-1")
+        self.assertIsNone(self.research.parse_summary(bundle, dict(raw, id="wrong")))
+        self.assertIsNone(self.research.parse_summary(bundle, dict(raw, title="")))
+
+    def test_summarize_bundle_does_not_retry_dropped(self):
+        bundle = self._bundle()
+        dropped = {
+            "id": "event-1", "title": "丢弃", "summary": "丢弃",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": True,
+        }
+        calls = []
+        result = self.research.summarize_bundle(
+            bundle, lambda payload: calls.append(payload) or dropped, retries=3,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(result, self.research.DroppedSummary)
 
     def test_verify_summary_is_exact_and_fail_closed(self):
         bundle = self._bundle()
@@ -3223,7 +3250,7 @@ class DailyReportTests(unittest.TestCase):
         spec.loader.exec_module(module)
         prompt = module._SNAPSHOT_ENRICH_PROMPT
         self.assertIn("绝不编造评分", prompt)
-        self.assertIn("不确定的细节不要编", prompt)
+        self.assertIn("不要推断任何细节", prompt)
 
     def test_section_cooldown_controls_state_retention(self):
         sections = importlib.import_module("tg_bot.report_sections")
@@ -3657,6 +3684,47 @@ class DailyReportCollectionTests(unittest.TestCase):
         )
         self.assertEqual([event.event_id for event in verified], ["good"])
         self.assertIn("global:bad:summary_failed", diagnostics)
+
+    def test_research_selected_events_skips_dropped_quietly(self):
+        module = self._load_builder("build_daily_report_dropped_quietly")
+        daily = importlib.import_module("tg_bot.daily_report")
+        research = importlib.import_module("tg_bot.report_research")
+        events = [
+            daily.ReportEvent(
+                event_id, "global", event_id, "facts", (), heat_score=heat,
+            )
+            for event_id, heat in (("junk", 100.0), ("good", 90.0))
+        ]
+        diagnostics, verify_payloads = [], []
+        def search_more(query):
+            event_id = "junk" if query == "junk" else "good"
+            return ([
+                {"title": "one", "url": f"https://one-{event_id}.test/a"},
+                {"title": "two", "url": f"https://two-{event_id}.test/a"},
+            ], [])
+        def summarize(payload):
+            if payload["id"] == "junk":
+                return {
+                    "id": "junk", "title": "丢弃", "summary": "丢弃",
+                    "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": True,
+                }
+            return {
+                "id": "good", "title": "已核查事件", "summary": "已核查事实摘要",
+                "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+            }
+        def verify(payload):
+            verify_payloads.append(payload)
+            return {"verdict": "pass", "unsupported_claims": [], "supporting_source_ids": ["S1", "S2"]}
+        verified = module.research_selected_events(
+            events, research.ResearchBudget(followup_queries=1), search_more,
+            lambda _url: "full facts", summarize, verify,
+            evidence_top_k=2, summary_retries=1, verify_retries=1,
+            diagnostics=diagnostics,
+        )
+        self.assertEqual([event.event_id for event in verified], ["good"])
+        self.assertEqual([payload["summary"]["id"] for payload in verify_payloads], ["good"])
+        self.assertIn("global:junk:dropped", diagnostics)
+        self.assertFalse(any("summary_failed" in item for item in diagnostics))
 
     def test_summary_and_verify_calls_use_separate_rotating_key_pools(self):
         module = self._load_builder("build_daily_report_model_pools")
