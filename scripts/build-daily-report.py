@@ -407,38 +407,26 @@ def _verify_call(payload):
     return _report_model_call(_VERIFY_PROMPT, payload, verify=True)
 
 
-_COLD_KNOWLEDGE_PROMPT = """\
-你是中文冷知识科普作者，只写你确有把握的真实知识，绝不编造。
-围绕用户给定的 topic 主题，写一条具体、准确、有细节（数字、年代、具体实例）的冷知识，
-让读者读完有"原来如此"的感觉。
-硬性要求：
-· content 是一段连续的中文正文，120～200 字，不分点、不用列表、不加小标题
-· 直接给出信息，不写"你知道吗""是不是很神奇""有趣的是"这类废话开头
-· 不得使用 avoid 数组里已经出现过的具体知识点或说法，也不得只是换个说法重讲同一件事，
-  必须是全新的、更具体的角度
-· 没有十足把握的具体数字/年代/名称，宁可省略或改用模糊表述，绝不能编造
-· 涉及天文、时间或数字的比较，必须区分清楚定义（例如恒星日与太阳日、自转与公转）；不确定就不要写比较，只陈述有把握的单个事实。
-只输出一个 JSON 对象，字段恰好为 content（正文字符串），不得输出任何额外字段、
-解释或 markdown 代码块标记。"""
-
-
 def generate_cold_knowledge(topic, avoid_summaries):
-    """按 topic 生成一段 120～200 字的中文冷知识正文；AI 不可用/解析失败一律返回 None。
+    """按 topic 生成冷知识：先从中文维基百科取材，模型只能依据材料写并附出处。
 
-    调用方（cold_knowledge_collector）必须把 None 当作"今天这块没有"处理，整块跳过，
-    绝不能用空文案或占位符硬塞进日报——这是本项目一贯坚持的原则。
+    取不到材料 / 校验不过 / AI 不可用一律返回 None，调用方（cold_knowledge_collector）
+    必须把 None 当作"今天这块没有"处理，整块跳过——绝不凭模型记忆写，也不用占位符硬塞。
     """
-    payload = {
-        "topic": str(topic or ""),
-        "avoid": [str(item).strip() for item in (avoid_summaries or []) if str(item or "").strip()],
-    }
-    data = _report_model_call(_COLD_KNOWLEDGE_PROMPT, payload, verify=False)
-    if not isinstance(data, Mapping):
+    from tg_bot.cold_ground import build_grounded
+    from tg_bot.tools.fetch import http_get
+
+    avoid = [str(item).strip() for item in (avoid_summaries or []) if str(item or "").strip()]
+    day_of_year = datetime.now(ZoneInfo("Asia/Shanghai")).timetuple().tm_yday
+    try:
+        return build_grounded(
+            str(topic or ""), avoid, day_of_year,
+            get=http_get,
+            model=lambda system_prompt, payload: _report_model_call(system_prompt, payload, verify=False),
+        )
+    except Exception as exc:
+        print(f"WARNING cold_knowledge_ground:{type(exc).__name__}", file=sys.stderr)
         return None
-    content = re.sub(r"[ \t]+", " ", str(data.get("content") or "")).strip().strip("\"'")
-    if not (60 <= len(content) <= 320):
-        return None
-    return content
 
 
 _COLD_GIST_STRIP_RE = re.compile(r"[^一-鿿A-Za-z0-9]")

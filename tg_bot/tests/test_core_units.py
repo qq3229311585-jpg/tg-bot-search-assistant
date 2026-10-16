@@ -3409,7 +3409,8 @@ class DailyReportTests(unittest.TestCase):
         spec.loader.exec_module(module)
         with temporary_env(**required_env()):
             reload_config()
-            self.assertIsNone(module.generate_cold_knowledge("深海生物", ["深海生物·发光诱饵"]))
+            with patch("tg_bot.tools.fetch.http_get", return_value=""):
+                self.assertIsNone(module.generate_cold_knowledge("深海生物", ["深海生物·发光诱饵"]))
 
     def test_cold_knowledge_novelty_label_is_ledger_safe(self):
         script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")

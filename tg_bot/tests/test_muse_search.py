@@ -226,6 +226,41 @@ class CorroborateTests(unittest.TestCase):
         self.assertEqual([r["reason"] for r in rejected[:4]], ["引用无效"] * 4)
         self.assertEqual(len(rejected), 5)
 
+    def test_corroborate_allow_single_marks_single(self):
+        accepted, rejected = ms.corroborate(
+            [{"text": "结论五", "quote_ids": ["Q2"]}], QUOTES, SOURCES, allow_single=True)
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted[0]["credibility"], "单一来源 b.test")
+        self.assertIs(accepted[0]["single"], True)
+
+    def test_corroborate_allow_single_strong_claims_have_no_single_flag(self):
+        accepted, rejected = ms.corroborate(
+            [{"text": "互证", "quote_ids": ["Q1", "Q2"]},
+             {"text": "权威", "quote_ids": ["Q3"]}], QUOTES, SOURCES, allow_single=True)
+        self.assertEqual(rejected, [])
+        self.assertEqual([a["text"] for a in accepted], ["互证", "权威"])
+        for item in accepted:
+            self.assertNotIn("single", item)
+
+    def test_corroborate_default_still_rejects_single(self):
+        accepted, rejected = ms.corroborate(
+            [{"text": "结论六", "quote_ids": ["Q2"]}], QUOTES, SOURCES)
+        self.assertEqual(accepted, [])
+        self.assertEqual(rejected[0]["reason"], "仅单一非权威来源")
+
+
+class SourceOrderTests(unittest.TestCase):
+    def test_source_lines_sorted_numerically(self):
+        sources = {sid: {"url": f"https://x.test/{sid}", "title": sid, "site": "x.test", "date": None}
+                   for sid in ["S1", "S2", "S10"]}
+        lines = ms._source_lines(["S2", "S1", "S10"], sources)
+        order = [line[3:line.index("]")] for line in lines if line.startswith("- [")]
+        self.assertEqual(order, ["S1", "S2", "S10"])
+        lines = ms._source_lines(["Sx", "S10", "S1"], sources)
+        order = [line[3:line.index("]")] for line in lines if line.startswith("- [")]
+        self.assertEqual(order, ["S1", "S10", "Sx"])
+
 
 class RenderMarkdownTests(unittest.TestCase):
     def test_render_markdown_none_found(self):
@@ -498,8 +533,10 @@ class RunQueryTests(unittest.TestCase):
                   "conflicts": []}
         out = ms.run_query("新项目什么时候投产",
                            deps=self._deps(rows=[ROWS[0]], claims=claims), now=NOW)
-        self.assertNotIn("## 结论", out)
-        self.assertIn("仅单一非权威来源", out)
+        self.assertIn("单一来源", out)
+        self.assertIn("## 结论", out)
+        self.assertLess(out.index("## 结论"), out.index("单一来源"))
+        self.assertNotIn("仅单一非权威来源", out)
 
     def test_verify_fail_demotes(self):
         out = ms.run_query("新项目什么时候投产", deps=self._deps(verify="fail"), now=NOW)
@@ -531,6 +568,24 @@ class RunQueryTests(unittest.TestCase):
                            now=NOW)
         self.assertIsInstance(out, str)
         self.assertIn("没有找到", out)
+
+    def test_claims_beyond_eight_go_to_rejected(self):
+        from unittest import mock
+        claims9 = [{"text": f"结论{i}", "quote_ids": ["Q1", "Q2"]} for i in range(9)]
+        with mock.patch.object(ms, "parse_claims", return_value=(claims9, [])):
+            out = ms.run_query("新项目什么时候投产", deps=self._deps(), now=NOW)
+        self.assertEqual(out.count("### C"), 8)
+        self.assertIn("- 结论8: 超出核查数量上限", out)
+
+    def test_weakest_claim_dropped_first_when_over_cap(self):
+        from unittest import mock
+        single = {"text": "弱结论", "quote_ids": ["Q1"]}
+        strong = [{"text": f"强结论{i}", "quote_ids": ["Q1", "Q2"]} for i in range(8)]
+        with mock.patch.object(ms, "parse_claims", return_value=([single] + strong, [])):
+            out = ms.run_query("新项目什么时候投产", deps=self._deps(), now=NOW)
+        self.assertEqual(out.count("### C"), 8)
+        self.assertNotIn("可信度: 单一来源", out)
+        self.assertIn("- 弱结论: 超出核查数量上限", out)
 
 
 class CliTests(unittest.TestCase):

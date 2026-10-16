@@ -259,8 +259,19 @@ def _origin_groups(sids, quotes_by_sid, site_of):
     return len({find(sid) for sid in ordered})
 
 
-def corroborate(claims, quotes, sources):
-    """按站点互证或权威来源判定结论是否通过，返回 (accepted, rejected)。"""
+def _strength_rank(claim):
+    """结论强度排序键:互证 0、权威 1、单一来源 2。"""
+    cred = str(claim.get("credibility") or "")
+    if cred.startswith("互证"):
+        return 0
+    if cred.startswith("权威"):
+        return 1
+    return 2
+
+
+def corroborate(claims, quotes, sources, allow_single=False):
+    """按站点互证或权威来源判定结论是否通过，返回 (accepted, rejected)。
+    allow_single=True 时,仅单一非权威来源的结论也进入 accepted,可信度标为“单一来源”。"""
     qid_map = {q["qid"]: q for q in quotes}
     accepted, rejected = [], []
     for claim in claims:
@@ -274,7 +285,7 @@ def corroborate(claims, quotes, sources):
             rejected.append({"text": text, "reason": "引用无效"})
             continue
         sids = {qid_map[qid]["sid"] for qid in quote_ids}
-        present = [sources[sid] for sid in sids if sid in sources]
+        present = [sources[sid] for sid in sorted(sids) if sid in sources]
         sites = {src.get("site") for src in present if src.get("site")}
         quotes_by_sid = {}
         for qid in quote_ids:
@@ -283,6 +294,7 @@ def corroborate(claims, quotes, sources):
         site_sids = {sid for sid in sids if sources.get(sid, {}).get("site")}
         site_of = {sid: sources[sid].get("site") for sid in site_sids}
         groups = _origin_groups(site_sids, quotes_by_sid, site_of) if site_sids else 0
+        single = False
         if groups >= 2:
             credibility = f"互证 {groups} 站 ({', '.join(sorted(sites))})"
             if groups < len(sites):
@@ -292,10 +304,18 @@ def corroborate(claims, quotes, sources):
                                if _is_authority_domain(src.get("domain") or ""))
             if authority:
                 credibility = f"权威 {authority[0]}"
+            elif allow_single:
+                site = next((src.get("site") for src in present if src.get("site")), None)
+                site = site or next((src.get("domain") for src in present if src.get("domain")), "")
+                credibility = f"单一来源 {site}"
+                single = True
             else:
                 rejected.append({"text": text, "reason": "仅单一非权威来源", "quote_ids": list(quote_ids)})
                 continue
-        accepted.append({"text": text, "quote_ids": list(quote_ids), "credibility": credibility})
+        entry = {"text": text, "quote_ids": list(quote_ids), "credibility": credibility}
+        if single:
+            entry["single"] = True
+        accepted.append(entry)
     return accepted, rejected
 
 
@@ -317,10 +337,20 @@ def _rejected_lines(rejected, quotes, sources):
     return out, used
 
 
+def _sid_order(sid):
+    """来源编号的排序键:S 后面的数字升序,无法转成数字的排最后。"""
+    text = str(sid)
+    digits = text[1:] if text.startswith("S") else text
+    try:
+        return (0, int(digits))
+    except ValueError:
+        return (1, 0)
+
+
 def _source_lines(used, sources):
-    """来源列表:每个来源只列一次(标题 | 网站 | 日期 | 网址)。"""
+    """来源列表:每个来源只列一次(标题 | 网站 | 日期 | 网址),按编号数字升序。"""
     lines = ["## 来源"]
-    for sid in used:
+    for sid in sorted(used, key=_sid_order):
         src = sources.get(sid, {})
         lines.append(f"- [{sid}] {src.get('title', '')} | {src.get('site', '')} | "
                      f"{src.get('date') or '未知'} | {src.get('url', '')}")
@@ -478,7 +508,7 @@ def parse_claims(raw):
     claims, conflicts = [], []
     if isinstance(raw.get("claims"), list):
         for item in raw["claims"]:
-            if len(claims) >= 5:
+            if len(claims) >= 8:
                 break
             if not isinstance(item, dict):
                 continue
@@ -727,9 +757,13 @@ def run_query(q, *, deps=None, now=None):
                        for qu in quotes],
         })
         claims, raw_conflicts = parse_claims(claims_raw)
-        accepted, rejected = corroborate(claims, quotes, sources)
+        accepted, rejected = corroborate(claims, quotes, sources, allow_single=True)
 
-        checked = accepted[:5]
+        accepted = sorted(accepted, key=_strength_rank)
+        checked = accepted[:8]
+        for claim in accepted[8:]:
+            rejected.append({"text": claim["text"], "reason": "超出核查数量上限",
+                             "quote_ids": list(claim["quote_ids"])})
 
         def check(claim):
             subset = [{"qid": qu["qid"], "quote": qu["quote"]}
