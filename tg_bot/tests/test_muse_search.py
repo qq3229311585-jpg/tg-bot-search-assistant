@@ -355,3 +355,108 @@ class ModelLayerTests(unittest.TestCase):
             with self.subTest(prompt=prompt[:10]):
                 self.assertTrue(prompt.strip())
                 self.assertIn("JSON", prompt)
+
+
+_AUTO = object()
+_DEFAULT_REWRITE = {"queries": [], "time_range": "any", "must_terms": []}
+URL_A = "https://a.example.com/news/1"
+URL_B = "https://b.example.org/story/2"
+TITLE_A = "甲站报道"
+TITLE_B = "乙站报道"
+QUOTE_A = "该项目计划于明年第一季度投产"
+QUOTE_B = "乙站确认该项目计划于明年第一季度投产"
+BODY_A = "甲站记者报道，" + QUOTE_A + "。" + "相关设备已完成安装调试，" * 24
+BODY_B = "乙站综合报道：" + QUOTE_B + "。" + "现场施工进展顺利，" * 24
+ROWS = [
+    {"url": URL_A, "title": TITLE_A, "summary": "", "published_at": None},
+    {"url": URL_B, "title": TITLE_B, "summary": "", "published_at": None},
+]
+PAGES = {URL_A: BODY_A, URL_B: BODY_B}
+QUOTE_BY_TITLE = {TITLE_A: QUOTE_A, TITLE_B: QUOTE_B}
+CLAIMS_OK = {"claims": [{"text": "该项目计划于明年第一季度投产", "quote_ids": ["Q1", "Q2"]}],
+             "conflicts": []}
+
+
+class RunQueryTests(unittest.TestCase):
+    def _deps(self, *, rows=ROWS, pages=PAGES, rewrite=_DEFAULT_REWRITE, extract=_AUTO,
+              claims=CLAIMS_OK, verify="pass", web_error=None, calls=None):
+        def model(system_prompt, payload):
+            if system_prompt == ms.REWRITE_PROMPT:
+                return rewrite
+            if system_prompt == ms.EXTRACT_PROMPT:
+                if extract is not _AUTO:
+                    return extract
+                return {"quotes": [{"sid": p["sid"], "quote": QUOTE_BY_TITLE[p["title"]]}
+                                   for p in payload["pages"] if p["title"] in QUOTE_BY_TITLE]}
+            if system_prompt == ms.CLAIMS_PROMPT:
+                return claims
+            if system_prompt == ms.VERIFY_PROMPT:
+                return {"verdict": verify}
+            return None
+
+        def web(query):
+            if calls is not None:
+                calls.append(query)
+            if web_error is not None:
+                raise web_error
+            return list(rows), {}
+
+        def fetch(url):
+            return pages.get(url, "正文抓取失败：无数据")
+
+        return {"web": web, "news": lambda query: ([], {}), "fetch": fetch,
+                "model": model, "canon": lambda url: url}
+
+    def test_happy_path_two_sites(self):
+        out = ms.run_query("新项目什么时候投产", deps=self._deps(), now=NOW)
+        self.assertIn("该项目计划于明年第一季度投产", out)
+        self.assertIn(URL_A, out)
+        self.assertIn(URL_B, out)
+        self.assertIn(f'"{QUOTE_A}"', out)
+        self.assertIn(f'"{QUOTE_B}"', out)
+        self.assertIn("互证 2 站", out)
+
+    def test_fabricated_quote_dropped(self):
+        extract = {"quotes": [{"sid": "S1", "quote": "这句话在页面里根本不存在的编造内容"}]}
+        out = ms.run_query("新项目什么时候投产", deps=self._deps(extract=extract), now=NOW)
+        self.assertIn("没有找到", out)
+        self.assertIn("没有找到可核对的原文引文", out)
+
+    def test_single_nonauthority_rejected(self):
+        claims = {"claims": [{"text": "该项目计划于明年第一季度投产", "quote_ids": ["Q1"]}],
+                  "conflicts": []}
+        out = ms.run_query("新项目什么时候投产",
+                           deps=self._deps(rows=[ROWS[0]], claims=claims), now=NOW)
+        self.assertNotIn("## 结论", out)
+        self.assertIn("仅单一非权威来源", out)
+
+    def test_verify_fail_demotes(self):
+        out = ms.run_query("新项目什么时候投产", deps=self._deps(verify="fail"), now=NOW)
+        self.assertIn("核查未通过", out)
+        self.assertNotIn("### C1", out)
+
+    def test_no_pages_returns_not_found(self):
+        out = ms.run_query("新项目什么时候投产", deps=self._deps(pages={}), now=NOW)
+        self.assertIn("没有找到", out)
+        self.assertIn("未能获取任何可用页面", out)
+
+    def test_rewrite_failure_falls_back(self):
+        calls = []
+        q = "新项目什么时候投产"
+        out = ms.run_query(q, deps=self._deps(rewrite=None, calls=calls), now=NOW)
+        self.assertIn(q, calls)
+        self.assertIn("互证 2 站", out)
+
+    def test_conflict_mapped(self):
+        claims = {"claims": [],
+                  "conflicts": [{"point": "投产时间说法不一", "qids": ["Q1", "Q2"]}]}
+        out = ms.run_query("新项目什么时候投产", deps=self._deps(claims=claims), now=NOW)
+        self.assertIn("来源说法不一致", out)
+        self.assertIn(URL_A, out)
+
+    def test_never_raises(self):
+        out = ms.run_query("新项目什么时候投产",
+                           deps=self._deps(rewrite=None, web_error=RuntimeError("boom")),
+                           now=NOW)
+        self.assertIsInstance(out, str)
+        self.assertIn("没有找到", out)

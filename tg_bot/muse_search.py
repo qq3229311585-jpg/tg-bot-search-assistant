@@ -394,3 +394,156 @@ def parse_claims(raw):
 def parse_verify(raw):
     """仅当 verdict 明确为 pass 时返回 True。"""
     return isinstance(raw, dict) and raw.get("verdict") == "pass"
+
+
+# ---- 调度层 ----
+
+def _default_dep(name):
+    """延迟导入真实实现，测试时通过 deps 注入假函数。"""
+    if name == "web":
+        from tg_bot.tools.search import web_candidates_all
+        return web_candidates_all
+    if name == "news":
+        from tg_bot.tools.search import execute_news_candidates_all
+        return execute_news_candidates_all
+    if name == "fetch":
+        from tg_bot.tools.fetch import execute_fetch_content
+        return execute_fetch_content
+    if name == "canon":
+        from tg_bot.tools.search import _canonical_news_url
+        return _canonical_news_url
+    return call_model
+
+
+def _safe_call(fn, *args):
+    try:
+        return fn(*args)
+    except Exception:
+        return None
+
+
+def _rows_from(result):
+    rows = result[0] if isinstance(result, tuple) and result else result
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _not_found(q, time_range, stamp, queries, reason):
+    return render_markdown(q, time_range, stamp, queries, [], [], {}, [],
+                           [{"text": q, "reason": reason}])
+
+
+def run_query(q, *, deps=None, now=None):
+    """执行完整查询流程并返回 Markdown；任何内部错误降级为"没有找到"，不抛出。"""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    stamp = now.isoformat(timespec="seconds")
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        from tg_bot.report_research import _clean_content
+
+        injected = deps or {}
+
+        def dep(name):
+            fn = injected.get(name)
+            return fn if fn is not None else _default_dep(name)
+
+        model = dep("model")
+        rewrite = parse_rewrite(_safe_call(model, REWRITE_PROMPT, {"question": q}), q)
+        time_range, queries = rewrite["time_range"], rewrite["queries"]
+
+        web, news = dep("web"), dep("news")
+        fetch, canon = dep("fetch"), dep("canon")
+        jobs = [(web, variant) for variant in queries[:4]]
+        if time_range in ("day", "week"):
+            jobs += [(news, variant) for variant in queries[:4]]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda job: _safe_call(job[0], job[1]), jobs))
+        rows, seen = [], set()
+        for result in results:
+            for row in _rows_from(result):
+                url = row.get("url") or ""
+                if not url:
+                    continue
+                key = canon(url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+
+        ranked = rank_candidates(rows, rewrite["must_terms"], time_range, now)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            texts = list(pool.map(lambda cand: _safe_call(fetch, cand.get("url") or ""), ranked))
+        pages, sources = {}, {}
+        for cand, raw in zip(ranked, texts):
+            text = _clean_content(raw)
+            if not text or len(text) < 200:
+                continue
+            url = cand.get("url") or ""
+            domain = (urlparse(url).hostname or "").lower()
+            sid = f"S{len(pages) + 1}"
+            pages[sid] = text[:6000]
+            sources[sid] = {
+                "url": url,
+                "title": cand.get("title") or "",
+                "site": site_key(domain) if domain else "",
+                "date": str(cand["published_at"]) if cand.get("published_at") else "未知",
+                "domain": domain,
+            }
+        if not pages:
+            return _not_found(q, time_range, stamp, queries, "未能获取任何可用页面")
+
+        extract_raw = _safe_call(model, EXTRACT_PROMPT, {
+            "question": q,
+            "pages": [{"sid": sid, "title": sources[sid]["title"], "text": pages[sid]}
+                      for sid in pages],
+        })
+        quotes = verify_quotes(parse_extract(extract_raw), pages)
+        if not quotes:
+            return _not_found(q, time_range, stamp, queries, "没有找到可核对的原文引文")
+
+        claims_raw = _safe_call(model, CLAIMS_PROMPT, {
+            "question": q,
+            "quotes": [{"qid": qu["qid"], "sid": qu["sid"], "quote": qu["quote"]}
+                       for qu in quotes],
+        })
+        claims, raw_conflicts = parse_claims(claims_raw)
+        accepted, rejected = corroborate(claims, quotes, sources)
+
+        checked = accepted[:5]
+
+        def check(claim):
+            subset = [{"qid": qu["qid"], "quote": qu["quote"]}
+                      for qu in quotes if qu["qid"] in claim["quote_ids"]]
+            verdict = _safe_call(model, VERIFY_PROMPT, {"claim": claim["text"], "quotes": subset})
+            return parse_verify(verdict)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            verdicts = list(pool.map(check, checked))
+        kept = []
+        for claim, ok in zip(checked, verdicts):
+            if ok:
+                kept.append(claim)
+            else:
+                rejected.append({"text": claim["text"], "reason": "核查未通过"})
+        accepted = kept
+
+        qid_map = {qu["qid"]: qu for qu in quotes}
+        conflicts = []
+        for conflict in raw_conflicts:
+            positions, sids = [], set()
+            for qid in conflict["qids"]:
+                qu = qid_map.get(qid)
+                if qu is None:
+                    continue
+                positions.append({"sid": qu["sid"], "quote": qu["quote"]})
+                sids.add(qu["sid"])
+            if len(sids) < 2:
+                continue
+            conflicts.append({"point": conflict["point"], "positions": positions})
+
+        return render_markdown(q, time_range, stamp, queries, accepted, quotes,
+                               sources, conflicts, rejected)
+    except Exception as exc:
+        return _not_found(q, "any", stamp, [q], f"内部错误: {type(exc).__name__}")
