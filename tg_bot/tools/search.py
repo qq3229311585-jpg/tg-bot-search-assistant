@@ -360,6 +360,152 @@ def execute_news_candidates_all(query, providers=None):
             diagnostics.append(f"{name}: provider_error:{type(exc).__name__}")
     return merged, diagnostics
 
+
+def _web_from_brave(query):
+    """返回 Brave 通用网页搜索的结构化结果与提供方诊断。"""
+    from tg_bot.tools.fetch import http_get
+    from urllib.parse import quote_plus
+
+    if not BRAVE_KEY:
+        return [], ["brave: unavailable"]
+    try:
+        raw = http_get(
+            "https://api.search.brave.com/res/v1/web/search"
+            f"?q={quote_plus(query)}&count=10",
+            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_KEY},
+        )
+        data = json.loads(raw) if raw else {}
+        items = data.get("web", {}).get("results", [])
+        valid_items, diagnostics = _validated_news_items(items, "brave")
+        rows = [
+            {
+                "title": item.get("title", ""),
+                "summary": item.get("description", ""),
+                "url": item.get("url", ""),
+                "published_at": item.get("page_age") or item.get("age"),
+                "source": "brave",
+            }
+            for item in valid_items
+            if item.get("title") and item.get("url")
+        ]
+        if items:
+            inc_quota("brave")
+            return rows, diagnostics
+        return [], ["brave: empty"]
+    except Exception as exc:
+        return [], [f"brave: provider_error:{type(exc).__name__}"]
+
+
+def _web_from_serper(query):
+    """返回 Serper 通用网页搜索的结构化结果，保留 key 轮换逻辑。"""
+    import tg_bot.config as _cfg
+
+    if not _cfg.SERPER_KEYS:
+        return [], ["serper: unavailable"]
+    diagnostics = []
+    endpoint = "https://google.serper.dev/search"
+    keys = tuple(_cfg.SERPER_KEYS)
+    start_index, _start_key = _reserve_serper_key()
+    for attempt in range(len(keys)):
+        key_index = (start_index + attempt) % len(keys)
+        key = keys[key_index]
+        try:
+            body = json.dumps({"q": query, "num": 10}).encode()
+            req = Request(endpoint, data=body, headers={"Content-Type": "application/json", "X-API-KEY": key})
+            with urlopen(req, context=_ctx, timeout=15) as response:
+                data = json.loads(response.read())
+            items = data.get("organic", [])
+            valid_items, response_diagnostics = _validated_news_items(items, "serper")
+            rows = [
+                {
+                    "title": item.get("title", ""),
+                    "summary": item.get("snippet", ""),
+                    "url": item.get("link", ""),
+                    "published_at": item.get("date"),
+                    "source": "serper",
+                }
+                for item in valid_items
+                if item.get("title") and item.get("link")
+            ]
+            if items:
+                diagnostics.extend(response_diagnostics)
+                with _cfg._provider_rotation_lock:
+                    _cfg._serper_idx = key_index
+                    _cfg.SERPER_KEY = key
+                inc_quota("serper")
+                return rows, diagnostics
+            diagnostics.append("serper: empty")
+            break
+        except Exception as exc:
+            diagnostics.append(f"serper[{attempt}]: provider_error:{type(exc).__name__}")
+            # The next loop iteration reserves the next key atomically.
+    return [], diagnostics
+
+
+def _web_from_tavily(query):
+    """返回 Tavily 通用网页搜索的结构化结果与提供方诊断。"""
+    if not TAVILY_KEYS:
+        return [], ["tavily: unavailable"]
+    try:
+        data = _tavily_request("https://api.tavily.com/search", {
+            "query": query,
+            "search_depth": "basic",
+            "topic": "general",
+            "max_results": 10,
+        }) or {}
+        items = data.get("results", [])
+        valid_items, diagnostics = _validated_news_items(items, "tavily")
+        rows = [
+            {
+                "title": item.get("title", ""),
+                "summary": item.get("content", ""),
+                "url": item.get("url", ""),
+                "published_at": item.get("published_date"),
+                "source": "tavily",
+            }
+            for item in valid_items
+            if item.get("title") and item.get("url")
+        ]
+        if items:
+            return rows, diagnostics
+        return [], ["tavily: empty"]
+    except Exception as exc:
+        return [], [f"tavily: provider_error:{type(exc).__name__}"]
+
+
+def web_candidates_all(query, providers=None):
+    """聚合通用网页搜索的多个提供方，结果顺序稳定、按 URL 去重。"""
+    if providers is None:
+        providers = (
+            ("brave", _web_from_brave),
+            ("tavily", _web_from_tavily),
+            ("serper", _web_from_serper),
+        )
+    merged = []
+    diagnostics = []
+    seen = set()
+    for name, provider in providers:
+        try:
+            items, notes = provider(query)
+            diagnostics.extend(notes or [])
+            malformed = False
+            for item in items or []:
+                if not isinstance(item, Mapping):
+                    malformed = True
+                    continue
+                key = _canonical_news_url(item.get("url", ""))
+                if key:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                merged.append(item)
+            if malformed:
+                diagnostics.append(f"{name}: provider_error:TypeError")
+        except Exception as exc:
+            diagnostics.append(f"{name}: provider_error:{type(exc).__name__}")
+    return merged, diagnostics
+
+
 def _tavily_search_fallback(query, search_type):
     """搜索降级：Tavily → Serper"""
     log.info(f"🔍 Tavily 降级 [{search_type}]: {query}")

@@ -917,6 +917,113 @@ class SearchProviderTests(unittest.TestCase):
             shutil.rmtree(data_dir, ignore_errors=True)
 
 
+class WebCandidatesTests(unittest.TestCase):
+    def test_web_candidates_merges_and_dedupes(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            first = {"title": "First", "url": "https://one.test/a?utm_source=x", "source": "brave"}
+            duplicate = {"title": "Dup", "url": "https://one.test/a", "source": "tavily"}
+            last = {"title": "Last", "url": "https://two.test/b", "source": "serper"}
+            items, diagnostics = search.web_candidates_all(
+                "query",
+                providers=(
+                    ("brave", lambda _query: ([first], [])),
+                    ("tavily", lambda _query: ([duplicate, last], [])),
+                ),
+            )
+            self.assertEqual(items, [first, last])
+            self.assertEqual(diagnostics, [])
+
+    def test_web_candidates_provider_error_isolated(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+
+            def broken(_query):
+                raise RuntimeError("secret-key-must-not-appear")
+
+            def good(_query):
+                return [{"title": "Good", "url": "https://good.test/a"}], []
+
+            items, diagnostics = search.web_candidates_all(
+                "query",
+                providers=(("brave", broken), ("serper", good)),
+            )
+            self.assertEqual([item["title"] for item in items], ["Good"])
+            self.assertEqual(diagnostics, ["brave: provider_error:RuntimeError"])
+            self.assertNotIn("secret-key", " ".join(diagnostics))
+
+    def test_web_from_brave_maps_fields(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            payload = json.dumps({"web": {"results": [{
+                "title": "Brave web",
+                "description": "web summary",
+                "url": "https://brave.test/web",
+                "age": "3 hours ago",
+            }]}})
+            with patch(
+                "tg_bot.tools.fetch.http_get", return_value=payload
+            ) as http_get, patch.object(search, "inc_quota") as quota:
+                items, diagnostics = search._web_from_brave("query")
+            self.assertEqual(items, [{
+                "title": "Brave web",
+                "summary": "web summary",
+                "url": "https://brave.test/web",
+                "published_at": "3 hours ago",
+                "source": "brave",
+            }])
+            self.assertEqual(diagnostics, [])
+            self.assertIn("/res/v1/web/search?q=query&count=10", http_get.call_args.args[0])
+            quota.assert_called_once_with("brave")
+
+            with patch.object(search, "BRAVE_KEY", ""), patch(
+                "tg_bot.tools.fetch.http_get"
+            ) as http_get:
+                items, diagnostics = search._web_from_brave("query")
+            self.assertEqual((items, diagnostics), ([], ["brave: unavailable"]))
+            http_get.assert_not_called()
+
+    def test_web_from_serper_maps_fields(self):
+        with temporary_env(**required_env(SERPER_KEY_1=None, SERPER_KEY_2=None)):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_args):
+                    return False
+                def read(self):
+                    return json.dumps({"organic": [{
+                        "title": "Serper web",
+                        "snippet": "web snippet",
+                        "link": "https://serper.test/web",
+                        "date": "2 days ago",
+                    }]}).encode()
+
+            with patch.object(search, "urlopen", return_value=FakeResponse()) as opened, patch.object(
+                search, "inc_quota"
+            ) as quota:
+                items, diagnostics = search._web_from_serper("query")
+            self.assertEqual(items, [{
+                "title": "Serper web",
+                "summary": "web snippet",
+                "url": "https://serper.test/web",
+                "published_at": "2 days ago",
+                "source": "serper",
+            }])
+            self.assertEqual(diagnostics, [])
+            self.assertEqual(opened.call_args.args[0].full_url, "https://google.serper.dev/search")
+            quota.assert_called_once_with("serper")
+
+
 class TokenTests(unittest.TestCase):
     def test_existing_token_file_is_tightened_to_private_mode(self):
         temp_dir = tempfile.mkdtemp(prefix="tg-bot-token-")
