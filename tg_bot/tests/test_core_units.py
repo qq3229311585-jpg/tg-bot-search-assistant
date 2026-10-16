@@ -3364,7 +3364,112 @@ class DailyReportTests(unittest.TestCase):
         spec.loader.exec_module(module)
         prompt = module._SNAPSHOT_ENRICH_PROMPT
         self.assertIn("绝不编造评分", prompt)
-        self.assertIn("不要推断任何细节", prompt)
+        self.assertIn("禁止只是换个说法复述标题", prompt)
+        self.assertNotIn("正文为空", prompt)
+
+    def _load_enrich_module(self, name):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location(name, script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_filter_hn_removes_empty_and_renumbers(self):
+        module = self._load_enrich_module("build_daily_report_filter_hn_empty")
+        long_body = "[正文来源：https://example.com/x]\n\n" + "这是一段足够长的正文。" * 30
+        articles = [
+            long_body, None, long_body, "正文抓取失败：timeout", long_body,
+            long_body, "[正文来源：https://example.com/s]\n短", long_body,
+        ]
+        items = [f"• Headline {i}" for i in range(8)]
+        urls = [f"https://example.com/{i}" for i in range(8)]
+        kept_items, kept_urls, kept_articles = module._filter_hn(items, urls, articles)
+        self.assertEqual(len(kept_items), 5)
+        self.assertEqual(kept_items, ["• Headline 0", "• Headline 2", "• Headline 4", "• Headline 5", "• Headline 7"])
+        self.assertEqual(kept_urls, [f"https://example.com/{i}" for i in (0, 2, 4, 5, 7)])
+        self.assertEqual(len(kept_articles), 5)
+
+    def test_snapshot_item_urls_strips_trailing_blockquote(self):
+        mod = self._load_enrich_module("build_daily_report_item_urls")
+        suffix = "<blockquote expandable>🔗 原文链接\n1. https://a.example/x\n2. https://b.example/y</blockquote>"
+        self.assertEqual(mod._snapshot_item_urls(suffix), ["https://a.example/x", "https://b.example/y"])
+
+    def test_filter_hn_caps_at_five(self):
+        module = self._load_enrich_module("build_daily_report_filter_hn_cap")
+        long_body = "正文" * 150
+        items = [f"• Headline {i}" for i in range(8)]
+        urls = [f"https://example.com/{i}" for i in range(8)]
+        kept_items, kept_urls, _ = module._filter_hn(items, urls, [long_body] * 8)
+        self.assertEqual(kept_items, items[:5])
+        self.assertEqual(kept_urls, urls[:5])
+
+    def test_filter_hn_all_empty_returns_empty(self):
+        module = self._load_enrich_module("build_daily_report_filter_hn_empty_all")
+        items = [f"• Headline {i}" for i in range(3)]
+        urls = [f"https://example.com/{i}" for i in range(3)]
+        kept_items, kept_urls, kept_articles = module._filter_hn(items, urls, [None, None, "正文抓取失败"])
+        self.assertEqual((kept_items, kept_urls, kept_articles), ([], [], []))
+
+    def test_enrich_fallback_uses_filtered_hn(self):
+        module = self._load_enrich_module("build_daily_report_enrich_fallback_hn")
+        bad = {1, 3, 6}
+        bodies = {}
+        for i in range(8):
+            url = f"https://example.com/{i}"
+            bodies[url] = "短" * 10 if i in bad else "[正文来源：" + url + "]\n\n" + "正文内容。" * 60
+        urls = list(bodies)
+        links = "\n".join(f"{n}. {url}" for n, url in enumerate(urls, 1))
+        section = (
+            "🗣️ 圈子在聊\n"
+            + "\n".join(f"• Headline {i}" for i in range(8))
+            + f"\n<blockquote expandable>🔗 原文链接\n{links}</blockquote>"
+        )
+        with patch.object(gather_executor, "execute_fetch_content", side_effect=lambda url: bodies[url]), \
+             patch.object(module, "_report_model_call", return_value=None):
+            result = module.enrich_snapshot_sections({"hackernews": section})
+        hn_text = result["hackernews"]
+        self.assertLessEqual(hn_text.count("• "), 5)
+        for removed in ("Headline 1", "Headline 3", "Headline 6"):
+            self.assertNotIn(removed, hn_text)
+        for kept in ("Headline 0", "Headline 2", "Headline 4", "Headline 5"):
+            self.assertIn(kept, hn_text)
+        self.assertIn("1. https://example.com/0", hn_text)
+        self.assertNotIn("https://example.com/6", hn_text)
+
+    def test_archive_dated_copy_writes_file(self):
+        module = self._load_enrich_module("build_daily_report_archive_write")
+        with tempfile.TemporaryDirectory() as directory:
+            module._archive_dated_copy("# 日报\n内容\n", directory, today="2026-10-16")
+            path = os.path.join(directory, "2026-10-16.md")
+            self.assertTrue(os.path.exists(path))
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "# 日报\n内容\n")
+
+    def test_archive_dated_copy_prunes_old(self):
+        module = self._load_enrich_module("build_daily_report_archive_prune")
+        with tempfile.TemporaryDirectory() as directory:
+            start = datetime(2026, 1, 1)
+            names = [(start + timedelta(days=d)).strftime("%Y-%m-%d") + ".md" for d in range(35)]
+            for name in names:
+                with open(os.path.join(directory, name), "w", encoding="utf-8") as fh:
+                    fh.write("old")
+            for extra in ("latest.md", "notes.txt"):
+                with open(os.path.join(directory, extra), "w", encoding="utf-8") as fh:
+                    fh.write("keep")
+            module._archive_dated_copy("new", directory, today="2026-03-01")
+            remaining = sorted(n for n in os.listdir(directory) if re.match(r"^\d{4}-\d{2}-\d{2}\.md$", n))
+            self.assertEqual(len(remaining), 30)
+            self.assertEqual(remaining, sorted(names + ["2026-03-01.md"])[-30:])
+            self.assertTrue(os.path.exists(os.path.join(directory, "latest.md")))
+            self.assertTrue(os.path.exists(os.path.join(directory, "notes.txt")))
+
+    def test_archive_overwrites_same_day(self):
+        module = self._load_enrich_module("build_daily_report_archive_overwrite")
+        with tempfile.TemporaryDirectory() as directory:
+            module._archive_dated_copy("first", directory, today="2026-10-16")
+            module._archive_dated_copy("second", directory, today="2026-10-16")
+            with open(os.path.join(directory, "2026-10-16.md"), encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "second")
 
     def test_section_cooldown_controls_state_retention(self):
         sections = importlib.import_module("tg_bot.report_sections")

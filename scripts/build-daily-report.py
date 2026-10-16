@@ -29,6 +29,10 @@ from tg_bot.daily_report import (  # noqa: E402
     select_events,
     select_visible_event_sections,
 )
+from tg_bot.report_research import (  # noqa: E402
+    _CONTENT_SOURCE_HEADER,
+    _FETCH_FAILURE_PREFIX,
+)
 from tg_bot.report_sections import (  # noqa: E402
     DEFAULT_REPORT_SECTIONS,
     EVENT_SECTION_IDS,
@@ -468,7 +472,7 @@ _SNAPSHOT_ENRICH_PROMPT = """\
 
 hn_items：每条给了标题，以及抓取到的原文正文（可能为空）。为每条给出 desc：
   2～4 句话，基于正文讲清楚这件事具体是什么、有什么关键信息或进展；
-  禁止只是换个说法复述标题；正文为空时只依据标题和已知事实，说明保持简短，不要推断任何细节。
+  禁止只是换个说法复述标题。
 
 steam_items：每条给了游戏名、官方简介、类型标签，以及一段网上搜到的相关资料（可能为空）。
   为每条给出 desc：2～4 句话，综合官方简介和搜索资料写清楚这是什么类型/题材的游戏、
@@ -499,7 +503,7 @@ def _snapshot_item_lines(section_text):
 
 def _snapshot_item_urls(suffix):
     """从链接引用块里按顺序取出 URL 列表。"""
-    return re.findall(r"^\d+\.\s*(\S+)", suffix or "", flags=re.MULTILINE)
+    return re.findall(r"^\d+\.\s*(\S+?)(?=</blockquote>|\s|$)", suffix or "", flags=re.MULTILINE)
 
 
 def _item_title(bullet_line):
@@ -551,6 +555,41 @@ def _github_section_items(section_text):
     return heading, items
 
 
+def _filter_hn(items, urls, articles, keep=5, min_chars=200):
+    """HN 条目只保留抓到足够正文的：正文为空/抓取失败/过短的整条剔除，取前 keep 条。
+    items、urls、articles 同步过滤，保证一一对应。"""
+    kept_items, kept_urls, kept_articles = [], [], []
+    for index, item in enumerate(items):
+        if len(kept_items) >= keep:
+            break
+        article = articles[index] if index < len(articles) else None
+        if not article or article.startswith(_FETCH_FAILURE_PREFIX):
+            continue
+        body = _CONTENT_SOURCE_HEADER.sub("", article, count=1).strip()
+        if len(body) < min_chars:
+            continue
+        kept_items.append(item)
+        kept_urls.append(urls[index] if index < len(urls) else "")
+        kept_articles.append(article)
+    return kept_items, kept_urls, kept_articles
+
+
+def _hn_link_block(urls):
+    """按保留下来的条目重新编号生成 HN 原文链接块（格式与 execute_hn_front_page 一致）。"""
+    if not urls:
+        return ""
+    body = "\n".join(f"{number}. {url}" for number, url in enumerate(urls, 1))
+    return f"<blockquote expandable>🔗 原文链接\n{body}</blockquote>"
+
+
+def _hn_section_text(heading, items, suffix):
+    """把 HN 标题、条目行和链接块拼回板块文本；没有条目时返回空字符串（板块自动隐藏）。"""
+    if not items:
+        return ""
+    text = "\n".join(([heading] if heading else []) + list(items))
+    return f"{text}\n{suffix}" if suffix else text
+
+
 def enrich_snapshot_sections(preserved_sections):
     """给 Steam / HN / GitHub 板块的每条追加人话说明；任何失败都原样降级。"""
     from tg_bot.tools.search import execute_search
@@ -596,6 +635,12 @@ def enrich_snapshot_sections(preserved_sections):
             elif kind == "steam_search":
                 steam_search[index] = result
 
+    # 正文抓不到或过短的 HN 条目整条剔除，不让模型对空正文编造说明
+    hn_raw_count = len(hn_items)
+    hn_items, hn_urls, hn_articles = _filter_hn(hn_items, hn_urls, hn_articles)
+    hn_suffix = _hn_link_block(hn_urls)
+    hn_plain = _hn_section_text(hn_heading, hn_items, hn_suffix)
+
     payload = {
         "hn_items": [
             {"title": _item_title(item), "article": (hn_articles[i] or "")[:2000]}
@@ -620,7 +665,10 @@ def enrich_snapshot_sections(preserved_sections):
     }
     data = _report_model_call(_SNAPSHOT_ENRICH_PROMPT, payload, verify=False)
     if not data:
-        return preserved_sections
+        fallback_sections = dict(preserved_sections)
+        if hn_raw_count:
+            fallback_sections["hackernews"] = hn_plain
+        return fallback_sections
 
     def _apply(heading, items, suffix, key):
         if not items:
@@ -647,6 +695,8 @@ def enrich_snapshot_sections(preserved_sections):
         return f"{text}\n{suffix}" if suffix else text
 
     new_sections = dict(preserved_sections)
+    if hn_raw_count:
+        new_sections["hackernews"] = hn_plain
     hn_text = _apply(hn_heading, hn_items, hn_suffix, "hn")
     if hn_text:
         new_sections["hackernews"] = hn_text
@@ -908,7 +958,7 @@ def register_builtin_snapshot_collectors(enabled=True):
 
     def hackernews_collector():
         from tg_bot.tools.native import execute_hn_front_page
-        raw = str(execute_hn_front_page(limit=5) or "").strip("\n")
+        raw = str(execute_hn_front_page(limit=8) or "").strip("\n")
         return "" if "无法获取" in raw else raw
 
     def proxy_collector():
@@ -1219,6 +1269,23 @@ def _report_push_lock(status_file):
         os.close(fd)
 
 
+def _archive_dated_copy(text, directory, today=None, keep=30):
+    """在目录里写一份 YYYY-MM-DD.md（同日覆盖），并只保留按文件名排序最新的 keep 份。
+    只删除文件名匹配日期格式的文件。"""
+    if today is None:
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+    dated = os.path.join(directory, f"{today}.md")
+    tmp = f"{dated}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, dated)
+    pattern = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+    names = sorted(name for name in os.listdir(directory) if pattern.match(name))
+    for name in names[: max(0, len(names) - keep)]:
+        os.remove(os.path.join(directory, name))
+
+
 def _publish_latest_markdown(report_text, path=None):
     """Write the report as Markdown for read-only consumers; never fail the run."""
     path = path or os.environ.get("DAILY_REPORT_MARKDOWN_FILE", "")
@@ -1239,6 +1306,11 @@ def _publish_latest_markdown(report_text, path=None):
         os.replace(tmp, path)
     except Exception as exc:
         print(f"WARNING latest_markdown_failed: {type(exc).__name__}", file=sys.stderr)
+        return
+    try:
+        _archive_dated_copy(text, os.path.dirname(path) or ".")
+    except Exception as exc:
+        print(f"WARNING dated_archive_failed:{type(exc).__name__}", file=sys.stderr)
 
 
 def main(argv=None) -> int:
