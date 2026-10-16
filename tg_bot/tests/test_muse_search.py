@@ -633,6 +633,15 @@ class CliTests(unittest.TestCase):
         self.assertIn("https://only.example.com/a", out)
         self.assertIn("仅单一非权威来源", out)
 
+    def test_infer_page_date(self):
+        from datetime import datetime, timezone
+        from tg_bot import muse_search as m
+        now = datetime(2026, 10, 16, tzinfo=timezone.utc)
+        self.assertEqual(m._infer_page_date("2021年2月8日 桃田贤斗眼窝骨折", now).year, 2021)
+        self.assertEqual(m._infer_page_date("发布于 2026-10-15 来源", now).day, 15)
+        self.assertIsNone(m._infer_page_date("没有日期的正文", now))
+        self.assertIsNone(m._infer_page_date("预计 2099-01-01 上市", now))
+
     def test_runner_exception_exits_1(self):
         import tempfile
 

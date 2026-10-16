@@ -117,6 +117,21 @@ def _parse_published(value, now):
     return dt
 
 
+_PAGE_DATE_RE = re.compile(r"(20\d{2})\s*[-年/.]\s*(\d{1,2})\s*[-月/.]\s*(\d{1,2})")
+
+
+def _infer_page_date(text, now):
+    """从正文开头 1500 字里找第一个合理日期(2000 年至今天),找不到返回 None。"""
+    for m in _PAGE_DATE_RE.finditer((text or "")[:1500]):
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if datetime(2000, 1, 1, tzinfo=timezone.utc) <= dt <= now + timedelta(days=2):
+            return dt
+    return None
+
+
 def _freshness(published_at, time_range, now):
     """按时间窗口计算新鲜度：未知 0.2，any 固定 0.5，窗口内线性衰减。"""
     dt = _parse_published(published_at, now)
@@ -507,13 +522,21 @@ def run_query(q, *, deps=None, now=None):
                 continue
             url = cand.get("url") or ""
             domain = (urlparse(url).hostname or "").lower()
+            date_str = str(cand["published_at"]) if cand.get("published_at") else "未知"
+            if _parse_published(cand.get("published_at"), now) is None:
+                inferred = _infer_page_date(text, now)
+                if inferred is not None:
+                    if (time_range in _WINDOW_SECONDS
+                            and (now - inferred).total_seconds() > 2 * _WINDOW_SECONDS[time_range]):
+                        continue  # 搜索结果没给日期,但正文里的日期明显过期
+                    date_str = inferred.date().isoformat() + "(正文内日期)"
             sid = f"S{len(pages) + 1}"
             pages[sid] = text[:6000]
             sources[sid] = {
                 "url": url,
                 "title": cand.get("title") or "",
                 "site": site_key(domain) if domain else "",
-                "date": str(cand["published_at"]) if cand.get("published_at") else "未知",
+                "date": date_str,
                 "domain": domain,
             }
         if not pages:
