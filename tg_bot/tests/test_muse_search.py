@@ -265,3 +265,93 @@ class RenderMarkdownTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelLayerTests(unittest.TestCase):
+    def _fake_config(self):
+        """tg_bot.config 需要真实环境变量，测试里用假模块替代。"""
+        import sys
+        from types import SimpleNamespace
+        from unittest import mock
+        fake = SimpleNamespace(_next_ds_key=lambda: "k", DEEPSEEK_MODEL="model-test",
+                               DEEPSEEK_API_BASE="https://example.invalid")
+        return mock.patch.dict(sys.modules, {"tg_bot.config": fake})
+
+    def test_call_model_returns_dict(self):
+        calls = []
+
+        def fake_post(url, body, headers=None, timeout=None):
+            calls.append(body)
+            return {"choices": [{"message": {"content": '{"a": 1}'}}]}
+
+        with self._fake_config():
+            result = ms.call_model("sys", {"q": "x"}, post=fake_post)
+        self.assertEqual(result, {"a": 1})
+        self.assertEqual(calls[0]["model"], "model-test")
+        self.assertEqual(calls[0]["thinking"], {"type": "disabled"})
+        self.assertEqual(calls[0]["temperature"], 0.0)
+
+    def test_call_model_bad_json_returns_none(self):
+        def fake_post(url, body, headers=None, timeout=None):
+            return {"choices": [{"message": {"content": "not json"}}]}
+        with self._fake_config():
+            self.assertIsNone(ms.call_model("sys", {"q": "x"}, post=fake_post))
+
+    def test_call_model_exception_returns_none(self):
+        def fake_post(url, body, headers=None, timeout=None):
+            raise RuntimeError("boom")
+        with self._fake_config():
+            self.assertIsNone(ms.call_model("sys", {"q": "x"}, post=fake_post))
+
+    def test_parse_extract_caps_and_filters(self):
+        raw = {"quotes": [
+            {"sid": "a", "quote": "一"}, {"sid": "a", "quote": "二"},
+            {"sid": "a", "quote": "三"}, {"sid": "a", "quote": "四"},
+            {"sid": "b", "quote": ""}, {"quote": "无 sid"}, {"sid": "c"},
+            {"sid": "c", "quote": "有效"},
+        ]}
+        result = ms.parse_extract(raw)
+        self.assertEqual([r["quote"] for r in result], ["一", "二", "三", "有效"])
+
+    def test_parse_extract_invalid_returns_empty(self):
+        for raw in (None, [], {"quotes": "x"}, {}):
+            with self.subTest(raw=raw):
+                self.assertEqual(ms.parse_extract(raw), [])
+
+    def test_parse_claims_valid(self):
+        raw = {
+            "claims": [{"text": "结论", "quote_ids": ["q1", "q2"]}],
+            "conflicts": [{"point": "分歧", "qids": ["q1", "q3"]}],
+        }
+        claims, conflicts = ms.parse_claims(raw)
+        self.assertEqual(claims, [{"text": "结论", "quote_ids": ["q1", "q2"]}])
+        self.assertEqual(conflicts, [{"point": "分歧", "qids": ["q1", "q3"]}])
+
+    def test_parse_claims_drops_bad_items(self):
+        raw = {
+            "claims": [
+                {"text": "无引用", "quote_ids": []},
+                {"text": "", "quote_ids": ["q1"]},
+                {"text": "有效", "quote_ids": ["q1", "q1", 3]},
+            ],
+            "conflicts": [
+                {"point": "只有一方", "qids": ["q1"]},
+                {"point": "", "qids": ["q1", "q2"]},
+            ],
+        }
+        claims, conflicts = ms.parse_claims(raw)
+        self.assertEqual(claims, [{"text": "有效", "quote_ids": ["q1"]}])
+        self.assertEqual(conflicts, [])
+        self.assertEqual(ms.parse_claims("bad"), ([], []))
+
+    def test_parse_verify_only_pass(self):
+        self.assertTrue(ms.parse_verify({"verdict": "pass"}))
+        for raw in ({"verdict": "fail"}, {"verdict": "unknown"}, {}, "pass", None):
+            with self.subTest(raw=raw):
+                self.assertFalse(ms.parse_verify(raw))
+
+    def test_prompts_nonempty_and_mention_json(self):
+        for prompt in (ms.REWRITE_PROMPT, ms.EXTRACT_PROMPT, ms.CLAIMS_PROMPT, ms.VERIFY_PROMPT):
+            with self.subTest(prompt=prompt[:10]):
+                self.assertTrue(prompt.strip())
+                self.assertIn("JSON", prompt)

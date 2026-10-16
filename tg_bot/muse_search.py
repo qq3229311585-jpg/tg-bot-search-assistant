@@ -273,3 +273,124 @@ def render_markdown(q, time_range, generated_at_iso, queries, accepted, quotes,
             lines.append(f"- {item.get('text')}: {item.get('reason')}")
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+# ---- 模型调用层 ----
+
+REWRITE_PROMPT = """你是搜索查询改写器。输入 JSON 含 question。只输出 JSON 对象，字段恰为：queries（2 到 4 条搜索词字符串，至少 1 条与原问题同语言；若问题涉及外文人名、赛事、公司，再加 1 条英文查询；每条要加上时间或实体限定，不得加入问题里没有的事实）、time_range（只能是 day、week、month、any；问题问"最近/今天/最新"用 day 或 week，没有时间含义用 any）、must_terms（1 到 5 个应当字面出现在相关新闻里的关键词）。"""
+
+EXTRACT_PROMPT = """你是证据摘录器。输入 JSON 含 question 和 pages（每项 sid、title、text）。只输出 JSON：{"quotes":[{"sid":..., "quote":...}]}。每个页面最多摘 3 句与问题直接相关的原文，必须从 text 中逐字复制，不得改写、拼接、翻译、省略号缩写；每条 quote 长度 8 到 200 字；页面与问题无关就不要摘；不得编造 sid。"""
+
+CLAIMS_PROMPT = """你是结论归纳器。输入 JSON 含 question 和 quotes（每项 qid、sid、quote）。只输出 JSON：{"claims":[{"text":..., "quote_ids":[...]}], "conflicts":[{"point":..., "qids":[...]}]}。只能依据给出的引文归纳，不得补充引文以外的任何信息；每条结论一句话，quote_ids 列出支撑它的引文编号；不同引文对同一事实说法不一致时，写入 conflicts（point 用一句话概括分歧点，qids 列出各方引文），不要自己选边；得不出结论就返回空数组。"""
+
+VERIFY_PROMPT = """你是独立核查器。输入 JSON 含 claim 和 quotes（每项 qid、quote）。只判断：仅凭这些引文，claim 是否被明确支持。只输出 JSON：{"verdict":"pass"|"fail"|"unknown"}；不确定或引文只是碰巧包含关键词而没有回答 claim 时不得输出 pass。"""
+
+
+def call_model(system_prompt, payload, *, timeout=60, post=None):
+    """调用模型，返回解析后的 dict；任何失败返回 None，不抛出。"""
+    try:
+        import tg_bot.config as config
+        if post is None:
+            from tg_bot.tools.fetch import http_post as post
+
+        key = config._next_ds_key()
+        model = getattr(config, "DEEPSEEK_MODEL", "deepseek-flash")
+        base = getattr(config, "DEEPSEEK_API_BASE", "https://api.deepseek.com")
+        response = post(
+            f"{base}/chat/completions",
+            {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                "max_tokens": 2000,
+                "temperature": 0.0,
+                "thinking": {"type": "disabled"},
+                "response_format": {"type": "json_object"},
+            },
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=timeout,
+        )
+        content = ""
+        if isinstance(response, dict) and response.get("choices"):
+            content = response["choices"][0]["message"].get("content") or ""
+        raw = content.strip()
+        if not raw:
+            return None
+        result = json.loads(raw)
+        return result if isinstance(result, dict) else None
+    except Exception as exc:
+        import sys
+        print(f"WARNING muse_model_call:{type(exc).__name__}", file=sys.stderr)
+        return None
+
+
+def parse_extract(raw):
+    """解析摘录结果为 [{"sid", "quote"}]；每 sid 最多 3 条，总数最多 30 条。"""
+    if not isinstance(raw, dict) or not isinstance(raw.get("quotes"), list):
+        return []
+    per_sid = {}
+    out = []
+    for item in raw["quotes"]:
+        if len(out) >= 30:
+            break
+        if not isinstance(item, dict):
+            continue
+        sid, quote = item.get("sid"), item.get("quote")
+        if not (isinstance(sid, str) and sid.strip()
+                and isinstance(quote, str) and quote.strip()):
+            continue
+        if per_sid.get(sid, 0) >= 3:
+            continue
+        per_sid[sid] = per_sid.get(sid, 0) + 1
+        out.append({"sid": sid, "quote": quote})
+    return out
+
+
+def _clean_str_list(values):
+    """去掉非空 str 以外的项，去重保序。"""
+    seen = []
+    for value in values:
+        if isinstance(value, str) and value.strip() and value not in seen:
+            seen.append(value)
+    return seen
+
+
+def parse_claims(raw):
+    """解析结论归纳结果，返回 (claims, conflicts)；不合法的项丢弃。"""
+    if not isinstance(raw, dict):
+        return [], []
+    claims, conflicts = [], []
+    if isinstance(raw.get("claims"), list):
+        for item in raw["claims"]:
+            if len(claims) >= 5:
+                break
+            if not isinstance(item, dict):
+                continue
+            text, ids = item.get("text"), item.get("quote_ids")
+            if not (isinstance(text, str) and text.strip() and isinstance(ids, list)):
+                continue
+            quote_ids = _clean_str_list(ids)
+            if not quote_ids:
+                continue
+            claims.append({"text": text, "quote_ids": quote_ids})
+    if isinstance(raw.get("conflicts"), list):
+        for item in raw["conflicts"]:
+            if len(conflicts) >= 3:
+                break
+            if not isinstance(item, dict):
+                continue
+            point, qids = item.get("point"), item.get("qids")
+            if not (isinstance(point, str) and point.strip() and isinstance(qids, list)):
+                continue
+            clean = _clean_str_list(qids)
+            if len(clean) < 2:
+                continue
+            conflicts.append({"point": point, "qids": clean})
+    return claims, conflicts
+
+
+def parse_verify(raw):
+    """仅当 verdict 明确为 pass 时返回 True。"""
+    return isinstance(raw, dict) and raw.get("verdict") == "pass"
