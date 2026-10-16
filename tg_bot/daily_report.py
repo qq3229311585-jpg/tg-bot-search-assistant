@@ -370,8 +370,8 @@ def _is_material_update(event: ReportEvent, previous: Mapping[str, object], now:
         return False
     old_tokens = _title_tokens(str(previous.get("title") or ""))
     new_tokens = _title_tokens(event.title)
-    old_sources = {str(item).lower() for item in previous.get("sources", []) or []}
-    new_sources = {item.domain for item in event.sources if item.domain}
+    old_sources = {site_key(str(item)) for item in previous.get("sources", []) or []}
+    new_sources = {site_key(item.domain) for item in event.sources if item.domain}
     if not old_tokens and not old_sources:
         return False
     old_numbers = set(re.findall(r"\d+(?:\.\d+)?", str(previous.get("summary") or "")))
@@ -547,7 +547,7 @@ def render_daily_report(
         for source in event.sources:
             url = str(source.url or "").strip()
             domain = _safe_http_domain(url)
-            domain_key = domain.casefold()
+            domain_key = site_key(domain)
             if not url or not domain_key or domain_key in seen_domains:
                 continue
             seen_domains.add(domain_key)

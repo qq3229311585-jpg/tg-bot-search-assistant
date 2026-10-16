@@ -2698,6 +2698,59 @@ class DailyReportTests(unittest.TestCase):
         self.assertNotIn("https://four.test/story", text)
         self.assertEqual(text.count("<blockquote expandable>"), 1)
 
+    def test_render_daily_report_dedupes_same_site_sources_across_subdomains(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        sources = tuple(
+            self.daily.NewsCandidate(
+                category="global",
+                title="Sina event",
+                summary="A factual summary.",
+                url=url,
+                domain=domain,
+                published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+                relevance=0.9,
+                source="fixture",
+            )
+            for domain, url in (
+                ("k.sina.cn", "https://k.sina.cn/article/1"),
+                ("finance.sina.com.cn", "https://finance.sina.com.cn/article/2"),
+            )
+        )
+        text = self.daily.render_daily_report(
+            [self._event(sources=sources)],
+            self.now,
+            section_specs=[sections.section_spec("global")],
+        )
+        self.assertEqual(text.count('<a href="'), 1)
+        self.assertIn("https://k.sina.cn/article/1", text)
+        self.assertNotIn("https://finance.sina.com.cn/article/2", text)
+
+    def test_material_update_ignores_same_site_subdomain_as_new_source(self):
+        previous = {
+            "last_published": (self.now - self.daily.timedelta(hours=48)).isoformat(),
+            "title": "Fresh event",
+            "summary": "A factual summary.",
+            "sources": ["k.sina.cn", "stats.gov.cn"],
+        }
+        sources = tuple(
+            self.daily.NewsCandidate(
+                category="global",
+                title="Fresh event",
+                summary="A factual summary.",
+                url=url,
+                domain=domain,
+                published_at=(self.now - self.daily.timedelta(hours=1)).isoformat(),
+                relevance=0.9,
+                source="fixture",
+            )
+            for domain, url in (
+                ("finance.sina.com.cn", "https://finance.sina.com.cn/article/3"),
+                ("stats.gov.cn", "https://stats.gov.cn/release/4"),
+            )
+        )
+        event = self.daily.ReportEvent("e-sina", "global", "Fresh event", "A factual summary.", sources)
+        self.assertFalse(self.daily._is_material_update(event, previous, self.now))
+
     def test_render_daily_report_derives_source_label_from_url_hostname(self):
         sections = importlib.import_module("tg_bot.report_sections")
         source = self.daily.NewsCandidate(
@@ -3911,6 +3964,47 @@ class DailyReportCollectionTests(unittest.TestCase):
                 candidates, diagnostics = module.collect_candidates(("china", "global"))
         self.assertEqual([item.category for item in candidates], ["china"])
         self.assertEqual(diagnostics, ["global: provider_error:TimeoutError"])
+
+    def _digest_candidate(self, module, title, summary=""):
+        return module.NewsCandidate(
+            category="global", title=title, summary=summary,
+            url="https://example.com/digest", domain="example.com", source="fixture",
+        )
+
+    def test_digest_title_dropped(self):
+        module = self._load_builder("build_daily_report_digest_title")
+        self.assertTrue(module._is_digest_item(self._digest_candidate(module, "新浪财经10月16日热点汇总")))
+
+    def test_normal_news_kept(self):
+        module = self._load_builder("build_daily_report_digest_normal")
+        self.assertFalse(module._is_digest_item(
+            self._digest_candidate(module, "港交所拟2028年下半年过渡至T+1结算")
+        ))
+
+    def test_keyword_single_topic_kept(self):
+        module = self._load_builder("build_daily_report_digest_single_topic")
+        self.assertFalse(module._is_digest_item(
+            self._digest_candidate(module, "A股盘点:券商股领涨", summary="券商股集体走强")
+        ))
+
+    def test_keyword_with_many_semicolons_dropped(self):
+        module = self._load_builder("build_daily_report_digest_semicolons")
+        self.assertTrue(module._is_digest_item(self._digest_candidate(
+            module, "今日财经速览", summary="甲公司扩产；乙公司涨价；丙公司回购；丁公司分红",
+        )))
+
+    def test_digest_diag_suffix(self):
+        module = self._load_builder("build_daily_report_digest_diag")
+        raw_items = [
+            {"title": "新浪财经10月16日热点汇总", "summary": "", "url": "https://k.sina.cn/digest", "source": "fixture"},
+            {"title": "港交所拟2028年下半年过渡至T+1结算", "summary": "事实摘要", "url": "https://example.com/hkex", "source": "fixture"},
+        ]
+        fake_search = unittest.mock.Mock(return_value=(raw_items, []))
+        found, diagnostics = module._collect_one_category("global", fake_search)
+        self.assertEqual([item.title for item in found], ["港交所拟2028年下半年过渡至T+1结算"])
+        dropped = [item for item in diagnostics if item.endswith(":dropped")]
+        self.assertEqual(len(dropped), 1)
+        self.assertTrue(dropped[0].startswith("global: digest:"))
 
     def test_report_content_hash_ignores_only_html_header_timestamp(self):
         module = self._load_builder("build_daily_report_hash")

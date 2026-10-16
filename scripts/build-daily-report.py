@@ -118,6 +118,21 @@ def _parse_search_output(result: str, category: str, source: str) -> list[NewsCa
     return candidates
 
 
+_DIGEST_TITLE_RE = re.compile(r"\d{1,2}月\d{1,2}日.{0,8}(热点|要闻)?(汇总|小时报|早报|晚报|速览|一览|盘点|合集)\s*$")
+_DIGEST_KEYWORDS = ("汇总", "小时报", "早报", "晚报", "午报", "速览", "一览", "合集", "榜单", "排行榜", "直播", "专题")
+
+
+def _is_digest_item(candidate) -> bool:
+    """Return True for multi-story roundup pages (汇总/快讯杂烩), not single news items."""
+    title = str(getattr(candidate, "title", "") or "")
+    summary = str(getattr(candidate, "summary", "") or "")
+    if _DIGEST_TITLE_RE.search(title):
+        return True
+    if any(keyword in title for keyword in _DIGEST_KEYWORDS) and summary.count("；") >= 3:
+        return True
+    return False
+
+
 def _collect_one_category(category, execute_news_candidates):
     """Collect one event lane in isolation for bounded parallel execution."""
     query = query_for_category(category)
@@ -128,7 +143,16 @@ def _collect_one_category(category, execute_news_candidates):
             for item in raw_items
         ]
         found = [item for item in found if not _is_blocked_news_domain(item.domain)]
+        digest_diagnostics = []
+        kept = []
+        for item in found:
+            if _is_digest_item(item):
+                digest_diagnostics.append(f"{category}: digest:{(item.title or '')[:20]}:dropped")
+            else:
+                kept.append(item)
+        found = kept
         diagnostics = [f"{category}: {item}" for item in provider_diagnostics]
+        diagnostics.extend(digest_diagnostics)
         if not found and not provider_diagnostics:
             diagnostics.append(f"{category}: no_candidates")
         return found, diagnostics
@@ -389,6 +413,7 @@ _COLD_KNOWLEDGE_PROMPT = """\
 · 不得使用 avoid 数组里已经出现过的具体知识点或说法，也不得只是换个说法重讲同一件事，
   必须是全新的、更具体的角度
 · 没有十足把握的具体数字/年代/名称，宁可省略或改用模糊表述，绝不能编造
+· 涉及天文、时间或数字的比较，必须区分清楚定义（例如恒星日与太阳日、自转与公转）；不确定就不要写比较，只陈述有把握的单个事实。
 只输出一个 JSON 对象，字段恰好为 content（正文字符串），不得输出任何额外字段、
 解释或 markdown 代码块标记。"""
 
