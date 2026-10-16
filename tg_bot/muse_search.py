@@ -446,6 +446,18 @@ def _default_dep(name):
     if name == "news":
         from tg_bot.tools.search import execute_news_candidates_all
         return execute_news_candidates_all
+    if name == "web_brave":
+        from tg_bot.tools.search import web_candidates_all, _web_from_brave
+        return lambda q: web_candidates_all(q, providers=(("brave", _web_from_brave),))
+    if name == "news_brave":
+        from tg_bot.tools.search import _news_from_brave
+        return _news_from_brave
+    if name == "web_serper":
+        from tg_bot.tools.search import web_candidates_all, _web_from_serper
+        return lambda q: web_candidates_all(q, providers=(("serper", _web_from_serper),))
+    if name == "web_tavily":
+        from tg_bot.tools.search import web_candidates_all, _web_from_tavily
+        return lambda q: web_candidates_all(q, providers=(("tavily", _web_from_tavily),))
     if name == "fetch":
         from tg_bot.tools.fetch import execute_fetch_content
         return execute_fetch_content
@@ -474,8 +486,13 @@ def _not_found(q, time_range, stamp, queries, reason):
                            [{"text": q, "reason": reason}])
 
 
+ENOUGH_SITES = 6
+LAST_SEARCH_CALLS = 0
+
+
 def run_query(q, *, deps=None, now=None):
     """执行完整查询流程并返回 Markdown；任何内部错误降级为"没有找到"，不抛出。"""
+    global LAST_SEARCH_CALLS
     if now is None:
         now = datetime.now(timezone.utc)
     stamp = now.isoformat(timespec="seconds")
@@ -493,24 +510,53 @@ def run_query(q, *, deps=None, now=None):
         rewrite = parse_rewrite(_safe_call(model, REWRITE_PROMPT, {"question": q}), q)
         time_range, queries = rewrite["time_range"], rewrite["queries"]
 
-        web, news = dep("web"), dep("news")
         fetch, canon = dep("fetch"), dep("canon")
-        jobs = [(web, variant) for variant in queries[:4]]
-        if time_range in ("day", "week"):
-            jobs += [(news, variant) for variant in queries[:4]]
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            results = list(pool.map(lambda job: _safe_call(job[0], job[1]), jobs))
         rows, seen = [], set()
-        for result in results:
-            for row in _rows_from(result):
-                url = row.get("url") or ""
-                if not url:
-                    continue
-                key = canon(url)
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append(row)
+
+        def merge(results):
+            for result in results:
+                for row in _rows_from(result):
+                    url = row.get("url") or ""
+                    if not url:
+                        continue
+                    key = canon(url)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(row)
+
+        search_calls = 0
+        legacy = bool(injected) and ("web" in injected or "news" in injected) and "web_brave" not in injected
+        if legacy:
+            web, news = dep("web"), dep("news")
+            jobs = [(web, variant) for variant in queries[:4]]
+            if time_range in ("day", "week"):
+                jobs += [(news, variant) for variant in queries[:4]]
+            search_calls = len(jobs)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                merge(list(pool.map(lambda job: _safe_call(job[0], job[1]), jobs)))
+        else:
+            variants = queries[:3]
+
+            def run_stage(jobs):
+                nonlocal search_calls
+                search_calls += len(jobs)
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    merge(list(pool.map(lambda job: _safe_call(job[0], job[1]), jobs)))
+
+            def enough():
+                hosts = {urlparse(row.get("url") or "").hostname for row in rows}
+                return len({site_key(h) for h in hosts if h}) >= ENOUGH_SITES
+
+            stage1 = [(dep("web_brave"), v) for v in variants]
+            if time_range in ("day", "week"):
+                stage1 += [(dep("news_brave"), v) for v in variants]
+            run_stage(stage1)
+            if variants and not enough():
+                run_stage([(dep("web_serper"), v) for v in variants])
+            if variants and not enough():
+                run_stage([(dep("web_tavily"), variants[0])])
+        LAST_SEARCH_CALLS = search_calls
 
         ranked = rank_candidates(rows, rewrite["must_terms"], time_range, now)
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -626,21 +672,24 @@ class _QueryTimeout(BaseException):
     """超时信号专用:继承 BaseException,避免被内部 `except Exception` 吞掉。"""
 
 
-def _audit(log_path, status, q, started, result_chars):
+def _audit(log_path, status, q, started, result_chars, extra=None):
     """追加一行 JSON 审计日志；任何异常都吞掉，不影响主流程。"""
     try:
         import hashlib
         import time
         from datetime import datetime as _dt, timezone as _tz
         q = q or ""
-        line = json.dumps({
+        record = {
             "ts": _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "status": status,
             "q_sha256": hashlib.sha256(q.encode("utf-8")).hexdigest(),
             "q": q[:300],
             "elapsed_ms": int((time.monotonic() - started) * 1000),
             "result_chars": result_chars,
-        }, ensure_ascii=False)
+        }
+        if extra:
+            record.update(extra)
+        line = json.dumps(record, ensure_ascii=False)
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except Exception:
@@ -744,7 +793,8 @@ def main(argv=None, *, stdin_bytes=None, runner=None, env=None):
             _audit(log_path, "error", q, started, 0)
             return 1
         emit(result)
-        _audit(log_path, "ok", q, started, len(result))
+        _audit(log_path, "ok", q, started, len(result),
+               extra={"search_calls": LAST_SEARCH_CALLS})
         return 0
     finally:
         if slot is not None:

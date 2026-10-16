@@ -660,3 +660,100 @@ class CliTests(unittest.TestCase):
             code, out = self._main(env, lambda q: "RESULT")
             self.assertEqual(code, 0)
             self.assertIn("RESULT", out)
+
+
+def _sites(n, prefix="s"):
+    return [{"url": f"https://{prefix}{i}.com/a", "title": f"t{prefix}{i}",
+             "summary": "", "published_at": None} for i in range(n)]
+
+
+class AdaptiveSearchTests(unittest.TestCase):
+    QUERIES = ["q1", "q2", "q3"]
+
+    def _run(self, *, time_range="any", deps_extra=None, legacy=False):
+        calls = {"web_brave": [], "news_brave": [], "web_serper": [], "web_tavily": [],
+                 "web": [], "news": []}
+        rewrite = {"queries": list(self.QUERIES), "time_range": time_range, "must_terms": []}
+
+        def model(system_prompt, payload):
+            if system_prompt == ms.REWRITE_PROMPT:
+                return rewrite
+            return None
+
+        def recorder(name, rows):
+            def fn(query):
+                calls[name].append(query)
+                return list(rows), {}
+            return fn
+
+        deps = {"model": model, "fetch": lambda url: "", "canon": lambda url: url}
+        if legacy:
+            deps["web"] = recorder("web", _sites(1))
+            deps["news"] = recorder("news", [])
+        else:
+            deps["web_brave"] = recorder("web_brave", _sites(6, "b"))
+            deps["news_brave"] = recorder("news_brave", [])
+            deps["web_serper"] = recorder("web_serper", [])
+            deps["web_tavily"] = recorder("web_tavily", [])
+        deps.update(deps_extra or {})
+        ms.run_query("问题", deps=deps, now=NOW)
+        return calls
+
+    def test_stops_after_brave_when_enough_sites(self):
+        calls = self._run()
+        self.assertEqual(calls["web_serper"], [])
+        self.assertEqual(calls["web_tavily"], [])
+        self.assertEqual(ms.LAST_SEARCH_CALLS, 3)
+
+    def test_escalates_to_serper_when_few_sites(self):
+        serper_calls = []
+
+        def serper(q):
+            serper_calls.append(q)
+            return _sites(4, "c"), {}
+
+        calls = self._run(deps_extra={"web_brave": lambda q: (_sites(2, "b"), {}),
+                                      "web_serper": serper})
+        self.assertEqual(len(serper_calls), 3)
+        self.assertEqual(calls["web_tavily"], [])  # 2 + 4 sites reaches ENOUGH_SITES
+        self.assertEqual(ms.LAST_SEARCH_CALLS, 6)
+
+    def test_tavily_called_once_at_most(self):
+        tavily_calls = []
+
+        def tavily(q):
+            tavily_calls.append(q)
+            return _sites(1, "t"), {}
+
+        self._run(deps_extra={
+            "web_brave": lambda q: (_sites(1, "b"), {}),
+            "web_serper": lambda q: (_sites(1, "c"), {}),
+            "web_tavily": tavily,
+        })
+        self.assertEqual(tavily_calls, ["问题"])
+        self.assertEqual(ms.LAST_SEARCH_CALLS, 7)
+
+    def test_news_brave_only_for_day_week(self):
+        calls = self._run(time_range="day")
+        self.assertEqual(len(calls["news_brave"]), 3)
+        calls = self._run(time_range="any")
+        self.assertEqual(calls["news_brave"], [])
+
+    def test_legacy_deps_still_work(self):
+        calls = self._run(legacy=True)
+        self.assertEqual(sorted(calls["web"]), sorted(["问题", "q1", "q2", "q3"]))
+        self.assertEqual(calls["news"], [])
+        self.assertEqual(calls["web_brave"], [])
+        self.assertEqual(ms.LAST_SEARCH_CALLS, 4)  # legacy path keeps queries[:4]
+
+    def test_audit_extra_written(self):
+        import os
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "audit.log")
+            ms._audit(path, "ok", "q", time.monotonic(), 3, extra={"search_calls": 5})
+            with open(path, encoding="utf-8") as fh:
+                record = json.loads(fh.readline())
+        self.assertEqual(record["search_calls"], 5)
+        self.assertEqual(record["status"], "ok")
