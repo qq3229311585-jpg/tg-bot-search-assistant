@@ -2470,6 +2470,11 @@ class SiteKeyTests(unittest.TestCase):
             with self.subTest(domain=domain):
                 self.assertEqual(self.research.site_key(domain), "sina.com.cn")
 
+    def test_weibo_merged_into_sina(self):
+        for domain in ("weibo.com", "m.weibo.cn", "www.sina.cn"):
+            with self.subTest(domain=domain):
+                self.assertEqual(self.research.site_key(domain), "sina.com.cn")
+
     def test_21jingji(self):
         self.assertEqual(
             self.research.site_key("m.21jingji.com"),

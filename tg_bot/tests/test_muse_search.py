@@ -263,6 +263,72 @@ class RenderMarkdownTests(unittest.TestCase):
         self.assertIn("## 没有找到 / 未通过核查", text)
 
 
+COPY_COMMON = "据新华社北京十月十五日电国务院办公厅印发了关于推进城市更新的指导意见要求各地落实相关任务并于年底前完成全部试点工作"
+
+
+def _src(sid, site):
+    return {"url": f"https://{site}/{sid}", "title": sid, "site": site, "date": None, "domain": site}
+
+
+class SameOriginTests(unittest.TestCase):
+    def test_shares_long_run_true_for_copy(self):
+        a = "甲网站转载：" + COPY_COMMON + "以上为全文。"
+        b = "乙站写道 " + COPY_COMMON + " 此外另有信息。"
+        self.assertTrue(ms._shares_long_run(a, b))
+        self.assertFalse(ms._shares_long_run(a, "另一段毫无关系的文字讲的是天气与海洋在远方的城市里发生的许多事情"))
+        self.assertFalse(ms._shares_long_run(COPY_COMMON[:30], COPY_COMMON[:30]))
+
+    def test_copy_across_sites_counts_as_one(self):
+        sources = {"T1": _src("T1", "a-site.com"), "T2": _src("T2", "b-site.org")}
+        quotes = [
+            {"sid": "T1", "quote": "甲：" + COPY_COMMON, "qid": "Q1"},
+            {"sid": "T2", "quote": "乙转载 " + COPY_COMMON, "qid": "Q2"},
+        ]
+        accepted, rejected = ms.corroborate(
+            [{"text": "结论", "quote_ids": ["Q1", "Q2"]}], quotes, sources)
+        self.assertEqual(accepted, [])
+        self.assertEqual(rejected[0]["reason"], "仅单一非权威来源")
+
+    def test_independent_quotes_still_pass(self):
+        sources = {"T1": _src("T1", "a-site.com"), "T2": _src("T2", "b-site.org")}
+        quotes = [
+            {"sid": "T1", "quote": "甲方说明了事实的细节", "qid": "Q1"},
+            {"sid": "T2", "quote": "乙方也确认了这件事", "qid": "Q2"},
+        ]
+        accepted, rejected = ms.corroborate(
+            [{"text": "结论", "quote_ids": ["Q1", "Q2"]}], quotes, sources)
+        self.assertEqual(rejected, [])
+        self.assertIn("互证 2 站", accepted[0]["credibility"])
+
+    def test_partial_copy_credibility_note(self):
+        sources = {"T1": _src("T1", "a-site.com"), "T2": _src("T2", "b-site.org"),
+                   "T3": _src("T3", "c-site.net")}
+        quotes = [
+            {"sid": "T1", "quote": "甲：" + COPY_COMMON, "qid": "Q1"},
+            {"sid": "T2", "quote": "乙转载 " + COPY_COMMON, "qid": "Q2"},
+            {"sid": "T3", "quote": "丙方独立报道的内容与其他完全不同", "qid": "Q3"},
+        ]
+        accepted, rejected = ms.corroborate(
+            [{"text": "结论", "quote_ids": ["Q1", "Q2", "Q3"]}], quotes, sources)
+        self.assertEqual(rejected, [])
+        self.assertIn("互证 2 站", accepted[0]["credibility"])
+        self.assertIn("转载同源", accepted[0]["credibility"])
+
+    def test_authority_fallback_with_copies(self):
+        sources = {"T1": _src("T1", "a-site.com"), "T4": _src("T4", "reuters.com")}
+        quotes = [
+            {"sid": "T1", "quote": "甲：" + COPY_COMMON, "qid": "Q1"},
+            {"sid": "T4", "quote": "路透转载 " + COPY_COMMON, "qid": "Q2"},
+        ]
+        accepted, rejected = ms.corroborate(
+            [{"text": "结论", "quote_ids": ["Q1", "Q2"]}], quotes, sources)
+        self.assertEqual(rejected, [])
+        self.assertIn("权威", accepted[0]["credibility"])
+
+    def test_claims_prompt_mentions_timezone(self):
+        self.assertIn("时区", ms.CLAIMS_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()
 

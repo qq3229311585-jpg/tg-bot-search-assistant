@@ -216,6 +216,49 @@ def verify_quotes(quotes, pages):
     return kept
 
 
+COPY_RUN_CHARS = 40
+_COPY_STRIP_RE = re.compile(r'[\s，。,.、；;：:"“”\'‘’()（）\[\]【】《》]+')
+
+
+def _shares_long_run(a, b, n=COPY_RUN_CHARS):
+    """两段引文是否含有长度 >= n 的完全相同片段（去空白和常见标点后比较）。"""
+    import difflib
+    a = _COPY_STRIP_RE.sub("", normalize_ws(a))
+    b = _COPY_STRIP_RE.sub("", normalize_ws(b))
+    if len(a) < n or len(b) < n:
+        return False
+    match = difflib.SequenceMatcher(None, a, b, autojunk=False).find_longest_match(0, len(a), 0, len(b))
+    return match.size >= n
+
+
+def _origin_groups(sids, quotes_by_sid, site_of):
+    """把同站的来源先合并，再把不同站之间引文有长段相同的来源合并，返回独立来源数。"""
+    parent = {sid: sid for sid in sids}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        parent[find(x)] = find(y)
+
+    ordered = sorted(sids)
+    for i, x in enumerate(ordered):
+        for y in ordered[i + 1:]:
+            if site_of.get(x) and site_of.get(x) == site_of.get(y):
+                union(x, y)
+    for i, x in enumerate(ordered):
+        for y in ordered[i + 1:]:
+            if find(x) == find(y) or site_of.get(x) == site_of.get(y):
+                continue
+            if any(_shares_long_run(p, q)
+                   for p in quotes_by_sid.get(x, []) for q in quotes_by_sid.get(y, [])):
+                union(x, y)
+    return len({find(sid) for sid in ordered})
+
+
 def corroborate(claims, quotes, sources):
     """按站点互证或权威来源判定结论是否通过，返回 (accepted, rejected)。"""
     qid_map = {q["qid"]: q for q in quotes}
@@ -233,8 +276,17 @@ def corroborate(claims, quotes, sources):
         sids = {qid_map[qid]["sid"] for qid in quote_ids}
         present = [sources[sid] for sid in sids if sid in sources]
         sites = {src.get("site") for src in present if src.get("site")}
-        if len(sites) >= 2:
-            credibility = f"互证 {len(sites)} 站 ({', '.join(sorted(sites))})"
+        quotes_by_sid = {}
+        for qid in quote_ids:
+            qu = qid_map[qid]
+            quotes_by_sid.setdefault(qu["sid"], []).append(qu["quote"])
+        site_sids = {sid for sid in sids if sources.get(sid, {}).get("site")}
+        site_of = {sid: sources[sid].get("site") for sid in site_sids}
+        groups = _origin_groups(site_sids, quotes_by_sid, site_of) if site_sids else 0
+        if groups >= 2:
+            credibility = f"互证 {groups} 站 ({', '.join(sorted(sites))})"
+            if groups < len(sites):
+                credibility += ";其中有转载同源"
         else:
             authority = sorted(src.get("domain") for src in present
                                if _is_authority_domain(src.get("domain") or ""))
@@ -321,7 +373,7 @@ REWRITE_PROMPT = """你是搜索查询改写器。输入 JSON 含 question。只
 
 EXTRACT_PROMPT = """你是证据摘录器。输入 JSON 含 question 和 pages（每项 sid、title、text）。只输出 JSON：{"quotes":[{"sid":..., "quote":...}]}。每个页面最多摘 3 句与问题直接相关的原文，必须从 text 中逐字复制，不得改写、拼接、翻译、省略号缩写；每条 quote 长度 8 到 200 字；页面与问题无关就不要摘；不得编造 sid。"""
 
-CLAIMS_PROMPT = """你是结论归纳器。输入 JSON 含 question 和 quotes（每项 qid、sid、quote）。只输出 JSON：{"claims":[{"text":..., "quote_ids":[...]}], "conflicts":[{"point":..., "qids":[...]}]}。只能依据给出的引文归纳，不得补充引文以外的任何信息；每条结论一句话，quote_ids 列出支撑它的引文编号；不同引文对同一事实说法不一致时，写入 conflicts（point 用一句话概括分歧点，qids 列出各方引文），不要自己选边；得不出结论就返回空数组。"""
+CLAIMS_PROMPT = """你是结论归纳器。输入 JSON 含 question 和 quotes（每项 qid、sid、quote）。只输出 JSON：{"claims":[{"text":..., "quote_ids":[...]}], "conflicts":[{"point":..., "qids":[...]}]}。只能依据给出的引文归纳，不得补充引文以外的任何信息；每条结论一句话，quote_ids 列出支撑它的引文编号；不同引文对同一事实说法不一致时，写入 conflicts（point 用一句话概括分歧点，qids 列出各方引文），不要自己选边；但时区不同（如北京时间与美国时间）、单位换算、同一事实的不同写法或表述详略不同，都不算冲突；只有数字或事实本身互相矛盾才写入 conflicts。得不出结论就返回空数组。"""
 
 VERIFY_PROMPT = """你是独立核查器。输入 JSON 含 claim 和 quotes（每项 qid、quote）。只判断：仅凭这些引文，claim 是否被明确支持。只输出 JSON：{"verdict":"pass"|"fail"|"unknown"}；不确定或引文只是碰巧包含关键词而没有回答 claim 时不得输出 pass。"""
 

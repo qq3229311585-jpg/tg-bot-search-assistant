@@ -38,7 +38,9 @@ _MULTI_PART_SUFFIXES = (
     ".com.cn", ".net.cn", ".org.cn", ".gov.cn", ".com.tw", ".com.hk",
     ".com.sg", ".co.uk", ".co.jp",
 )
-_SITE_ALIASES = {"sina.cn": "sina.com.cn", "sina.com": "sina.com.cn"}
+_SITE_ALIASES = {"sina.cn": "sina.com.cn", "sina.com": "sina.com.cn",
+                 "weibo.com": "sina.com.cn", "weibo.cn": "sina.com.cn",
+                 "sina.com.cn": "sina.com.cn"}
 
 
 def site_key(domain: str) -> str:
