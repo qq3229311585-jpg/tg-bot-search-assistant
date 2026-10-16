@@ -1087,3 +1087,44 @@ class ReinforceRunQueryTests(unittest.TestCase):
         _, plain_calls = self._run(claim_rows=[], rows=ROWS, claim_quote_ids=("Q1", "Q2"))
         self.assertNotIn(CLAIM_TEXT, plain_calls)
         self.assertEqual(ms.LAST_SEARCH_CALLS, len(plain_calls))
+
+
+class UntrustedCorroborateTests(unittest.TestCase):
+    UNTRUSTED_SOURCES = dict(SOURCES, S5={
+        "url": "https://k.sina.com.cn/5", "title": "新浪", "site": "sina.com.cn",
+        "date": None, "domain": "k.sina.com.cn"})
+    UNTRUSTED_QUOTES = QUOTES + [{"sid": "S5", "quote": "新浪转述了同一件事", "qid": "Q5"}]
+
+    def test_untrusted_plus_trusted_single_is_single_source(self):
+        accepted, rejected = ms.corroborate(
+            [{"text": "结论", "quote_ids": ["Q5", "Q1"]}],
+            self.UNTRUSTED_QUOTES, self.UNTRUSTED_SOURCES, allow_single=True)
+        self.assertEqual(rejected, [])
+        self.assertTrue(accepted[0]["credibility"].startswith("单一来源"))
+        self.assertIn("a.test", accepted[0]["credibility"])
+        self.assertIs(accepted[0]["single"], True)
+
+    def test_untrusted_plus_trusted_default_rejected(self):
+        accepted, rejected = ms.corroborate(
+            [{"text": "结论", "quote_ids": ["Q5", "Q1"]}],
+            self.UNTRUSTED_QUOTES, self.UNTRUSTED_SOURCES)
+        self.assertEqual(accepted, [])
+        self.assertEqual(rejected[0]["reason"], "仅单一非权威来源")
+
+    def test_two_trusted_plus_untrusted_still_corroborated(self):
+        accepted, rejected = ms.corroborate(
+            [{"text": "结论", "quote_ids": ["Q1", "Q2", "Q5"]}],
+            self.UNTRUSTED_QUOTES, self.UNTRUSTED_SOURCES)
+        self.assertEqual(rejected, [])
+        self.assertEqual(accepted[0]["credibility"], "互证 2 站 (a.test, b.test)")
+
+    def test_reinforce_skips_untrusted_domain_rows(self):
+        claim, quotes, sources, pages = _reinforce_fixture()
+        fetched = []
+        ok = ms.reinforce_claim(claim, quotes, sources, pages, **_reinforce_kwargs(
+            search=lambda q: [{"url": "https://k.sina.com.cn/news/9", "title": "新浪",
+                               "published_at": None}],
+            fetch=lambda url: fetched.append(url) or BODY_B))
+        self.assertFalse(ok)
+        self.assertEqual(fetched, [])
+        self.assertEqual(claim["quote_ids"], ["Q1"])

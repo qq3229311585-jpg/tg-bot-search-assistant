@@ -33,6 +33,19 @@ def _is_authority_domain(domain: str) -> bool:
     )
 
 
+# 不可信域名：质量不稳，可以引用，但不计入“独立站点互证”。
+_UNTRUSTED_DOMAINS = ("k.sina.com.cn", "k.sina.cn", "smzdm.com", "molihua.org")
+
+
+def _is_untrusted_domain(domain: str) -> bool:
+    domain = (domain or "").lower()
+    if not domain:
+        return False
+    return domain in _UNTRUSTED_DOMAINS or any(
+        domain.endswith(f".{suffix}") for suffix in _UNTRUSTED_DOMAINS
+    )
+
+
 _SITE_PREFIXES = ("www.", "m.", "k.", "mobile.", "wap.", "3g.")
 _MULTI_PART_SUFFIXES = (
     ".com.cn", ".net.cn", ".org.cn", ".gov.cn", ".com.tw", ".com.hk",
@@ -439,7 +452,7 @@ def parse_summary(bundle: EvidenceBundle, raw: object) -> VerifiedSummary | Drop
     if any(source_id not in sources_by_id for source_id in source_ids):
         return None
     cited_domains = {sources_by_id[source_id].domain for source_id in source_ids}
-    cited_sites = {site_key(domain) for domain in cited_domains}
+    cited_sites = {site_key(domain) for domain in cited_domains if not _is_untrusted_domain(domain)}
     # 至少两个独立站点互证（同站不同域名不算）；单一信源时，只有权威/官方域名才放行。
     if len(cited_sites) < 2 and not any(_is_authority_domain(domain) for domain in cited_domains):
         return None

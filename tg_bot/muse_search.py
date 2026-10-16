@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json, re, time, unicodedata
 from urllib.parse import urlparse
 
-from tg_bot.report_research import site_key, _is_authority_domain
+from tg_bot.report_research import site_key, _is_authority_domain, _is_untrusted_domain
 
 MAX_STDIN_BYTES = 4096
 MIN_Q_CHARS = 2
@@ -286,12 +286,15 @@ def corroborate(claims, quotes, sources, allow_single=False):
             continue
         sids = {qid_map[qid]["sid"] for qid in quote_ids}
         present = [sources[sid] for sid in sorted(sids) if sid in sources]
-        sites = {src.get("site") for src in present if src.get("site")}
+        # 不可信域名可引用，但不计入站点互证
+        trusted = [src for src in present if not _is_untrusted_domain(src.get("domain") or "")]
+        sites = {src.get("site") for src in trusted if src.get("site")}
         quotes_by_sid = {}
         for qid in quote_ids:
             qu = qid_map[qid]
             quotes_by_sid.setdefault(qu["sid"], []).append(qu["quote"])
-        site_sids = {sid for sid in sids if sources.get(sid, {}).get("site")}
+        site_sids = {sid for sid in sids if sources.get(sid, {}).get("site")
+                     and not _is_untrusted_domain(sources[sid].get("domain") or "")}
         site_of = {sid: sources[sid].get("site") for sid in site_sids}
         groups = _origin_groups(site_sids, quotes_by_sid, site_of) if site_sids else 0
         single = False
@@ -305,7 +308,8 @@ def corroborate(claims, quotes, sources, allow_single=False):
             if authority:
                 credibility = f"权威 {authority[0]}"
             elif allow_single:
-                site = next((src.get("site") for src in present if src.get("site")), None)
+                site = next((src.get("site") for src in trusted if src.get("site")), None)
+                site = site or next((src.get("site") for src in present if src.get("site")), None)
                 site = site or next((src.get("domain") for src in present if src.get("domain")), "")
                 credibility = f"单一来源 {site}"
                 single = True
@@ -646,6 +650,8 @@ def reinforce_claim(claim, quotes, sources, pages, *, search, fetch, extract, ve
             if not url or url in known_urls or any(url == p[1] for p in picked):
                 continue
             domain = (urlparse(url).hostname or "").lower()
+            if _is_untrusted_domain(domain):
+                continue
             site = site_key(domain) if domain else ""
             if not site or site in existing_sites or site in new_sites:
                 continue

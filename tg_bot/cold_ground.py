@@ -10,7 +10,11 @@ from urllib.parse import quote
 
 WIKI_API = "https://zh.wikipedia.org/w/api.php"
 
-_TITLE_BLOCKLIST = ("列表", "消歧义", "年表", "分类:")
+_TITLE_BLOCKLIST = (
+    "列表", "消歧义", "年表", "分类:",
+    "中心", "研究所", "大学", "学院", "公司", "协会", "委员会", "实验室", "博物馆",
+    "电影", "电视剧", "游戏", "专辑", "小说", "漫画",
+)
 
 
 def wiki_search(topic, *, get):
@@ -80,7 +84,10 @@ COLD_GROUND_PROMPT = (
     "3. 写一段 120～200 字的连续中文，不分点、不用小标题，"
     "不要以“你知道吗”之类的话开头。\n"
     "4. 不得重复 avoid 中的知识点。\n"
-    "5. 只输出一个 JSON 对象，字段恰好为 content，例如 {\"content\": \"……\"}。"
+    "5. 从材料里选最出人意料、最具体的一个事实来写（带数字或实例），"
+    "不要写机构、人物或作品的简介。\n"
+    "6. 如果材料整体都是机构/人物/作品介绍而没有可讲的具体事实，输出 {\"content\": \"\"}。\n"
+    "7. 只输出一个 JSON 对象，字段恰好为 content，例如 {\"content\": \"……\"}。"
     "不要输出任何其他文字。"
 )
 
@@ -89,8 +96,9 @@ def build_grounded(topic, avoid, day_of_year, *, get, model, max_attempts=3):
     titles = wiki_search(topic, get=get)
     if not titles:
         return None
-    k = day_of_year % len(titles)
-    rotated = titles[k:] + titles[:k]
+    pool = titles[:8]
+    k = day_of_year % len(pool)
+    rotated = pool[k:] + pool[:k]
     candidates = [t for t in rotated if not any(t in a for a in avoid)]
 
     attempts = 0
@@ -98,7 +106,7 @@ def build_grounded(topic, avoid, day_of_year, *, get, model, max_attempts=3):
         if attempts >= max_attempts:
             break
         extract = wiki_extract(title, get=get)
-        if len(extract) < 300:
+        if len(extract) < 1200:
             continue
         attempts += 1
         payload = {

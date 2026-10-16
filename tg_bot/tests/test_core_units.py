@@ -5021,5 +5021,48 @@ class GatherFallbackTests(unittest.TestCase):
         self.assertEqual(meta["source_index"], sources)
 
 
+class UntrustedDomainTests(unittest.TestCase):
+    def setUp(self):
+        self.research = importlib.import_module("tg_bot.report_research")
+
+    def _bundle_with(self, domain_s1, domain_s2):
+        base = self.research
+        return base.EvidenceBundle("event-1", "global", "Seed", (
+            base.EvidenceSource("S1", "brave", "q1", "Source one", f"https://{domain_s1}/a",
+                                domain_s1, "2026-07-17T05:00:00+00:00", "snippet one",
+                                "full facts one", "ok"),
+            base.EvidenceSource("S2", "serper", "q2", "Source two", f"https://{domain_s2}/b",
+                                domain_s2, "2026-07-17T05:10:00+00:00", "snippet two",
+                                "full facts two", "ok"),
+        ))
+
+    def test_is_untrusted_domain_matches_listed_and_subdomains_only(self):
+        fn = self.research._is_untrusted_domain
+        for domain in ("k.sina.com.cn", "k.sina.cn", "smzdm.com", "www.smzdm.com", "molihua.org"):
+            with self.subTest(domain=domain):
+                self.assertTrue(fn(domain))
+        for domain in ("sina.com.cn", "news.sina.com.cn", "notsmzdm.com", ""):
+            with self.subTest(domain=domain):
+                self.assertFalse(fn(domain))
+
+    def test_parse_summary_untrusted_plus_plain_is_rejected(self):
+        bundle = self._bundle_with("k.sina.com.cn", "plain.test")
+        raw = {"id": "event-1", "title": "事实标题", "summary": "事实摘要",
+               "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False}
+        self.assertIsNone(self.research.parse_summary(bundle, raw))
+
+    def test_parse_summary_two_plain_sites_pass(self):
+        bundle = self._bundle_with("one.test", "two.test")
+        raw = {"id": "event-1", "title": "事实标题", "summary": "事实摘要",
+               "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False}
+        self.assertIsNotNone(self.research.parse_summary(bundle, raw))
+
+    def test_parse_summary_untrusted_plus_authority_passes(self):
+        bundle = self._bundle_with("k.sina.com.cn", "gov.cn")
+        raw = {"id": "event-1", "title": "事实标题", "summary": "事实摘要",
+               "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False}
+        self.assertIsNotNone(self.research.parse_summary(bundle, raw))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,7 @@ import unittest
 
 from tg_bot import cold_ground as cg
 
-LONG = "这是一段很长的维基百科材料内容。" * 20  # 320 字，超过 300 的最短材料要求
+LONG = "这是一段很长的维基百科材料内容。" * 80  # 1280 字，超过 1200 的材料长度门槛
 
 
 def _search_json(titles):
@@ -50,6 +50,12 @@ class SearchTests(unittest.TestCase):
 
         self.assertEqual(cg.wiki_search("动物", get=get), ["猫", "狗"])
         self.assertIn("list=search", seen[0])
+
+    def test_wiki_search_filters_institution_titles(self):
+        def get(url):
+            return _search_json(["某某研究中心", "某某研究所", "某某大学", "某某电影", "恒星"])
+
+        self.assertEqual(cg.wiki_search("天文", get=get), ["恒星"])
 
     def test_wiki_search_bad_response_returns_empty(self):
         for raw in ("not json", "", '{"foo": 1}'):
@@ -112,6 +118,31 @@ class BuildGroundedTests(unittest.TestCase):
         result = cg.build_grounded("主题", ["乙相关的旧讲解"], 0, get=get, model=model)
         self.assertEqual(calls, ["丙"])
         self.assertIn("《丙》", result)
+
+    def test_build_grounded_rotates_only_within_first_eight_titles(self):
+        titles = [f"条目{i}" for i in range(12)]
+        get = FakeWiki(titles, {t: "1998年" + LONG for t in titles})
+        for day in range(12):
+            calls = []
+
+            def model(prompt, payload):
+                calls.append(payload["title"])
+                return {"content": _content()}
+
+            cg.build_grounded("主题", [], day, get=get, model=model)
+            self.assertIn(calls[0], titles[:8])
+
+    def test_build_grounded_length_gate_is_1200(self):
+        get = FakeWiki(["甲", "乙"], {"甲": "1998年" + "这" * 1000, "乙": "1998年" + "这" * 1300})
+        calls = []
+
+        def model(prompt, payload):
+            calls.append(payload["title"])
+            return {"content": _content()}
+
+        result = cg.build_grounded("主题", [], 0, get=get, model=model)
+        self.assertEqual(calls, ["乙"])
+        self.assertIn("《乙》", result)
 
     def test_build_grounded_model_errors_return_none_after_max_attempts(self):
         get = FakeWiki(["甲", "乙", "丙", "丁"], {t: "1998年" + LONG for t in "甲乙丙丁"})
