@@ -757,3 +757,66 @@ class AdaptiveSearchTests(unittest.TestCase):
                 record = json.loads(fh.readline())
         self.assertEqual(record["search_calls"], 5)
         self.assertEqual(record["status"], "ok")
+
+
+class QuotaGuardTests(unittest.TestCase):
+    QUERIES = ["q1", "q2", "q3"]
+
+    def _run(self, *, quota, brave_rows=None, serper_rows=None, tavily_rows=None):
+        calls = {"web_brave": [], "web_serper": [], "web_tavily": []}
+        rewrite = {"queries": list(self.QUERIES), "time_range": "any", "must_terms": []}
+
+        def model(system_prompt, payload):
+            return rewrite if system_prompt == ms.REWRITE_PROMPT else None
+
+        def recorder(name, rows):
+            def fn(query):
+                calls[name].append(query)
+                return list(rows or []), {}
+            return fn
+
+        deps = {"model": model, "fetch": lambda url: "", "canon": lambda url: url,
+                "web_brave": recorder("web_brave", brave_rows),
+                "web_serper": recorder("web_serper", serper_rows),
+                "web_tavily": recorder("web_tavily", tavily_rows)}
+        if quota is not None:
+            deps["quota"] = quota
+        out = ms.run_query("问题", deps=deps, now=NOW)
+        return out, calls
+
+    def test_quota_status_thresholds(self):
+        limits = {"brave": 100, "serper": 100, "tavily_0": 50, "tavily_1": 50}
+        self.assertTrue(ms.quota_status({"brave": 79}, limits)["brave"])
+        self.assertFalse(ms.quota_status({"brave": 80}, limits)["brave"])
+        self.assertTrue(ms.quota_status({"brave": 999}, {"brave": 0})["brave"])
+        self.assertTrue(ms.quota_status({"tavily_0": 30, "tavily_1": 30}, limits)["tavily"] is True)
+        self.assertFalse(ms.quota_status({"tavily_0": 40, "tavily_1": 40}, limits)["tavily"])
+
+    def test_quota_status_bad_input(self):
+        result = ms.quota_status(None, None)
+        self.assertEqual(result, {"brave": True, "serper": True, "tavily": True})
+
+    def test_all_over_pauses_query(self):
+        out, calls = self._run(quota=lambda: {"brave": False, "serper": False, "tavily": False},
+                               brave_rows=_sites(6, "b"))
+        self.assertIn("已暂停", out)
+        self.assertEqual(calls, {"web_brave": [], "web_serper": [], "web_tavily": []})
+        self.assertEqual(ms.LAST_SEARCH_CALLS, 0)
+
+    def test_skips_unavailable_provider(self):
+        quota = lambda: {"brave": False, "serper": True, "tavily": True}
+        _, calls = self._run(quota=quota, serper_rows=_sites(6, "s"))
+        self.assertEqual(calls["web_brave"], [])
+        self.assertEqual(len(calls["web_serper"]), 3)
+
+    def test_quota_error_defaults_to_allowed(self):
+        def boom():
+            raise RuntimeError("quota unavailable")
+        _, calls = self._run(quota=boom, brave_rows=_sites(6, "b"))
+        self.assertEqual(len(calls["web_brave"]), 3)
+
+    def test_load_quota_status_never_raises(self):
+        status = ms._load_quota_status()
+        self.assertIsInstance(status, dict)
+        for key in ("brave", "serper", "tavily"):
+            self.assertIsInstance(status[key], bool)

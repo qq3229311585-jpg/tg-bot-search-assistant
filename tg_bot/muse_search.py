@@ -486,6 +486,36 @@ def _not_found(q, time_range, stamp, queries, reason):
                            [{"text": q, "reason": reason}])
 
 
+def quota_status(counts, limits, pct=80):
+    """各搜索提供方是否还可用于按需查询:用量 < 额度的 pct% 为 True;额度未知(<=0)为 True。"""
+    if not isinstance(counts, dict):
+        counts = {}
+    if not isinstance(limits, dict):
+        limits = {}
+
+    def ok(used, limit):
+        if limit <= 0:
+            return True
+        return used < limit * pct / 100
+
+    return {
+        "brave": ok(counts.get("brave", 0), limits.get("brave", 0)),
+        "serper": ok(counts.get("serper", 0), limits.get("serper", 0)),
+        "tavily": ok(counts.get("tavily_0", 0) + counts.get("tavily_1", 0),
+                     limits.get("tavily_0", 0) + limits.get("tavily_1", 0)),
+    }
+
+
+def _load_quota_status():
+    """读取本月额度并判断各提供方是否可用;任何异常都视为可用,不阻断查询。"""
+    try:
+        from tg_bot.storage import load_quota
+        from tg_bot.config import API_FREE_LIMITS
+        return quota_status(load_quota().get("counts", {}), API_FREE_LIMITS)
+    except Exception:
+        return {"brave": True, "serper": True, "tavily": True}
+
+
 ENOUGH_SITES = 6
 LAST_SEARCH_CALLS = 0
 
@@ -538,6 +568,19 @@ def run_query(q, *, deps=None, now=None):
         else:
             variants = queries[:3]
 
+            # 额度保护:某提供方本月用量 >= 80% 时按需查询不再使用它
+            quota_fn = injected.get("quota")
+            if quota_fn is None:
+                quota_fn = _load_quota_status if deps is None else (
+                    lambda: {"brave": True, "serper": True, "tavily": True})
+            allowed = _safe_call(quota_fn)
+            if not isinstance(allowed, dict):
+                allowed = {"brave": True, "serper": True, "tavily": True}
+            if not any(allowed.get(p, True) for p in ("brave", "serper", "tavily")):
+                LAST_SEARCH_CALLS = 0
+                return _not_found(q, time_range, stamp, queries,
+                                  "本月搜索额度已用到 80% 以上,按需查询已暂停以保护日报,下月自动恢复")
+
             def run_stage(jobs):
                 nonlocal search_calls
                 search_calls += len(jobs)
@@ -548,14 +591,21 @@ def run_query(q, *, deps=None, now=None):
                 hosts = {urlparse(row.get("url") or "").hostname for row in rows}
                 return len({site_key(h) for h in hosts if h}) >= ENOUGH_SITES
 
-            stage1 = [(dep("web_brave"), v) for v in variants]
-            if time_range in ("day", "week"):
-                stage1 += [(dep("news_brave"), v) for v in variants]
-            run_stage(stage1)
-            if variants and not enough():
-                run_stage([(dep("web_serper"), v) for v in variants])
-            if variants and not enough():
-                run_stage([(dep("web_tavily"), variants[0])])
+            # 可用提供方按固定优先级 brave -> serper -> tavily 排成阶段
+            stages = []
+            if allowed.get("brave", True):
+                jobs = [(dep("web_brave"), v) for v in variants]
+                if time_range in ("day", "week"):
+                    jobs += [(dep("news_brave"), v) for v in variants]
+                stages.append(jobs)
+            if allowed.get("serper", True) and variants:
+                stages.append([(dep("web_serper"), v) for v in variants])
+            if allowed.get("tavily", True) and variants:
+                stages.append([(dep("web_tavily"), variants[0])])
+            for index, jobs in enumerate(stages):
+                if index > 0 and enough():
+                    break
+                run_stage(jobs)
         LAST_SEARCH_CALLS = search_calls
 
         ranked = rank_candidates(rows, rewrite["must_terms"], time_range, now)
