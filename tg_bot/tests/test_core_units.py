@@ -3146,6 +3146,43 @@ class DailyReportTests(unittest.TestCase):
             ("product_updates", "产品与服务更新", "📦", "软件 产品 服务 今日 重大更新"),
         ])
 
+    def _load_build_script_module(self, name):
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts", "build-daily-report.py")
+        spec = importlib.util.spec_from_file_location(name, script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_beyond_section_is_primary_event_lane_not_reserve(self):
+        sections = importlib.import_module("tg_bot.report_sections")
+        spec = sections.section_spec("beyond")
+        self.assertEqual(spec.kind, "event")
+        self.assertFalse(spec.reserve)
+        self.assertIn("beyond", sections.EVENT_SECTION_IDS)
+
+    def test_beyond_query_rotates_daily_through_wheel(self):
+        module = self._load_build_script_module("build_daily_report_beyond_rotation")
+        base = datetime(2026, 10, 16, 4, 0, tzinfo=timezone.utc)
+        days = [base + timedelta(days=offset) for offset in range(3)]
+        queries = [module.query_for_category("beyond", now=day) for day in days]
+        self.assertTrue(all(query in module.BEYOND_QUERY_WHEEL for query in queries))
+        self.assertEqual(len(set(queries)), 3)
+
+    def test_query_for_china_keeps_static_section_query(self):
+        module = self._load_build_script_module("build_daily_report_china_query")
+        sections = importlib.import_module("tg_bot.report_sections")
+        china_query = sections.section_spec("china").query
+        self.assertEqual(module.query_for_category("china"), china_query)
+        self.assertEqual(
+            module.query_for_category("china", now=datetime(2026, 10, 16, tzinfo=timezone.utc)),
+            china_query,
+        )
+
+    def test_beyond_query_wheel_has_at_least_24_unique_entries(self):
+        module = self._load_build_script_module("build_daily_report_beyond_wheel")
+        self.assertGreaterEqual(len(module.BEYOND_QUERY_WHEEL), 24)
+        self.assertEqual(len(set(module.BEYOND_QUERY_WHEEL)), len(module.BEYOND_QUERY_WHEEL))
+
     def test_visible_event_sections_fill_missing_primary_lanes_with_reserves(self):
         sections = importlib.import_module("tg_bot.report_sections")
         events = [

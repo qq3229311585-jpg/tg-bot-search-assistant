@@ -2,7 +2,7 @@
 """muse_search.py — Muse 按需查询的纯函数积木（不含网络、命令行与模型调用）"""
 
 from datetime import datetime, timedelta, timezone
-import json, re, unicodedata
+import json, re, time, unicodedata
 from urllib.parse import urlparse
 
 from tg_bot.report_research import site_key, _is_authority_domain
@@ -622,6 +622,85 @@ def _load_quota_status():
 
 ENOUGH_SITES = 6
 LAST_SEARCH_CALLS = 0
+REINFORCE_MAX_AGE_SECONDS = 30 * 86400
+REINFORCE_BUDGET_SECONDS = 100
+
+
+def reinforce_claim(claim, quotes, sources, pages, *, search, fetch, extract, verify, now, max_pages=3):
+    """为单一来源结论补证:搜索并抓取至多 max_pages 个新站点的页面,抽取并核查新引文。
+    只有核查通过才一次性写回 quotes/sources/pages 与 claim["quote_ids"] 并返回 True;
+    否则不改动任何入参,返回 False。内部异常一律吞掉返回 False。"""
+    try:
+        from tg_bot.report_research import _clean_content
+
+        qid_sid = {qu["qid"]: qu["sid"] for qu in quotes}
+        claim_sids = {qid_sid[qid] for qid in claim["quote_ids"] if qid in qid_sid}
+        existing_sites = {sources[sid].get("site") for sid in claim_sids if sid in sources}
+        existing_sites.discard(None)
+        existing_sites.discard("")
+        known_urls = {src.get("url") for src in sources.values()}
+
+        picked, new_sites = [], set()
+        for row in _rows_from(search(claim["text"])):
+            url = row.get("url") or ""
+            if not url or url in known_urls or any(url == p[1] for p in picked):
+                continue
+            domain = (urlparse(url).hostname or "").lower()
+            site = site_key(domain) if domain else ""
+            if not site or site in existing_sites or site in new_sites:
+                continue
+            if len(picked) >= max_pages:
+                break
+            picked.append((row, url, site, domain))
+            new_sites.add(site)
+        if not picked:
+            return False
+
+        new_pages, new_sources = {}, {}
+        for row, url, site, domain in picked:
+            text = _clean_content(_safe_call(fetch, url))
+            if not text or len(text) < 200:
+                continue
+            published = row.get("published_at")
+            parsed = _parse_published(published, now)
+            date_str = str(published) if published else "未知"
+            if parsed is not None:
+                if (now - parsed).total_seconds() > REINFORCE_MAX_AGE_SECONDS:
+                    continue
+            else:
+                inferred = _infer_page_date(text, now)
+                if inferred is not None:
+                    if (now - inferred).total_seconds() > REINFORCE_MAX_AGE_SECONDS:
+                        continue
+                    date_str = inferred.date().isoformat() + "(正文内日期)"
+            sid = f"S{len(pages) + len(new_pages) + 1}"
+            new_pages[sid] = text[:6000]
+            new_sources[sid] = {
+                "url": url,
+                "title": row.get("title") or "",
+                "site": site,
+                "date": date_str,
+                "domain": domain,
+            }
+        if not new_pages:
+            return False
+
+        raw = extract(claim["text"], new_pages)
+        found = verify_quotes(parse_extract(raw), new_pages)
+        if not found:
+            return False
+        added = [{"sid": qu["sid"], "quote": qu["quote"], "qid": f"Q{len(quotes) + i}"}
+                 for i, qu in enumerate(found, 1)]
+        if not verify(claim["text"], [{"qid": qu["qid"], "quote": qu["quote"]} for qu in added]):
+            return False
+
+        quotes.extend(added)
+        sources.update(new_sources)
+        pages.update(new_pages)
+        claim["quote_ids"] = list(claim["quote_ids"]) + [qu["qid"] for qu in added]
+        return True
+    except Exception:
+        return False
 
 
 def run_query(q, *, deps=None, now=None):
@@ -630,6 +709,7 @@ def run_query(q, *, deps=None, now=None):
     if now is None:
         now = datetime.now(timezone.utc)
     stamp = now.isoformat(timespec="seconds")
+    started = time.monotonic()
     try:
         from concurrent.futures import ThreadPoolExecutor
         from tg_bot.report_research import _clean_content
@@ -660,6 +740,7 @@ def run_query(q, *, deps=None, now=None):
                     rows.append(row)
 
         search_calls = 0
+        allowed = {}
         legacy = bool(injected) and ("web" in injected or "news" in injected) and "web_brave" not in injected
         if legacy:
             web, news = dep("web"), dep("news")
@@ -758,6 +839,43 @@ def run_query(q, *, deps=None, now=None):
         })
         claims, raw_conflicts = parse_claims(claims_raw)
         accepted, rejected = corroborate(claims, quotes, sources, allow_single=True)
+
+        # 补证:单一来源结论最多两条,各再搜一次找第二个独立站点;预算用尽即停
+        targets = [c for c in accepted if c.get("single")][:2]
+        if targets and time.monotonic() - started < REINFORCE_BUDGET_SECONDS:
+            if legacy:
+                search_fn = dep("web")
+            else:
+                search_fn = None
+                for name, key in (("brave", "web_brave"), ("serper", "web_serper"),
+                                  ("tavily", "web_tavily")):
+                    if allowed.get(name, True):
+                        search_fn = dep(key)
+                        break
+            if search_fn is not None:
+                for target in targets:
+                    if time.monotonic() - started >= REINFORCE_BUDGET_SECONDS:
+                        break
+                    work = {"text": target["text"], "quote_ids": list(target["quote_ids"])}
+                    reinforced = reinforce_claim(
+                        work, quotes, sources, pages,
+                        search=search_fn, fetch=fetch,
+                        extract=lambda question, new_pages: _safe_call(model, EXTRACT_PROMPT, {
+                            "question": question,
+                            "pages": [{"sid": s, "title": "", "text": t}
+                                      for s, t in new_pages.items()],
+                        }),
+                        verify=lambda text, quote_list: parse_verify(
+                            _safe_call(model, VERIFY_PROMPT, {"claim": text, "quotes": quote_list})),
+                        now=now)
+                    search_calls += 1
+                    LAST_SEARCH_CALLS = search_calls
+                    if not reinforced:
+                        continue
+                    upgraded, _ = corroborate([work], quotes, sources, allow_single=True)
+                    if upgraded and "single" not in upgraded[0]:
+                        accepted = [upgraded[0] if item["text"] == target["text"] and item.get("single")
+                                    else item for item in accepted]
 
         accepted = sorted(accepted, key=_strength_rank)
         checked = accepted[:8]

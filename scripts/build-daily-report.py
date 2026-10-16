@@ -59,8 +59,39 @@ COLD_TOPIC_WHEEL = (
     "概率与统计", "桥梁与建筑", "铁路与航海", "食物起源", "文字演化", "历法与时间",
 )
 
+# ── 视野外板块轮盘：每天换一个用户平时看不到的领域/地区作为新闻搜索词 ──────
+BEYOND_QUERY_WHEEL = (
+    "非洲 科技 创业 新闻",
+    "拉丁美洲 经济 新闻",
+    "东南亚 社会 新闻",
+    "考古 新发现 新闻",
+    "海洋 生态 研究 新闻",
+    "公共卫生 研究 新闻",
+    "农业 技术 新闻",
+    "能源 转型 新闻",
+    "城市 规划 建筑 新闻",
+    "语言 文化 保护 新闻",
+    "航运 物流 新闻",
+    "材料 化学 研究 新闻",
+    "心理学 研究 新闻",
+    "古生物 化石 新闻",
+    "教育 改革 新闻",
+    "中东 社会 文化 新闻",
+    "中亚 经济 新闻",
+    "医学 临床试验 新闻",
+    "气候 适应 新闻",
+    "水资源 新闻",
+    "交通 基础设施 新闻",
+    "食品 科学 新闻",
+    "极地 科考 新闻",
+    "法律 政策 国际 新闻",
+    "北欧 设计 新闻",
+    "非洲 野生动物 保护 新闻",
+    "南太平洋 岛国 新闻",
+)
+
 # 要闻类板块必须有 24 小时内的发布日期，无日期的常青内容直接淘汰
-_DATED_ONLY_SECTIONS = {"china", "global", "ai_tech"}
+_DATED_ONLY_SECTIONS = {"china", "global", "ai_tech", "beyond"}
 
 # 新闻源黑名单：内容农场 / 广告垃圾 / 政治敏感倾向性站点，一律不进日报
 _BLOCKED_NEWS_DOMAINS = {
@@ -93,7 +124,15 @@ def cold_topic_for(now=None) -> str:
     return COLD_TOPIC_WHEEL[day_of_year % len(COLD_TOPIC_WHEEL)]
 
 
+def beyond_query_for(now=None) -> str:
+    now = now or datetime.now(timezone.utc)
+    day_of_year = now.astimezone(ZoneInfo("Asia/Shanghai")).timetuple().tm_yday
+    return BEYOND_QUERY_WHEEL[day_of_year % len(BEYOND_QUERY_WHEEL)]
+
+
 def query_for_category(category: str, now=None) -> str:
+    if category == "beyond":
+        return beyond_query_for(now)
     return _CATEGORY_QUERIES.get(category, f"{category} 今日 新闻")
 
 

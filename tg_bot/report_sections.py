@@ -56,6 +56,9 @@ DEFAULT_REPORT_SECTIONS: tuple[ReportSectionSpec, ...] = (
         aliases=("AI / 技术", "AI速报", "人工智能速报", "人工智能"), emoji="🤖",
     ),
     ReportSectionSpec(
+        "beyond", "视野外", "event", "世界 各地 新发现 新闻", "news", emoji="🧭",
+    ),
+    ReportSectionSpec(
         "security_privacy", "安全与隐私", "event", "网络安全 隐私 漏洞 今日 新闻", "news",
         emoji="🛡", reserve=True,
     ),

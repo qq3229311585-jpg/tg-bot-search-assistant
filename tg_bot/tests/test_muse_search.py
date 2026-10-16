@@ -946,3 +946,144 @@ class QuotaGuardTests(unittest.TestCase):
         self.assertIsInstance(status, dict)
         for key in ("brave", "serper", "tavily"):
             self.assertIsInstance(status[key], bool)
+
+
+CLAIM_TEXT = "该项目计划于明年第一季度投产"
+ROW_B = ROWS[1]
+
+
+def _reinforce_fixture():
+    claim = {"text": CLAIM_TEXT, "quote_ids": ["Q1"]}
+    quotes = [{"sid": "S1", "quote": QUOTE_A, "qid": "Q1"}]
+    sources = {"S1": {"url": URL_A, "title": TITLE_A, "site": ms.site_key("a.example.com"),
+                      "date": "未知", "domain": "a.example.com"}}
+    pages = {"S1": BODY_A}
+    return claim, quotes, sources, pages
+
+
+def _reinforce_kwargs(**over):
+    kwargs = {"search": lambda q: [dict(ROW_B)],
+              "fetch": lambda url: BODY_B,
+              "extract": lambda q, new_pages: {"quotes": [{"sid": s, "quote": QUOTE_B} for s in new_pages]},
+              "verify": lambda text, quote_list: True,
+              "now": NOW}
+    kwargs.update(over)
+    return kwargs
+
+
+class ReinforceClaimTests(unittest.TestCase):
+    def test_success_appends_new_site_quote(self):
+        claim, quotes, sources, pages = _reinforce_fixture()
+        ok = ms.reinforce_claim(claim, quotes, sources, pages, **_reinforce_kwargs())
+        self.assertTrue(ok)
+        self.assertEqual(claim["quote_ids"], ["Q1", "Q2"])
+        self.assertEqual([qu["qid"] for qu in quotes], ["Q1", "Q2"])
+        self.assertEqual(quotes[1]["sid"], "S2")
+        self.assertEqual(sources["S2"]["url"], URL_B)
+        self.assertEqual(sources["S2"]["site"], ms.site_key("b.example.org"))
+        self.assertEqual(sources["S2"]["date"], "未知")
+        self.assertIn("S2", pages)
+
+    def test_same_site_result_skipped(self):
+        claim, quotes, sources, pages = _reinforce_fixture()
+        same_site = {"url": "https://a.example.com/news/2", "title": "甲站另一篇",
+                     "published_at": None}
+        ok = ms.reinforce_claim(claim, quotes, sources, pages,
+                                **_reinforce_kwargs(search=lambda q: [same_site]))
+        self.assertFalse(ok)
+        self.assertEqual(len(quotes), 1)
+        self.assertEqual(len(sources), 1)
+
+    def test_stale_page_skipped(self):
+        claim, quotes, sources, pages = _reinforce_fixture()
+        stale = dict(ROW_B, published_at="2026-01-01")
+        ok = ms.reinforce_claim(claim, quotes, sources, pages,
+                                **_reinforce_kwargs(search=lambda q: [stale]))
+        self.assertFalse(ok)
+        self.assertEqual(claim["quote_ids"], ["Q1"])
+        self.assertEqual(len(pages), 1)
+
+    def test_verify_false_leaves_inputs_untouched(self):
+        import copy
+        claim, quotes, sources, pages = _reinforce_fixture()
+        before = copy.deepcopy((claim, quotes, sources, pages))
+        ok = ms.reinforce_claim(claim, quotes, sources, pages,
+                                **_reinforce_kwargs(verify=lambda text, quote_list: False))
+        self.assertFalse(ok)
+        self.assertEqual((claim, quotes, sources, pages), before)
+
+    def test_empty_search_returns_false(self):
+        claim, quotes, sources, pages = _reinforce_fixture()
+        self.assertFalse(ms.reinforce_claim(claim, quotes, sources, pages,
+                                            **_reinforce_kwargs(search=lambda q: [])))
+
+    def test_extract_exception_returns_false(self):
+        claim, quotes, sources, pages = _reinforce_fixture()
+
+        def boom(q, new_pages):
+            raise RuntimeError("extract down")
+
+        self.assertFalse(ms.reinforce_claim(claim, quotes, sources, pages,
+                                            **_reinforce_kwargs(extract=boom)))
+        self.assertEqual(claim["quote_ids"], ["Q1"])
+
+
+class ReinforceRunQueryTests(unittest.TestCase):
+    def _run(self, *, claim_rows, claim_quote_ids=("Q1",), rows=None, verify="pass"):
+        calls = []
+        rewrite = {"queries": ["q1"], "time_range": "any", "must_terms": []}
+        claims = {"claims": [{"text": CLAIM_TEXT, "quote_ids": list(claim_quote_ids)}],
+                  "conflicts": []}
+
+        def model(system_prompt, payload):
+            if system_prompt == ms.REWRITE_PROMPT:
+                return rewrite
+            if system_prompt == ms.EXTRACT_PROMPT:
+                found = []
+                for p in payload["pages"]:
+                    for quote in (QUOTE_A, QUOTE_B):
+                        if quote in p["text"]:
+                            found.append({"sid": p["sid"], "quote": quote})
+                return {"quotes": found}
+            if system_prompt == ms.CLAIMS_PROMPT:
+                return claims
+            if system_prompt == ms.VERIFY_PROMPT:
+                return {"verdict": verify}
+            return None
+
+        def brave(query):
+            calls.append(query)
+            if query == CLAIM_TEXT:
+                return list(claim_rows)
+            return list(rows if rows is not None else [ROWS[0]])
+
+        def empty(query):
+            calls.append(query)
+            return []
+
+        deps = {"model": model, "fetch": lambda url: PAGES.get(url, ""),
+                "canon": lambda url: url, "web_brave": brave,
+                "news_brave": empty, "web_serper": empty, "web_tavily": empty,
+                "quota": lambda: {"brave": True, "serper": True, "tavily": True}}
+        out = ms.run_query("新项目什么时候投产", deps=deps, now=NOW)
+        return out, calls
+
+    def test_single_source_upgraded_by_reinforcement(self):
+        out, _ = self._run(claim_rows=[ROW_B])
+        self.assertIn("互证 2 站", out)
+        self.assertIn(URL_B, out)
+        self.assertNotIn("单一来源", out)
+
+    def test_single_source_kept_when_reinforcement_finds_nothing(self):
+        out, _ = self._run(claim_rows=[])
+        self.assertIn("单一来源", out)
+        self.assertNotIn("互证 2 站", out)
+
+    def test_reinforcement_adds_exactly_one_search_call(self):
+        _, calls = self._run(claim_rows=[])
+        self.assertEqual(calls.count(CLAIM_TEXT), 1)
+        self.assertEqual(ms.LAST_SEARCH_CALLS, len(calls))
+        # 对照:两站互证、无单一来源结论时不补证,搜索次数少 1
+        _, plain_calls = self._run(claim_rows=[], rows=ROWS, claim_quote_ids=("Q1", "Q2"))
+        self.assertNotIn(CLAIM_TEXT, plain_calls)
+        self.assertEqual(ms.LAST_SEARCH_CALLS, len(plain_calls))
