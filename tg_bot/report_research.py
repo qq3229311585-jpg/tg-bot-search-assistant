@@ -398,24 +398,33 @@ def summary_payload(bundle: EvidenceBundle) -> dict[str, object]:
     }
 
 
+SUMMARY_FAIL_REASONS: dict[str, str] = {}
+
+
 def parse_summary(bundle: EvidenceBundle, raw: object) -> VerifiedSummary | DroppedSummary | None:
     """Parse the exact summary JSON contract, rejecting every ambiguity."""
+    SUMMARY_FAIL_REASONS.pop(bundle.event_id, None)
     allowed = {
         "id", "title", "summary", "supporting_source_ids", "conflicts", "drop",
     }
     if not isinstance(raw, Mapping) or set(raw) != allowed:
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "not_mapping_or_bad_keys"
         return None
     if raw.get("id") != bundle.event_id:
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "id_mismatch"
         return None
     drop = raw.get("drop")
     if not isinstance(drop, bool):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "bad_drop_flag"
         return None
     if drop is True:
         drop_title = raw.get("title")
         drop_summary = raw.get("summary")
         if not isinstance(drop_title, str) or not drop_title.strip():
+            SUMMARY_FAIL_REASONS[bundle.event_id] = "drop_fields_invalid"
             return None
         if not isinstance(drop_summary, str) or not drop_summary.strip():
+            SUMMARY_FAIL_REASONS[bundle.event_id] = "drop_fields_invalid"
             return None
         return DroppedSummary(bundle.event_id)
     title = raw.get("title")
@@ -423,21 +432,27 @@ def parse_summary(bundle: EvidenceBundle, raw: object) -> VerifiedSummary | Drop
     source_ids = raw.get("supporting_source_ids")
     conflicts = raw.get("conflicts")
     if not isinstance(title, str) or not title.strip():
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "title_or_summary_empty"
         return None
     if not isinstance(summary, str) or not summary.strip():
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "title_or_summary_empty"
         return None
     title = title.strip()
     summary = summary.strip()
-    if (
-        len(title) > 24
-        or not re.search(r"[\u3400-\u9fff]", title)
-        or _contains_traditional_chinese(title)
-    ):
+    if len(title) > 24:
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "title_too_long"
         return None
-    if (
-        not re.search(r"[\u3400-\u9fff]", summary)
-        or _contains_traditional_chinese(summary)
-    ):
+    if not re.search(r"[㐀-鿿]", title):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "title_or_summary_not_chinese"
+        return None
+    if _contains_traditional_chinese(title):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "traditional_chinese"
+        return None
+    if not re.search(r"[㐀-鿿]", summary):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "title_or_summary_not_chinese"
+        return None
+    if _contains_traditional_chinese(summary):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "traditional_chinese"
         return None
     if (
         not isinstance(source_ids, list)
@@ -445,18 +460,23 @@ def parse_summary(bundle: EvidenceBundle, raw: object) -> VerifiedSummary | Drop
         or any(not isinstance(item, str) or not item for item in source_ids)
         or len(source_ids) != len(set(source_ids))
     ):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "bad_source_ids"
         return None
     if not isinstance(conflicts, list) or any(not isinstance(item, str) for item in conflicts):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "bad_conflicts_type"
         return None
     sources_by_id = {source.source_id: source for source in bundle.sources}
     if any(source_id not in sources_by_id for source_id in source_ids):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "unknown_source_id"
         return None
     cited_domains = {sources_by_id[source_id].domain for source_id in source_ids}
     cited_sites = {site_key(domain) for domain in cited_domains if not _is_untrusted_domain(domain)}
     # 至少两个独立站点互证（同站不同域名不算）；单一信源时，只有权威/官方域名才放行。
     if len(cited_sites) < 2 and not any(_is_authority_domain(domain) for domain in cited_domains):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "not_enough_independent_sites"
         return None
     if conflicts and not re.search(r"分歧|不一致|冲突|来源说法不同|不同", summary):
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "conflicts_without_divergence_text"
         return None
     return VerifiedSummary(
         event_id=bundle.event_id,
@@ -481,13 +501,22 @@ def summarize_bundle(
     """Call the summarizer at most ``retries`` total times and parse strictly."""
     attempts = _retry_count(retries)
     payload = summary_payload(bundle)
+    SUMMARY_FAIL_REASONS.pop(bundle.event_id, None)
+    saw_none = False
     for _attempt in range(attempts):
         try:
-            parsed = parse_summary(bundle, call(payload))
+            raw = call(payload)
+            if raw is None:
+                saw_none = True
+                parsed = None
+            else:
+                parsed = parse_summary(bundle, raw)
         except Exception:
             parsed = None
         if parsed is not None:
             return parsed
+    if saw_none and bundle.event_id not in SUMMARY_FAIL_REASONS:
+        SUMMARY_FAIL_REASONS[bundle.event_id] = "model_returned_none"
     return None
 
 

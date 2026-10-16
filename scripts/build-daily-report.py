@@ -256,7 +256,13 @@ def research_selected_events(
     这是日报生成里最大的串行耗时；结果与诊断按原板块/热度顺序合并，
     输出与串行版本完全一致。
     """
-    from tg_bot.report_research import DroppedSummary, deepen_event, summarize_bundle, verify_summary
+    from tg_bot.report_research import (
+        SUMMARY_FAIL_REASONS,
+        DroppedSummary,
+        deepen_event,
+        summarize_bundle,
+        verify_summary,
+    )
 
     notes = diagnostics if diagnostics is not None else []
     lane_order = list(dict.fromkeys(event.category for event in eligible_selected))
@@ -282,6 +288,9 @@ def research_selected_events(
         if isinstance(summary, DroppedSummary):
             return None, f"{prefix}:dropped"
         if summary is None:
+            reason = SUMMARY_FAIL_REASONS.get(event.event_id)
+            if reason:
+                return None, f"{prefix}:summary_failed:{reason}"
             return None, f"{prefix}:summary_failed"
         if not verify_summary(bundle, summary, verify_call, retries=verify_retries):
             return None, f"{prefix}:verify_failed"

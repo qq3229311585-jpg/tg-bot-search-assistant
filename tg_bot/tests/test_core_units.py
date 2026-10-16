@@ -2399,6 +2399,34 @@ class ReportResearchTests(unittest.TestCase):
         self.assertIsNone(self.research.parse_summary(bundle, dict(raw, id="wrong")))
         self.assertIsNone(self.research.parse_summary(bundle, dict(raw, title="")))
 
+    def test_parse_summary_records_title_too_long_and_single_site_reasons(self):
+        bundle = self._bundle()
+        raw = {
+            "id": "event-1", "title": "A" * 25, "summary": "事实摘要",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+        }
+        self.assertIsNone(self.research.parse_summary(bundle, raw))
+        self.assertEqual(self.research.SUMMARY_FAIL_REASONS["event-1"], "title_too_long")
+        single_site = replace(
+            bundle,
+            sources=(bundle.sources[0], replace(bundle.sources[1], domain="one.test")),
+        )
+        self.assertIsNone(self.research.parse_summary(single_site, dict(raw, title="事实标题")))
+        self.assertEqual(
+            self.research.SUMMARY_FAIL_REASONS["event-1"], "not_enough_independent_sites",
+        )
+
+    def test_successful_parse_clears_previous_failure_reason(self):
+        bundle = self._bundle()
+        valid = {
+            "id": "event-1", "title": "事实标题", "summary": "事实摘要",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+        }
+        self.research.parse_summary(bundle, dict(valid, title="A" * 25))
+        self.assertIn("event-1", self.research.SUMMARY_FAIL_REASONS)
+        self.assertIsNotNone(self.research.parse_summary(bundle, valid))
+        self.assertNotIn("event-1", self.research.SUMMARY_FAIL_REASONS)
+
     def test_summarize_bundle_does_not_retry_dropped(self):
         bundle = self._bundle()
         dropped = {
@@ -4052,7 +4080,7 @@ class DailyReportCollectionTests(unittest.TestCase):
             diagnostics=diagnostics,
         )
         self.assertEqual([event.event_id for event in verified], ["good"])
-        self.assertIn("global:bad:summary_failed", diagnostics)
+        self.assertIn("global:bad:summary_failed:model_returned_none", diagnostics)
 
     def test_research_selected_events_skips_dropped_quietly(self):
         module = self._load_builder("build_daily_report_dropped_quietly")
@@ -4094,6 +4122,32 @@ class DailyReportCollectionTests(unittest.TestCase):
         self.assertEqual([payload["summary"]["id"] for payload in verify_payloads], ["good"])
         self.assertIn("global:junk:dropped", diagnostics)
         self.assertFalse(any("summary_failed" in item for item in diagnostics))
+
+    def test_research_selected_events_appends_recorded_summary_fail_reason(self):
+        module = self._load_builder("build_daily_report_summary_fail_reason")
+        daily = importlib.import_module("tg_bot.daily_report")
+        research = importlib.import_module("tg_bot.report_research")
+        events = [daily.ReportEvent("bad", "global", "bad", "facts", (), heat_score=100.0)]
+        diagnostics = []
+        def search_more(query):
+            return ([
+                {"title": "one", "url": "https://one-bad.test/a"},
+                {"title": "two", "url": "https://two-bad.test/a"},
+            ], [])
+        def summarize(payload):
+            return {
+                "id": "bad", "title": "A" * 25, "summary": "已核查事实摘要",
+                "supporting_source_ids": ["S1", "S2"], "conflicts": [], "drop": False,
+            }
+        verified = module.research_selected_events(
+            events, research.ResearchBudget(followup_queries=1), search_more,
+            lambda _url: "full facts", summarize,
+            lambda _payload: {"verdict": "pass", "unsupported_claims": [], "supporting_source_ids": ["S1", "S2"]},
+            evidence_top_k=1, summary_retries=1, verify_retries=1,
+            diagnostics=diagnostics,
+        )
+        self.assertEqual(verified, [])
+        self.assertIn("global:bad:summary_failed:title_too_long", diagnostics)
 
     def test_summary_and_verify_calls_use_separate_rotating_key_pools(self):
         module = self._load_builder("build_daily_report_model_pools")
