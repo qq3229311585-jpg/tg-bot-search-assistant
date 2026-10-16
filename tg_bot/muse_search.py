@@ -100,9 +100,17 @@ def _parse_published(value, now):
     m = _REL_ZH.match(s)
     if m:
         return now - timedelta(seconds=int(m.group(1)) * _ZH_UNIT[m.group(2)])
+    dt = None
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
+        for fmt in ("%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%Y年%m月%d日", "%Y/%m/%d", "%Y.%m.%d"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                continue
+    if dt is None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -130,6 +138,10 @@ def rank_candidates(cands, must_terms, time_range, now=None, per_site=2, top=6):
     terms = [t.lower() for t in (must_terms or []) if t]
     scored = []
     for cand in cands:
+        if time_range in _WINDOW_SECONDS:
+            published = _parse_published(cand.get("published_at"), now)
+            if published is not None and (now - published).total_seconds() > 2 * _WINDOW_SECONDS[time_range]:
+                continue  # 明确过期的旧闻直接剔除(日期未知的保留,输出里会标“未知”)
         url = cand.get("url") or ""
         try:
             host = (urlparse(url).hostname or "").lower()
@@ -214,10 +226,25 @@ def corroborate(claims, quotes, sources):
             if authority:
                 credibility = f"权威 {authority[0]}"
             else:
-                rejected.append({"text": text, "reason": "仅单一非权威来源"})
+                rejected.append({"text": text, "reason": "仅单一非权威来源", "quote_ids": list(quote_ids)})
                 continue
         accepted.append({"text": text, "quote_ids": list(quote_ids), "credibility": credibility})
     return accepted, rejected
+
+
+def _rejected_lines(rejected, quotes, sources):
+    """未通过项的文字行;若带 quote_ids,附上所引来源网址,方便复查。"""
+    qid_to_sid = {qu.get("qid"): qu.get("sid") for qu in quotes}
+    out = []
+    for item in rejected:
+        urls = []
+        for qid in item.get("quote_ids") or []:
+            url = sources.get(qid_to_sid.get(qid), {}).get("url")
+            if url and url not in urls:
+                urls.append(url)
+        tail = f" (来源: {'; '.join(urls)})" if urls else ""
+        out.append(f"- {item.get('text')}: {item.get('reason')}{tail}")
+    return out
 
 
 def render_markdown(q, time_range, generated_at_iso, queries, accepted, quotes,
@@ -230,8 +257,7 @@ def render_markdown(q, time_range, generated_at_iso, queries, accepted, quotes,
     ]
     if not accepted and not conflicts:
         lines.append("## 没有找到")
-        for item in rejected:
-            lines.append(f"- {item.get('text')}: {item.get('reason')}")
+        lines.extend(_rejected_lines(rejected, quotes, sources))
         if not rejected:
             lines.append("- 未找到可互证的结论")
         return "\n".join(lines) + "\n"
@@ -269,8 +295,7 @@ def render_markdown(q, time_range, generated_at_iso, queries, accepted, quotes,
 
     if rejected:
         lines.append("## 没有找到 / 未通过核查")
-        for item in rejected:
-            lines.append(f"- {item.get('text')}: {item.get('reason')}")
+        lines.extend(_rejected_lines(rejected, quotes, sources))
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
@@ -526,7 +551,7 @@ def run_query(q, *, deps=None, now=None):
             if ok:
                 kept.append(claim)
             else:
-                rejected.append({"text": claim["text"], "reason": "核查未通过"})
+                rejected.append({"text": claim["text"], "reason": "核查未通过", "quote_ids": list(claim["quote_ids"])})
         accepted = kept
 
         qid_map = {qu["qid"]: qu for qu in quotes}

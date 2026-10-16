@@ -199,13 +199,13 @@ class CorroborateTests(unittest.TestCase):
         accepted, rejected = ms.corroborate(
             [{"text": "结论二", "quote_ids": ["Q1", "Q4"]}], QUOTES, SOURCES)
         self.assertEqual(accepted, [])
-        self.assertEqual(rejected, [{"text": "结论二", "reason": "仅单一非权威来源"}])
+        self.assertEqual(rejected, [{"text": "结论二", "reason": "仅单一非权威来源", "quote_ids": ["Q1", "Q4"]}])
 
     def test_corroborate_single_nonauth_rejected(self):
         accepted, rejected = ms.corroborate(
             [{"text": "结论三", "quote_ids": ["Q2"]}], QUOTES, SOURCES)
         self.assertEqual(accepted, [])
-        self.assertEqual(rejected, [{"text": "结论三", "reason": "仅单一非权威来源"}])
+        self.assertEqual(rejected, [{"text": "结论三", "reason": "仅单一非权威来源", "quote_ids": ["Q2"]}])
 
     def test_corroborate_authority_single_ok(self):
         accepted, rejected = ms.corroborate(
@@ -599,6 +599,39 @@ class CliTests(unittest.TestCase):
     def test_load_env_file_missing_returns_zero(self):
         from tg_bot import muse_search as m
         self.assertEqual(m.load_env_file("/nonexistent/x.env", {}), 0)
+
+    def test_rank_drops_stale_dated_candidates(self):
+        from datetime import datetime, timezone
+        from tg_bot import muse_search as m
+        now = datetime(2026, 10, 16, tzinfo=timezone.utc)
+        cands = [
+            {"title": "旧闻", "url": "https://a.example.com/1", "summary": "x", "published_at": "Feb 8, 2021"},
+            {"title": "新闻", "url": "https://b.example.org/2", "summary": "x", "published_at": "2026-10-15"},
+            {"title": "未知", "url": "https://c.example.net/3", "summary": "x", "published_at": None},
+        ]
+        week = [c["title"] for c in m.rank_candidates(cands, [], "week", now)]
+        self.assertNotIn("旧闻", week)
+        self.assertIn("新闻", week)
+        self.assertIn("未知", week)
+        anyr = [c["title"] for c in m.rank_candidates(cands, [], "any", now)]
+        self.assertIn("旧闻", anyr)
+
+    def test_parse_published_extra_formats(self):
+        from datetime import datetime, timezone
+        from tg_bot import muse_search as m
+        now = datetime(2026, 10, 16, tzinfo=timezone.utc)
+        self.assertEqual(m._parse_published("Feb 8, 2021", now).year, 2021)
+        self.assertEqual(m._parse_published("2026年10月15日", now).day, 15)
+        self.assertIsNone(m._parse_published("昨天吧", now))
+
+    def test_rejected_section_lists_source_urls(self):
+        from tg_bot import muse_search as m
+        quotes = [{"qid": "Q1", "sid": "S1", "quote": "某条原文引文内容"}]
+        sources = {"S1": {"url": "https://only.example.com/a", "title": "t", "site": "example.com", "date": "未知", "domain": "only.example.com"}}
+        rejected = [{"text": "某结论", "reason": "仅单一非权威来源", "quote_ids": ["Q1"]}]
+        out = m.render_markdown("q", "any", "2026-10-16T00:00:00+00:00", ["q"], [], quotes, sources, [], rejected)
+        self.assertIn("https://only.example.com/a", out)
+        self.assertIn("仅单一非权威来源", out)
 
     def test_runner_exception_exits_1(self):
         import tempfile
