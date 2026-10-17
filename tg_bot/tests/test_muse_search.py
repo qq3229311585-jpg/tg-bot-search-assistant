@@ -649,6 +649,7 @@ class CliTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             env = self._env(tmp)
+            env["MUSE_SEARCH_QUEUE_WAIT"] = "0"
             os.makedirs(env["MUSE_SEARCH_LOCK_DIR"], exist_ok=True)
             held = []
             try:
@@ -664,6 +665,31 @@ class CliTests(unittest.TestCase):
             finally:
                 for fh in held:
                     fh.close()
+
+    def test_queues_until_slot_frees(self):
+        import fcntl
+        import os
+        import tempfile
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(tmp)
+            env["MUSE_SEARCH_QUEUE_WAIT"] = "10"
+            os.makedirs(env["MUSE_SEARCH_LOCK_DIR"], exist_ok=True)
+            held = []
+            for name in ("slot0", "slot1"):
+                fh = open(os.path.join(env["MUSE_SEARCH_LOCK_DIR"], name), "a+")
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held.append(fh)
+            timer = threading.Timer(1.0, lambda: [fh.close() for fh in held])
+            timer.start()
+            try:
+                code, out = self._main(env, lambda q: "OK-RESULT")
+            finally:
+                timer.cancel()
+                for fh in held:
+                    fh.close()
+            self.assertEqual(code, 0)
+            self.assertIn("OK-RESULT", out)
 
     def test_lock_released_after_run(self):
         import tempfile

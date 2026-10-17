@@ -1096,25 +1096,38 @@ def main(argv=None, *, stdin_bytes=None, runner=None, env=None):
         _audit(log_path, "invalid", "", started, 0)
         return 2
 
+    try:
+        queue_wait = float(env.get("MUSE_SEARCH_QUEUE_WAIT", "120"))
+    except (TypeError, ValueError):
+        queue_wait = 120.0
+
     slot = None
     try:
         os.makedirs(lock_dir, mode=0o700, exist_ok=True)
-        for name in ("slot0", "slot1"):
-            fh = open(os.path.join(lock_dir, name), "a+")
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                fh.close()
-                continue
-            except OSError:
-                fh.close()
-                break  # 锁机制异常：放行，不阻断查询
-            slot = fh
-            break
-        else:
-            emit("服务正忙,请稍后再试。")
-            _audit(log_path, "busy", q, started, 0)
-            return 4
+        deadline = time.monotonic() + max(queue_wait, 0)
+        while slot is None:
+            lock_broken = False
+            for name in ("slot0", "slot1"):
+                fh = open(os.path.join(lock_dir, name), "a+")
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    fh.close()
+                    continue
+                except OSError:
+                    fh.close()
+                    lock_broken = True  # 锁机制异常：放行，不阻断查询
+                    break
+                slot = fh
+                break
+            if slot is not None or lock_broken:
+                break
+            # 两个槽都被占:排队等待而不是立刻拒绝,超过上限才报忙
+            if time.monotonic() >= deadline:
+                emit("服务正忙,请稍后再试。")
+                _audit(log_path, "busy", q, started, 0)
+                return 4
+            time.sleep(0.5)
     except OSError:
         slot = None  # 目录或文件异常：放行，不阻断查询
 
