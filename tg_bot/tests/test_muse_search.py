@@ -1270,3 +1270,39 @@ class GnewsStageTests(unittest.TestCase):
                 rec = json.loads(fh.read().splitlines()[0])
             self.assertEqual(rec["gnews_calls"], 2)
             self.assertIn("search_calls", rec)
+
+
+class FreeStageTests(unittest.TestCase):
+    def _run(self, *, free, pages, quotes, paid_log, claims=CLAIMS_OK, time_range="any"):
+        def paid(name):
+            def call(q):
+                paid_log.append((name, q))
+                return ([], {})
+            return call
+
+        deps = {"model": _gmodel(quotes, claims, time_range),
+                "fetch": lambda url: pages.get(url, "正文抓取失败:无数据"),
+                "canon": lambda url: url,
+                "free": free,
+                "web_brave": paid("brave"), "news_brave": paid("news_brave"),
+                "web_serper": paid("serper"), "web_tavily": paid("tavily")}
+        return ms.run_query("新项目什么时候投产", deps=deps, now=NOW)
+
+    def test_free_rows_enter_candidates_and_do_not_count_as_paid(self):
+        rows, pages, quotes = _many_sites(6)
+        paid_log = []
+        out = self._run(free=lambda q, tr: list(rows), pages=pages, quotes=quotes,
+                        paid_log=paid_log)
+        self.assertIn(rows[0]["url"], out)
+        self.assertIn(rows[1]["url"], out)
+        self.assertEqual(paid_log, [])
+        self.assertEqual(ms.LAST_SEARCH_CALLS, 0)
+        self.assertGreaterEqual(ms.LAST_FREE_CALLS, 1)
+
+    def test_free_empty_falls_back_to_paid_and_counts_only_paid(self):
+        rows, pages, quotes = _many_sites(6)
+        paid_log = []
+        self._run(free=lambda q, tr: [], pages=pages, quotes=quotes, paid_log=paid_log)
+        self.assertTrue(any(name == "brave" for name, _ in paid_log))
+        self.assertEqual(ms.LAST_SEARCH_CALLS, len(paid_log))
+        self.assertGreaterEqual(ms.LAST_FREE_CALLS, 1)

@@ -553,6 +553,9 @@ def _default_dep(name):
         return lambda query, time_range: gnews_rows(
             query, time_range, max_items=8, get=default_get, post=default_post,
             cache=_GNEWS_CACHE)
+    if name == "free":
+        from tg_bot.free_sources import free_rows, default_get
+        return lambda query, time_range: free_rows(query, time_range, get=default_get)
     if name == "web":
         from tg_bot.tools.search import web_candidates_all
         return web_candidates_all
@@ -632,6 +635,7 @@ def _load_quota_status():
 ENOUGH_SITES = 6
 LAST_SEARCH_CALLS = 0
 LAST_GNEWS_CALLS = 0
+LAST_FREE_CALLS = 0
 _GNEWS_CACHE = {}
 REINFORCE_MAX_AGE_SECONDS = 30 * 86400
 REINFORCE_BUDGET_SECONDS = 100
@@ -718,8 +722,9 @@ def reinforce_claim(claim, quotes, sources, pages, *, search, fetch, extract, ve
 
 def run_query(q, *, deps=None, now=None):
     """执行完整查询流程并返回 Markdown；任何内部错误降级为"没有找到"，不抛出。"""
-    global LAST_SEARCH_CALLS, LAST_GNEWS_CALLS
+    global LAST_SEARCH_CALLS, LAST_GNEWS_CALLS, LAST_FREE_CALLS
     LAST_GNEWS_CALLS = 0
+    LAST_FREE_CALLS = 0
     if now is None:
         now = datetime.now(timezone.utc)
     stamp = now.isoformat(timespec="seconds")
@@ -781,6 +786,18 @@ def run_query(q, *, deps=None, now=None):
                 gnews_ran = True
                 LAST_GNEWS_CALLS = gcount[0]
 
+            # 阶段 0b:维基/GitHub/HN 免费源,与 gnews 同层,不计入付费 search_calls
+            free_ok = deps is None or "free" in injected
+            ffn = dep("free") if free_ok else None
+            free_ran = False
+            if ffn is not None:
+                fjobs = variants[:2]
+                fcount = len(fjobs)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    merge(list(pool.map(lambda v: _safe_call(ffn, v, time_range), fjobs)))
+                free_ran = True
+                LAST_FREE_CALLS = fcount
+
             # 额度保护:某提供方本月用量 >= 80% 时按需查询不再使用它
             quota_fn = injected.get("quota")
             if quota_fn is None:
@@ -827,7 +844,7 @@ def run_query(q, *, deps=None, now=None):
             if allowed.get("tavily", True) and variants:
                 stages.append([(dep("web_tavily"), variants[0])])
             for index, jobs in enumerate(stages):
-                if (index > 0 or gnews_ran) and enough():
+                if (index > 0 or gnews_ran or free_ran) and enough():
                     break
                 run_stage(jobs)
         LAST_SEARCH_CALLS = search_calls
@@ -1131,7 +1148,8 @@ def main(argv=None, *, stdin_bytes=None, runner=None, env=None):
         emit(result)
         _audit(log_path, "ok", q, started, len(result),
                extra={"search_calls": LAST_SEARCH_CALLS,
-                      "gnews_calls": LAST_GNEWS_CALLS})
+                      "gnews_calls": LAST_GNEWS_CALLS,
+                      "free_calls": LAST_FREE_CALLS})
         return 0
     finally:
         if slot is not None:
