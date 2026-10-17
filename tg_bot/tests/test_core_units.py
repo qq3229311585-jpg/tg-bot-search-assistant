@@ -4128,6 +4128,83 @@ class FetchSecurityTests(unittest.TestCase):
         self.assertIn("安全正文", result)
 
 
+class JinaFetchTests(unittest.TestCase):
+    def setUp(self):
+        self.fetch = importlib.import_module("tg_bot.tools.fetch")
+        self.fetch._jina_last_call = None
+        # 防止限速逻辑在测试中真的等待
+        sleep_patch = patch.object(self.fetch.time, "sleep")
+        self.sleep = sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
+        self.addCleanup(setattr, self.fetch, "_jina_last_call", None)
+
+    def test_try_jina_returns_sourced_text_on_success(self):
+        body = "Title: 示例\nURL Source: https://example.test/a\n\n" + "正文内容。" * 80
+        with patch.object(self.fetch, "http_get", return_value=body) as get:
+            result = self.fetch._try_jina("https://example.test/a")
+        get.assert_called_once_with(
+            "https://r.jina.ai/https://example.test/a",
+            headers={"Accept": "text/plain"},
+            timeout=25,
+        )
+        self.assertTrue(result.startswith("[正文来源（Jina）：https://example.test/a]"))
+        self.assertIn("Title: 示例", result)
+
+    def test_try_jina_treats_json_error_short_or_empty_as_failure(self):
+        cases = {
+            "json_error": '{"data":null,"code":429,"name":"AbuseAlleviationError"}',
+            "too_short": "短" * 10,
+            "empty": "",
+        }
+        for label, body in cases.items():
+            with self.subTest(case=label), \
+                 patch.object(self.fetch, "http_get", return_value=body):
+                self.assertIsNone(self.fetch._try_jina("https://example.test/a"))
+
+    def test_jina_calls_are_spaced_at_least_3_2_seconds(self):
+        body = "正文内容。" * 80
+        clock = iter([100.0, 101.0, 101.0])
+        with patch.object(self.fetch.time, "monotonic", side_effect=lambda: next(clock)), \
+             patch.object(self.fetch, "http_get", return_value=body):
+            self.fetch._try_jina("https://example.test/one")
+            self.fetch._try_jina("https://example.test/two")
+        self.sleep.assert_called_once()
+        self.assertAlmostEqual(self.sleep.call_args[0][0], 2.2, places=6)
+
+    def test_fetch_content_prefers_jina_then_falls_back_to_tavily(self):
+        url = "https://example.test/article"
+        jina_ok = "[正文来源（Jina）：https://example.test/article]\n\n" + "正文。" * 100
+        with patch.object(self.fetch, "validate_fetch_url", return_value=True), \
+             patch.object(self.fetch, "_safe_local_fetch", return_value=""), \
+             patch.object(self.fetch, "FETCH_REMOTE_EXTRACT", True), \
+             patch.object(self.fetch, "_try_jina", return_value=jina_ok), \
+             patch("tg_bot.tools.search._tavily_request") as tavily:
+            result = self.fetch.execute_fetch_content(url)
+        tavily.assert_not_called()
+        self.assertEqual(result, jina_ok)
+
+        with patch.object(self.fetch, "validate_fetch_url", return_value=True), \
+             patch.object(self.fetch, "_safe_local_fetch", return_value=""), \
+             patch.object(self.fetch, "FETCH_REMOTE_EXTRACT", True), \
+             patch.object(self.fetch, "_try_jina", return_value=None), \
+             patch("tg_bot.tools.search._tavily_request", return_value={
+                 "results": [{"raw_content": "Tavily正文。" * 60}]}) as tavily:
+            result = self.fetch.execute_fetch_content(url)
+        tavily.assert_called_once()
+        self.assertIn("Tavily正文", result)
+
+    def test_fetch_content_skips_jina_and_tavily_when_remote_extract_disabled(self):
+        with patch.object(self.fetch, "validate_fetch_url", return_value=True), \
+             patch.object(self.fetch, "_safe_local_fetch", return_value=""), \
+             patch.object(self.fetch, "FETCH_REMOTE_EXTRACT", False), \
+             patch.object(self.fetch, "http_get") as get, \
+             patch("tg_bot.tools.search._tavily_request") as tavily:
+            result = self.fetch.execute_fetch_content("https://example.test/article")
+        get.assert_not_called()
+        tavily.assert_not_called()
+        self.assertIn("正文抓取失败", result)
+
+
 class BotUtilsTests(unittest.TestCase):
     def setUp(self):
         with temporary_env(**required_env()):

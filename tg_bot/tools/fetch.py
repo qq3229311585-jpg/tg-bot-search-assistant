@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fetch.py — 内容抓取、缓存读取相关工具函数"""
 
-import http.client, ipaddress, json, re, os, logging, socket
+import http.client, ipaddress, json, re, os, logging, socket, threading, time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from datetime import datetime, timezone, timedelta
@@ -206,6 +206,36 @@ def _try_12ft(url):
         return None
 
 
+_JINA_PREFIX = "https://r.jina.ai/"
+_JINA_MIN_INTERVAL = 3.2  # 匿名 Jina 约 20 次/分钟
+_jina_lock = threading.Lock()
+_jina_last_call = None
+
+
+def _try_jina(url):
+    """通过 Jina Reader 抓取正文（免费），成功返回带来源头的正文，失败返回 None"""
+    global _jina_last_call
+    try:
+        with _jina_lock:
+            now = time.monotonic()
+            if _jina_last_call is not None:
+                wait = _JINA_MIN_INTERVAL - (now - _jina_last_call)
+                if wait > 0:
+                    time.sleep(wait)
+                    now = time.monotonic()
+            _jina_last_call = now
+        text = http_get(_JINA_PREFIX + url, headers={"Accept": "text/plain"}, timeout=25)
+        text = (text or "").strip()
+        # 匿名限流时 Jina 返回 JSON 错误体，视为失败
+        if text.startswith("{") or len(text) <= 300 or "AbuseAlleviationError" in text:
+            return None
+        log.info(f"✅ Jina Reader 获取 {len(text)} 字符：{url[:60]}")
+        return f"[正文来源（Jina）：{url}]\n\n{text[:8000]}"
+    except Exception as e:
+        log.debug(f"Jina Reader 失败: {e}")
+        return None
+
+
 def execute_fetch_content(url):
     """
     本地抓取正文，并校验每次重定向的目标。
@@ -239,6 +269,9 @@ def execute_fetch_content(url):
         return f"[正文来源：{url}]\n\n{local_text[:8000]}"
 
     if FETCH_REMOTE_EXTRACT:
+        jina_text = _try_jina(url)
+        if jina_text:
+            return jina_text
         from tg_bot.tools.search import _tavily_request
         try:
             d = _tavily_request("https://api.tavily.com/extract", {"urls": [url]})
