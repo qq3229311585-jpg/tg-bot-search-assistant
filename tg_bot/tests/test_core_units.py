@@ -2493,7 +2493,7 @@ class ReportResearchTests(unittest.TestCase):
         )
         self.assertIsNone(self.research.parse_summary(same_domain, valid))
 
-    def test_parse_summary_requires_explicit_conflict_language(self):
+    def test_parse_summary_appends_divergence_when_summary_lacks_wording(self):
         bundle = self._bundle()
         raw = {
             "id": "event-1", "title": "数字存在分歧", "summary": "两方给出不同数字。",
@@ -2502,7 +2502,52 @@ class ReportResearchTests(unittest.TestCase):
         }
         self.assertIsNotNone(self.research.parse_summary(bundle, raw))
         raw["summary"] = "项目公布了成本数字。"
-        self.assertIsNone(self.research.parse_summary(bundle, raw))
+        parsed = self.research.parse_summary(bundle, raw)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.summary, "项目公布了成本数字。来源说法存在分歧:成本数字不同。")
+        self.assertEqual(parsed.conflicts, ("成本数字不同",))
+
+    def test_parse_summary_appends_divergence_points_without_period_ending(self):
+        bundle = self._bundle()
+        raw = {
+            "id": "event-1", "title": "事实标题", "summary": "项目公布了成本数字",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": ["甲方说法", "乙方说法"],
+            "drop": False,
+        }
+        parsed = self.research.parse_summary(bundle, raw)
+        self.assertEqual(parsed.summary, "项目公布了成本数字 来源说法存在分歧:甲方说法;乙方说法。")
+
+    def test_parse_summary_does_not_duplicate_existing_divergence_wording(self):
+        bundle = self._bundle()
+        raw = {
+            "id": "event-1", "title": "数字存在分歧", "summary": "两方给出分歧数字。",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": ["成本数字不同"],
+            "drop": False,
+        }
+        parsed = self.research.parse_summary(bundle, raw)
+        self.assertEqual(parsed.summary, "两方给出分歧数字。")
+
+    def test_parse_summary_ignores_blank_conflicts(self):
+        bundle = self._bundle()
+        for conflicts in ([], ["", "   "]):
+            with self.subTest(conflicts=conflicts):
+                raw = {
+                    "id": "event-1", "title": "事实标题", "summary": "项目公布了成本数字。",
+                    "supporting_source_ids": ["S1", "S2"], "conflicts": conflicts,
+                    "drop": False,
+                }
+                parsed = self.research.parse_summary(bundle, raw)
+                self.assertEqual(parsed.summary, "项目公布了成本数字。")
+
+    def test_parse_summary_truncates_each_divergence_point_to_80_chars(self):
+        bundle = self._bundle()
+        raw = {
+            "id": "event-1", "title": "事实标题", "summary": "项目公布了成本数字。",
+            "supporting_source_ids": ["S1", "S2"], "conflicts": ["甲" * 100],
+            "drop": False,
+        }
+        parsed = self.research.parse_summary(bundle, raw)
+        self.assertEqual(parsed.summary, "项目公布了成本数字。来源说法存在分歧:" + "甲" * 80 + "。")
 
     def test_summarize_bundle_retries_parse_failures_with_total_call_bound(self):
         bundle = self._bundle()

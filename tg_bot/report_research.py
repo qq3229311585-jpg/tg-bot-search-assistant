@@ -475,9 +475,11 @@ def parse_summary(bundle: EvidenceBundle, raw: object) -> VerifiedSummary | Drop
     if len(cited_sites) < 2 and not any(_is_authority_domain(domain) for domain in cited_domains):
         SUMMARY_FAIL_REASONS[bundle.event_id] = "not_enough_independent_sites"
         return None
-    if conflicts and not re.search(r"分歧|不一致|冲突|来源说法不同|不同", summary):
-        SUMMARY_FAIL_REASONS[bundle.event_id] = "conflicts_without_divergence_text"
-        return None
+    divergence_points = [item.strip()[:80] for item in conflicts if item.strip()]
+    if divergence_points and not re.search(r"分歧|不一致|冲突|来源说法不同|不同", summary):
+        # 模型常只在 conflicts 里列分歧而不写进正文：直接补写进摘要，不再整条丢弃。
+        separator = "" if summary.endswith(("。", ".")) else " "
+        summary = summary + separator + "来源说法存在分歧:" + ";".join(divergence_points) + "。"
     return VerifiedSummary(
         event_id=bundle.event_id,
         title=title,
