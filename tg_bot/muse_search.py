@@ -548,6 +548,11 @@ def parse_verify(raw):
 
 def _default_dep(name):
     """延迟导入真实实现，测试时通过 deps 注入假函数。"""
+    if name == "gnews":
+        from tg_bot.gnews import gnews_rows, default_get, default_post
+        return lambda query, time_range: gnews_rows(
+            query, time_range, max_items=8, get=default_get, post=default_post,
+            cache=_GNEWS_CACHE)
     if name == "web":
         from tg_bot.tools.search import web_candidates_all
         return web_candidates_all
@@ -626,6 +631,8 @@ def _load_quota_status():
 
 ENOUGH_SITES = 6
 LAST_SEARCH_CALLS = 0
+LAST_GNEWS_CALLS = 0
+_GNEWS_CACHE = {}
 REINFORCE_MAX_AGE_SECONDS = 30 * 86400
 REINFORCE_BUDGET_SECONDS = 100
 
@@ -711,7 +718,8 @@ def reinforce_claim(claim, quotes, sources, pages, *, search, fetch, extract, ve
 
 def run_query(q, *, deps=None, now=None):
     """执行完整查询流程并返回 Markdown；任何内部错误降级为"没有找到"，不抛出。"""
-    global LAST_SEARCH_CALLS
+    global LAST_SEARCH_CALLS, LAST_GNEWS_CALLS
+    LAST_GNEWS_CALLS = 0
     if now is None:
         now = datetime.now(timezone.utc)
     stamp = now.isoformat(timespec="seconds")
@@ -746,6 +754,8 @@ def run_query(q, *, deps=None, now=None):
                     rows.append(row)
 
         search_calls = 0
+        gcount = [0]  # 免费 Google 新闻调用次数(不计入付费 search_calls)
+        paid_calls = [0]  # 补证阶段实际发出的付费搜索次数
         allowed = {}
         legacy = bool(injected) and ("web" in injected or "news" in injected) and "web_brave" not in injected
         if legacy:
@@ -758,6 +768,18 @@ def run_query(q, *, deps=None, now=None):
                 merge(list(pool.map(lambda job: _safe_call(job[0], job[1]), jobs)))
         else:
             variants = queries[:3]
+            gnews_ok = deps is None or "gnews" in injected
+            gfn = dep("gnews") if gnews_ok else None
+
+            # 阶段 0:Google 新闻 RSS,免费不限量,先跑;足够时付费阶段整体跳过
+            gnews_ran = False
+            if gfn is not None:
+                gjobs = variants[:2]
+                gcount[0] += len(gjobs)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    merge(list(pool.map(lambda v: _safe_call(gfn, v, time_range), gjobs)))
+                gnews_ran = True
+                LAST_GNEWS_CALLS = gcount[0]
 
             # 额度保护:某提供方本月用量 >= 80% 时按需查询不再使用它
             quota_fn = injected.get("quota")
@@ -767,7 +789,7 @@ def run_query(q, *, deps=None, now=None):
             allowed = _safe_call(quota_fn)
             if not isinstance(allowed, dict):
                 allowed = {"brave": True, "serper": True, "tavily": True}
-            if not any(allowed.get(p, True) for p in ("brave", "serper", "tavily")):
+            if not rows and not any(allowed.get(p, True) for p in ("brave", "serper", "tavily")):
                 LAST_SEARCH_CALLS = 0
                 return _not_found(q, time_range, stamp, queries,
                                   "本月搜索额度已用到 80% 以上,按需查询已暂停以保护日报,下月自动恢复")
@@ -779,8 +801,19 @@ def run_query(q, *, deps=None, now=None):
                     merge(list(pool.map(lambda job: _safe_call(job[0], job[1]), jobs)))
 
             def enough():
-                hosts = {urlparse(row.get("url") or "").hostname for row in rows}
-                return len({site_key(h) for h in hosts if h}) >= ENOUGH_SITES
+                # 只统计命中 must_terms 之一的行(title+snippet);must_terms 为空则不过滤
+                must = [str(t).lower() for t in rewrite["must_terms"] if t]
+                sites = set()
+                for row in rows:
+                    host = urlparse(row.get("url") or "").hostname
+                    if not host:
+                        continue
+                    if must:
+                        text = f'{row.get("title") or ""} {row.get("snippet") or ""}'.lower()
+                        if not any(term in text for term in must):
+                            continue
+                    sites.add(site_key(host))
+                return len(sites) >= ENOUGH_SITES
 
             # 可用提供方按固定优先级 brave -> serper -> tavily 排成阶段
             stages = []
@@ -794,7 +827,7 @@ def run_query(q, *, deps=None, now=None):
             if allowed.get("tavily", True) and variants:
                 stages.append([(dep("web_tavily"), variants[0])])
             for index, jobs in enumerate(stages):
-                if index > 0 and enough():
+                if (index > 0 or gnews_ran) and enough():
                     break
                 run_stage(jobs)
         LAST_SEARCH_CALLS = search_calls
@@ -852,17 +885,36 @@ def run_query(q, *, deps=None, now=None):
             if legacy:
                 search_fn = dep("web")
             else:
-                search_fn = None
+                paid_fn = None
                 for name, key in (("brave", "web_brave"), ("serper", "web_serper"),
                                   ("tavily", "web_tavily")):
                     if allowed.get(name, True):
-                        search_fn = dep(key)
+                        paid_fn = dep(key)
                         break
+                if paid_fn is not None:
+                    counted_paid = paid_fn
+
+                    def paid_search(q, _fn=counted_paid):
+                        paid_calls[0] += 1
+                        return _fn(q)
+                else:
+                    paid_search = None
+                if gfn is not None:
+                    def search_fn(q):
+                        # 先免费 Google 新闻(近一个月),为空才回退付费
+                        gcount[0] += 1
+                        found = _safe_call(gfn, q[:80], "month")
+                        if _rows_from(found):
+                            return found
+                        return paid_search(q) if paid_search is not None else []
+                else:
+                    search_fn = paid_search
             if search_fn is not None:
                 for target in targets:
                     if time.monotonic() - started >= REINFORCE_BUDGET_SECONDS:
                         break
                     work = {"text": target["text"], "quote_ids": list(target["quote_ids"])}
+                    paid_before = paid_calls[0]
                     reinforced = reinforce_claim(
                         work, quotes, sources, pages,
                         search=search_fn, fetch=fetch,
@@ -874,7 +926,8 @@ def run_query(q, *, deps=None, now=None):
                         verify=lambda text, quote_list: parse_verify(
                             _safe_call(model, VERIFY_PROMPT, {"claim": text, "quotes": quote_list})),
                         now=now)
-                    search_calls += 1
+                    # 只有真正发出的付费搜索才计入 search_calls;免费 gnews 不计
+                    search_calls += 1 if legacy else paid_calls[0] - paid_before
                     LAST_SEARCH_CALLS = search_calls
                     if not reinforced:
                         continue
@@ -883,6 +936,7 @@ def run_query(q, *, deps=None, now=None):
                         accepted = [upgraded[0] if item["text"] == target["text"] and item.get("single")
                                     else item for item in accepted]
 
+        LAST_GNEWS_CALLS = gcount[0] if not legacy else 0
         accepted = sorted(accepted, key=_strength_rank)
         checked = accepted[:8]
         for claim in accepted[8:]:
@@ -1076,7 +1130,8 @@ def main(argv=None, *, stdin_bytes=None, runner=None, env=None):
             return 1
         emit(result)
         _audit(log_path, "ok", q, started, len(result),
-               extra={"search_calls": LAST_SEARCH_CALLS})
+               extra={"search_calls": LAST_SEARCH_CALLS,
+                      "gnews_calls": LAST_GNEWS_CALLS})
         return 0
     finally:
         if slot is not None:

@@ -1128,3 +1128,145 @@ class UntrustedCorroborateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(fetched, [])
         self.assertEqual(claim["quote_ids"], ["Q1"])
+
+
+CLAIM_SINGLE = "该项目计划于明年第一季度投产"
+CLAIMS_SINGLE = {"claims": [{"text": CLAIM_SINGLE, "quote_ids": ["Q1"]}], "conflicts": []}
+
+
+def _many_sites(n):
+    """n 个不同网站的假结果:标题含"投产"(命中 must_terms),正文各含一条不同引文。"""
+    rows, pages, quotes = [], {}, []
+    for i in range(1, n + 1):
+        url = f"https://www.paper{i}.com/news/{i}"
+        quote = f"第{i}家媒体确认该项目计划于明年第一季度投产"
+        rows.append({"url": url, "title": f"第{i}家媒体投产报道", "snippet": "",
+                     "published_at": None, "source": "test"})
+        pages[url] = f"第{i}家媒体的正文:{quote}。" + "现场施工进展顺利," * 24
+        quotes.append(quote)
+    return rows, pages, quotes
+
+
+def _gmodel(quotes, claims, time_range="any"):
+    def model(system_prompt, payload):
+        if system_prompt == ms.REWRITE_PROMPT:
+            return {"queries": [], "time_range": time_range, "must_terms": ["投产"]}
+        if system_prompt == ms.EXTRACT_PROMPT:
+            out = []
+            for page in payload["pages"]:
+                hit = next((qu for qu in quotes if qu in page["text"]), None)
+                if hit:
+                    out.append({"sid": page["sid"], "quote": hit})
+            return {"quotes": out}
+        if system_prompt == ms.CLAIMS_PROMPT:
+            return claims
+        if system_prompt == ms.VERIFY_PROMPT:
+            return {"verdict": "pass"}
+        return None
+    return model
+
+
+class GnewsStageTests(unittest.TestCase):
+    def _run(self, *, gnews, pages, quotes, paid_log, claims=CLAIMS_OK,
+             time_range="any", now=None):
+        def paid(name):
+            def call(q):
+                paid_log.append((name, q))
+                return ([], {})
+            return call
+
+        deps = {"model": _gmodel(quotes, claims, time_range),
+                "fetch": lambda url: pages.get(url, "正文抓取失败:无数据"),
+                "canon": lambda url: url,
+                "gnews": gnews,
+                "web_brave": paid("brave"), "news_brave": paid("news_brave"),
+                "web_serper": paid("serper"), "web_tavily": paid("tavily")}
+        return ms.run_query("新项目什么时候投产", deps=deps, now=now or NOW)
+
+    def test_gnews_enough_skips_paid_providers(self):
+        rows, pages, quotes = _many_sites(6)
+        paid_log = []
+        out = self._run(gnews=lambda q, tr: list(rows), pages=pages, quotes=quotes,
+                        paid_log=paid_log)
+        self.assertEqual(paid_log, [])
+        self.assertEqual(ms.LAST_SEARCH_CALLS, 0)
+        self.assertGreaterEqual(ms.LAST_GNEWS_CALLS, 1)
+        self.assertIn(rows[0]["url"], out)
+        self.assertIn(rows[1]["url"], out)
+
+    def test_gnews_irrelevant_rows_do_not_count_as_enough(self):
+        rows, pages, quotes = _many_sites(6)
+        for row in rows:
+            row["title"] = "完全无关的体育新闻"
+        paid_log = []
+        self._run(gnews=lambda q, tr: list(rows), pages=pages, quotes=quotes,
+                  paid_log=paid_log)
+        self.assertTrue(any(name == "brave" for name, _ in paid_log))
+
+    def test_gnews_empty_falls_back_to_paid(self):
+        rows, pages, quotes = _many_sites(6)
+        paid_log = []
+        self._run(gnews=lambda q, tr: [], pages=pages, quotes=quotes, paid_log=paid_log)
+        self.assertTrue(any(name == "brave" for name, _ in paid_log))
+
+    def test_gnews_exception_falls_back_to_paid(self):
+        rows, pages, quotes = _many_sites(6)
+        paid_log = []
+
+        def boom(q, tr):
+            raise RuntimeError("gnews down")
+
+        self._run(gnews=boom, pages=pages, quotes=quotes, paid_log=paid_log)
+        self.assertTrue(any(name == "brave" for name, _ in paid_log))
+
+    def test_time_range_passed_to_gnews(self):
+        rows, pages, quotes = _many_sites(6)
+        seen = []
+
+        def gnews(q, tr):
+            seen.append(tr)
+            return list(rows)
+
+        self._run(gnews=gnews, pages=pages, quotes=quotes, paid_log=[], time_range="week")
+        self.assertTrue(seen)
+        self.assertTrue(all(tr == "week" for tr in seen))
+
+    def test_reinforce_prefers_gnews_over_paid(self):
+        paid_log, seen = [], []
+
+        def gnews(q, tr):
+            seen.append((q, tr))
+            return [{"url": URL_B, "title": TITLE_B, "snippet": "", "published_at": None,
+                     "source": "test"}] if tr == "month" else [
+                {"url": URL_A, "title": TITLE_A, "snippet": "", "published_at": None,
+                 "source": "test"}]
+
+        out = self._run(gnews=gnews, pages={URL_A: BODY_A, URL_B: BODY_B},
+                        quotes=[QUOTE_B, QUOTE_A], paid_log=paid_log,
+                        claims=CLAIMS_SINGLE)
+        self.assertIn(URL_B, out)
+        self.assertIn("互证 2 站", out)
+        self.assertFalse(any(q == CLAIM_SINGLE for _, q in paid_log))
+        self.assertTrue(any(tr == "month" for _, tr in seen))
+
+    def test_audit_extra_contains_gnews_calls(self):
+        import contextlib
+        import io
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"MUSE_SEARCH_DISABLED_FILE": os.path.join(tmp, "disabled"),
+                   "MUSE_SEARCH_LOCK_DIR": os.path.join(tmp, "locks"),
+                   "MUSE_SEARCH_LOG": os.path.join(tmp, "audit.log"),
+                   "MUSE_SEARCH_TIMEOUT": "10"}
+
+            def runner(q):
+                ms.LAST_GNEWS_CALLS = 2
+                return "RESULT"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                ms.main(stdin_bytes=b'{"q":"ab"}', runner=runner, env=env)
+            with open(env["MUSE_SEARCH_LOG"], encoding="utf-8") as fh:
+                rec = json.loads(fh.read().splitlines()[0])
+            self.assertEqual(rec["gnews_calls"], 2)
+            self.assertIn("search_calls", rec)
