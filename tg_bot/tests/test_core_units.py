@@ -482,7 +482,9 @@ class SearchProviderTests(unittest.TestCase):
             search = importlib.import_module("tg_bot.tools.search")
             with patch.object(search, "BRAVE_KEY", ""), patch.object(
                 search, "TAVILY_KEYS", []
-            ), patch.object(cfg, "SERPER_KEYS", []):
+            ), patch.object(cfg, "SERPER_KEYS", []), patch.object(
+                search, "_news_from_gnews", return_value=([], [])
+            ):
                 items, diagnostics = search.execute_news_candidates_all("query")
             self.assertEqual(items, [])
             self.assertEqual(diagnostics, [
@@ -506,6 +508,137 @@ class SearchProviderTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(items, [missing, malformed])
+            self.assertEqual(diagnostics, [])
+
+    def test_gnews_adapter_maps_rows_and_reports_empty(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            raw = [{
+                "url": "https://g.test/a",
+                "title": "Gnews title",
+                "snippet": "Src · Gnews title",
+                "published_at": "2026-10-17T01:00:00+00:00",
+                "source": "gnews",
+            }]
+            with patch("tg_bot.gnews.gnews_rows", return_value=raw) as rows_mock:
+                items, diagnostics = search._news_from_gnews("query")
+            self.assertEqual(diagnostics, [])
+            self.assertEqual(items, [{
+                "title": "Gnews title",
+                "summary": "Src · Gnews title",
+                "url": "https://g.test/a",
+                "published_at": "2026-10-17T01:00:00+00:00",
+                "relevance": None,
+                "source": "gnews",
+            }])
+            self.assertEqual(rows_mock.call_args.args[:2], ("query", "day"))
+            with patch("tg_bot.gnews.gnews_rows", return_value=[]):
+                items, diagnostics = search._news_from_gnews("query")
+            self.assertEqual((items, diagnostics), ([], ["gnews: empty"]))
+
+    def test_default_news_skips_paid_providers_when_gnews_has_twelve(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            free_rows = [
+                {"title": f"Free {i}", "url": f"https://free.test/{i}", "source": "gnews"}
+                for i in range(12)
+            ]
+            with patch.object(search, "_news_from_gnews", return_value=(free_rows, [])), patch.object(
+                search, "_news_from_brave", return_value=([], [])
+            ) as brave, patch.object(
+                search, "_news_from_tavily", return_value=([], [])
+            ) as tavily, patch.object(
+                search, "_news_from_serper", return_value=([], [])
+            ) as serper:
+                items, diagnostics = search.execute_news_candidates_all("query")
+            brave.assert_not_called()
+            tavily.assert_not_called()
+            serper.assert_not_called()
+            self.assertEqual(len(items), 12)
+            self.assertEqual(diagnostics, ["gnews: enough_skip_paid"])
+
+    def test_default_news_still_calls_paid_providers_when_gnews_is_short(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            free_rows = [{"title": "Free", "url": "https://free.test/0", "source": "gnews"}]
+            paid = {"title": "Paid", "url": "https://paid.test/0", "source": "brave"}
+            with patch.object(search, "_news_from_gnews", return_value=(free_rows, [])), patch.object(
+                search, "_news_from_brave", return_value=([paid], [])
+            ) as brave, patch.object(
+                search, "_news_from_tavily", return_value=([], [])
+            ) as tavily, patch.object(
+                search, "_news_from_serper", return_value=([], [])
+            ) as serper:
+                items, diagnostics = search.execute_news_candidates_all("query")
+            brave.assert_called_once()
+            tavily.assert_called_once()
+            serper.assert_called_once()
+            self.assertEqual([item["title"] for item in items], ["Free", "Paid"])
+            self.assertNotIn("gnews: enough_skip_paid", diagnostics)
+
+    def test_default_news_degrades_when_gnews_raises(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            paid = {"title": "Paid", "url": "https://paid.test/0", "source": "brave"}
+
+            with patch("tg_bot.gnews.gnews_rows", side_effect=RuntimeError("boom")), patch.object(
+                search, "_news_from_brave", return_value=([paid], [])
+            ) as brave, patch.object(
+                search, "_news_from_tavily", return_value=([], [])
+            ) as tavily, patch.object(
+                search, "_news_from_serper", return_value=([], [])
+            ) as serper:
+                items, diagnostics = search.execute_news_candidates_all("query")
+            brave.assert_called_once()
+            tavily.assert_called_once()
+            serper.assert_called_once()
+            self.assertEqual([item["title"] for item in items], ["Paid"])
+            self.assertTrue(any("gnews: provider_error" in d for d in diagnostics))
+            self.assertNotIn("gnews: enough_skip_paid", diagnostics)
+
+    def test_explicit_providers_have_no_gnews_or_skip_rule(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            many = [{"title": f"B{i}", "url": f"https://b.test/{i}"} for i in range(15)]
+            later = {"title": "Later", "url": "https://later.test/0"}
+            with patch.object(search, "_news_from_gnews", return_value=([], [])) as gnews:
+                items, diagnostics = search.execute_news_candidates_all(
+                    "query",
+                    providers=(
+                        ("brave", lambda _query: (many, [])),
+                        ("tavily", lambda _query: ([later], [])),
+                    ),
+                )
+            gnews.assert_not_called()
+            self.assertEqual(len(items), 16)
+            self.assertEqual(diagnostics, [])
+
+    def test_default_news_dedupes_gnews_and_paid_same_url(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            search = importlib.import_module("tg_bot.tools.search")
+            free = {"title": "Free", "url": "https://same.test/story?utm_source=rss", "source": "gnews"}
+            paid = {"title": "Paid", "url": "https://same.test/story", "source": "brave"}
+            with patch.object(search, "_news_from_gnews", return_value=([free], [])), patch.object(
+                search, "_news_from_brave", return_value=([paid], [])
+            ), patch.object(
+                search, "_news_from_tavily", return_value=([], [])
+            ), patch.object(
+                search, "_news_from_serper", return_value=([], [])
+            ):
+                items, diagnostics = search.execute_news_candidates_all("query")
+            self.assertEqual(items, [free])
             self.assertEqual(diagnostics, [])
 
     def test_legacy_news_candidates_still_stops_after_first_success(self):

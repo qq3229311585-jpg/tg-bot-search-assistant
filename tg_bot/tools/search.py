@@ -161,6 +161,41 @@ def _validated_news_items(items, provider):
     return valid, diagnostics
 
 
+_GNEWS_CACHE = {}
+
+
+def _news_from_gnews(query, time_range="day"):
+    """Return free Google News RSS rows; this provider never consumes quota."""
+    from tg_bot.gnews import default_get, default_post, gnews_rows
+
+    try:
+        raw_rows = gnews_rows(
+            query,
+            time_range,
+            max_items=8,
+            get=default_get,
+            post=default_post,
+            cache=_GNEWS_CACHE,
+        )
+        rows = [
+            {
+                "title": row.get("title", ""),
+                "summary": row.get("snippet", ""),
+                "url": row.get("url", ""),
+                "published_at": row.get("published_at"),
+                "relevance": None,
+                "source": "gnews",
+            }
+            for row in raw_rows
+            if row.get("title") and row.get("url")
+        ]
+        if rows:
+            return rows, []
+        return [], ["gnews: empty"]
+    except Exception as exc:
+        return [], [f"gnews: provider_error:{type(exc).__name__}"]
+
+
 def _news_from_brave(query):
     """Return structured Brave news rows and provider-local diagnostics."""
     from tg_bot.tools.fetch import http_get
@@ -330,8 +365,10 @@ def _canonical_news_url(url):
 
 def execute_news_candidates_all(query, providers=None):
     """Aggregate every news provider for daily reports in stable order."""
-    if providers is None:
+    use_default = providers is None
+    if use_default:
         providers = (
+            ("gnews", _news_from_gnews),
             ("brave", _news_from_brave),
             ("tavily", _news_from_tavily),
             ("serper", _news_from_serper),
@@ -358,6 +395,10 @@ def execute_news_candidates_all(query, providers=None):
                 diagnostics.append(f"{name}: provider_error:TypeError")
         except Exception as exc:
             diagnostics.append(f"{name}: provider_error:{type(exc).__name__}")
+        # 默认路径：免费 gnews 已够 12 条时，跳过其后的付费提供方
+        if use_default and name == "gnews" and len(merged) >= 12:
+            diagnostics.append("gnews: enough_skip_paid")
+            break
     return merged, diagnostics
 
 
