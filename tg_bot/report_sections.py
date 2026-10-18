@@ -95,6 +95,11 @@ DEFAULT_REPORT_SECTIONS: tuple[ReportSectionSpec, ...] = (
         "steam", "Steam 特价推荐", "snapshot", collector="native:execute_steam_specials",
         aliases=("Steam 降价优惠", "Steam降价", "Steam 折扣", "游戏优惠"), emoji="🎮",
     ),
+    # 别国维基热榜：每天轮换一个外语维基，取昨日暴涨条目，由构建脚本生成（generated）。
+    ReportSectionSpec(
+        "wiki_trending", "别国维基热榜", "snapshot", collector="generated",
+        aliases=("维基热榜", "外语维基"), emoji="🌐",
+    ),
     # 冷知识由构建脚本的编辑 AI 按话题轮盘直接撰写（generated），不走新闻搜索。
     ReportSectionSpec(
         "cold_knowledge", "今日冷知识", "snapshot", collector="generated",

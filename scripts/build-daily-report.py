@@ -477,6 +477,27 @@ def generate_cold_knowledge(topic, avoid_summaries):
         return None
 
 
+def generate_wiki_trending():
+    """别国维基热榜：取昨日暴涨的外语维基条目，模型只能依据原文介绍。
+
+    取不到合格条目或校验不过一律返回 None，调用方把 None 当作整块跳过。
+    """
+    from tg_bot.wiki_trending import build_wiki_trending
+    from tg_bot.tools.fetch import http_get
+
+    now_utc = datetime.now(timezone.utc)
+    day_of_year = now_utc.astimezone(ZoneInfo("Asia/Shanghai")).timetuple().tm_yday
+    try:
+        return build_wiki_trending(
+            day_of_year, now_utc,
+            get=http_get,
+            model=lambda system_prompt, payload: _report_model_call(system_prompt, payload, verify=False),
+        )
+    except Exception as exc:
+        print(f"WARNING wiki_trending_ground:{type(exc).__name__}", file=sys.stderr)
+        return None
+
+
 _COLD_GIST_STRIP_RE = re.compile(r"[^一-鿿A-Za-z0-9]")
 _COLD_GIST_SPLIT_RE = re.compile(r"[，,。！？!?；;\s]")
 
@@ -1030,6 +1051,9 @@ def register_builtin_snapshot_collectors(enabled=True):
         ]
         return generate_cold_knowledge(cold_topic_for(), avoid) or ""
 
+    def wiki_trending_collector():
+        return generate_wiki_trending() or ""
+
     register_section_collector("weather", weather_collector)
     register_section_collector("github", github_collector)
     register_section_collector("hackernews", hackernews_collector)
@@ -1038,6 +1062,7 @@ def register_builtin_snapshot_collectors(enabled=True):
     register_section_collector("exchange", exchange_collector)
     register_section_collector("market", market_collector)
     register_section_collector("cold_knowledge", cold_knowledge_collector)
+    register_section_collector("wiki_trending", wiki_trending_collector)
 
 
 def collect_snapshot_sections(section_specs, legacy_report_text, diagnostics=None):

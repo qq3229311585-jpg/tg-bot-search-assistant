@@ -41,6 +41,7 @@ _CATEGORY_LABELS = {
     "hackernews": "圈子在聊",
     "github": "GitHub 热榜",
     "steam": "Steam 特价推荐",
+    "wiki_trending": "别国维基热榜",
     "cold_knowledge": "今日冷知识",
 }
 _CATEGORY_EMOJI = {
@@ -56,6 +57,7 @@ _CATEGORY_EMOJI = {
     "hackernews": "🗣️",
     "github": "🛠",
     "steam": "🎮",
+    "wiki_trending": "🌐",
     "cold_knowledge": "🧠",
 }
 _WEEKDAYS_ZH = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
