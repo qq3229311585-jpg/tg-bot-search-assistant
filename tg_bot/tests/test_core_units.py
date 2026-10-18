@@ -483,6 +483,8 @@ class SearchProviderTests(unittest.TestCase):
             with patch.object(search, "BRAVE_KEY", ""), patch.object(
                 search, "TAVILY_KEYS", []
             ), patch.object(cfg, "SERPER_KEYS", []), patch.object(
+                search, "_news_from_deepseek", return_value=([], [])
+            ), patch.object(
                 search, "_news_from_gnews", return_value=([], [])
             ):
                 items, diagnostics = search.execute_news_candidates_all("query")
@@ -547,7 +549,7 @@ class SearchProviderTests(unittest.TestCase):
                 {"title": f"Free {i}", "url": f"https://free.test/{i}", "source": "gnews"}
                 for i in range(12)
             ]
-            with patch.object(search, "_news_from_gnews", return_value=(free_rows, [])), patch.object(
+            with patch.object(search, "_news_from_deepseek", return_value=([], [])), patch.object(search, "_news_from_gnews", return_value=(free_rows, [])), patch.object(
                 search, "_news_from_brave", return_value=([], [])
             ) as brave, patch.object(
                 search, "_news_from_tavily", return_value=([], [])
@@ -568,7 +570,7 @@ class SearchProviderTests(unittest.TestCase):
             search = importlib.import_module("tg_bot.tools.search")
             free_rows = [{"title": "Free", "url": "https://free.test/0", "source": "gnews"}]
             paid = {"title": "Paid", "url": "https://paid.test/0", "source": "brave"}
-            with patch.object(search, "_news_from_gnews", return_value=(free_rows, [])), patch.object(
+            with patch.object(search, "_news_from_deepseek", return_value=([], [])), patch.object(search, "_news_from_gnews", return_value=(free_rows, [])), patch.object(
                 search, "_news_from_brave", return_value=([paid], [])
             ) as brave, patch.object(
                 search, "_news_from_tavily", return_value=([], [])
@@ -589,7 +591,7 @@ class SearchProviderTests(unittest.TestCase):
             search = importlib.import_module("tg_bot.tools.search")
             paid = {"title": "Paid", "url": "https://paid.test/0", "source": "brave"}
 
-            with patch("tg_bot.gnews.gnews_rows", side_effect=RuntimeError("boom")), patch.object(
+            with patch("tg_bot.gnews.gnews_rows", side_effect=RuntimeError("boom")), patch.object(search, "_news_from_deepseek", return_value=([], [])), patch.object(
                 search, "_news_from_brave", return_value=([paid], [])
             ) as brave, patch.object(
                 search, "_news_from_tavily", return_value=([], [])
@@ -611,7 +613,7 @@ class SearchProviderTests(unittest.TestCase):
             search = importlib.import_module("tg_bot.tools.search")
             many = [{"title": f"B{i}", "url": f"https://b.test/{i}"} for i in range(15)]
             later = {"title": "Later", "url": "https://later.test/0"}
-            with patch.object(search, "_news_from_gnews", return_value=([], [])) as gnews:
+            with patch.object(search, "_news_from_deepseek", return_value=([], [])), patch.object(search, "_news_from_gnews", return_value=([], [])) as gnews:
                 items, diagnostics = search.execute_news_candidates_all(
                     "query",
                     providers=(
@@ -630,7 +632,7 @@ class SearchProviderTests(unittest.TestCase):
             search = importlib.import_module("tg_bot.tools.search")
             free = {"title": "Free", "url": "https://same.test/story?utm_source=rss", "source": "gnews"}
             paid = {"title": "Paid", "url": "https://same.test/story", "source": "brave"}
-            with patch.object(search, "_news_from_gnews", return_value=([free], [])), patch.object(
+            with patch.object(search, "_news_from_deepseek", return_value=([], [])), patch.object(search, "_news_from_gnews", return_value=([free], [])), patch.object(
                 search, "_news_from_brave", return_value=([paid], [])
             ), patch.object(
                 search, "_news_from_tavily", return_value=([], [])
@@ -4187,6 +4189,7 @@ class JinaFetchTests(unittest.TestCase):
              patch.object(self.fetch, "_safe_local_fetch", return_value=""), \
              patch.object(self.fetch, "FETCH_REMOTE_EXTRACT", True), \
              patch.object(self.fetch, "_try_jina", return_value=None), \
+             patch.object(self.fetch, "_try_deepseek_fetch", return_value=None), \
              patch("tg_bot.tools.search._tavily_request", return_value={
                  "results": [{"raw_content": "Tavily正文。" * 60}]}) as tavily:
             result = self.fetch.execute_fetch_content(url)
@@ -4203,6 +4206,136 @@ class JinaFetchTests(unittest.TestCase):
         get.assert_not_called()
         tavily.assert_not_called()
         self.assertIn("正文抓取失败", result)
+
+
+class DeepseekChainTests(unittest.TestCase):
+    """DeepSeek 搜索/抓取接入后的调用顺序与降级行为(全部假网络)。"""
+
+    def _search(self):
+        with temporary_env(**required_env()):
+            reload_config()
+            sys.modules.pop("tg_bot.tools.search", None)
+            return importlib.import_module("tg_bot.tools.search")
+
+    def setUp(self):
+        self.fetch = importlib.import_module("tg_bot.tools.fetch")
+
+    def test_default_news_provider_order_puts_deepseek_after_gnews_before_paid(self):
+        search = self._search()
+        calls = []
+
+        def recorder(name, rows=()):
+            def run(*_args, **_kwargs):
+                calls.append(name)
+                return list(rows), []
+            return run
+
+        with patch.object(search, "_news_from_gnews", side_effect=recorder("gnews")), \
+             patch.object(search, "_news_from_deepseek", side_effect=recorder("deepseek")), \
+             patch.object(search, "_news_from_brave", side_effect=recorder("brave")), \
+             patch.object(search, "_news_from_tavily", side_effect=recorder("tavily")), \
+             patch.object(search, "_news_from_serper", side_effect=recorder("serper")):
+            search.execute_news_candidates_all("query")
+        self.assertEqual(calls, ["gnews", "deepseek", "brave", "tavily", "serper"])
+
+    def test_gnews_enough_skips_deepseek_and_writes_diagnostic(self):
+        search = self._search()
+        free_rows = [{"title": f"Free {i}", "url": f"https://free.test/{i}", "source": "gnews"}
+                     for i in range(12)]
+        with patch.object(search, "_news_from_gnews", return_value=(free_rows, [])), \
+             patch.object(search, "_news_from_deepseek", return_value=([], [])) as deepseek:
+            items, diagnostics = search.execute_news_candidates_all("query")
+        deepseek.assert_not_called()
+        self.assertEqual(len(items), 12)
+        self.assertEqual(diagnostics, ["gnews: enough_skip_paid"])
+
+    def test_default_web_provider_order_starts_with_deepseek(self):
+        search = self._search()
+        calls = []
+
+        def recorder(name):
+            def run(_query):
+                calls.append(name)
+                return [], []
+            return run
+
+        with patch.object(search, "_web_from_deepseek", side_effect=recorder("deepseek")), \
+             patch.object(search, "_web_from_brave", side_effect=recorder("brave")), \
+             patch.object(search, "_web_from_tavily", side_effect=recorder("tavily")), \
+             patch.object(search, "_web_from_serper", side_effect=recorder("serper")):
+            search.web_candidates_all("query")
+        self.assertEqual(calls, ["deepseek", "brave", "tavily", "serper"])
+
+    def test_news_deepseek_rows_keep_url_and_source_and_degrade_without_key(self):
+        search = self._search()
+        raw = [{"url": "https://ds.test/1", "title": "DS", "snippet": "摘要",
+                "published_at": "2026-10-15T00:00:00Z", "source": "deepseek",
+                "authority": 3, "rerank_score": 2.1}]
+        with patch.dict(os.environ, {"DEEPSEEK_KEY_0": "k0-test"}), \
+             patch("tg_bot.deepseek_search.ds_search_rows", return_value=raw) as rows:
+            items, notes = search._news_from_deepseek("query")
+        self.assertEqual(notes, [])
+        self.assertEqual(items[0]["url"], "https://ds.test/1")
+        self.assertEqual(items[0]["source"], "deepseek")
+        self.assertEqual(items[0]["summary"], "摘要")
+        rows.assert_called_once()
+
+        with patch.dict(os.environ, {"DEEPSEEK_KEY_0": "", "DEEPSEEK_KEY_1": ""}), \
+             patch("tg_bot.deepseek_search.ds_search_rows") as rows:
+            items, notes = search._news_from_deepseek("query")
+        self.assertEqual((items, notes), ([], ["deepseek: unavailable"]))
+        rows.assert_not_called()
+
+    def test_fetch_chain_order_is_local_jina_deepseek_tavily(self):
+        url = "https://example.test/article"
+        calls = []
+
+        def local(_url):
+            calls.append("local")
+            return ""
+
+        def jina(_url):
+            calls.append("jina")
+            return None
+
+        def deepseek(_url):
+            calls.append("deepseek")
+            return None
+
+        def tavily(_endpoint, _payload):
+            calls.append("tavily")
+            return {"results": [{"raw_content": "Tavily正文。" * 60}]}
+
+        with patch.object(self.fetch, "validate_fetch_url", return_value=True), \
+             patch.object(self.fetch, "_safe_local_fetch", side_effect=local), \
+             patch.object(self.fetch, "FETCH_REMOTE_EXTRACT", True), \
+             patch.object(self.fetch, "_try_jina", side_effect=jina), \
+             patch.object(self.fetch, "_try_deepseek_fetch", side_effect=deepseek), \
+             patch("tg_bot.tools.search._tavily_request", side_effect=tavily):
+            result = self.fetch.execute_fetch_content(url)
+        self.assertEqual(calls, ["local", "jina", "deepseek", "tavily"])
+        self.assertIn("Tavily正文", result)
+
+    def test_fetch_chain_uses_deepseek_before_tavily_when_it_succeeds(self):
+        url = "https://example.test/article"
+        ds_text = "[正文来源（DeepSeek）：https://example.test/article]\n\n" + "正文。" * 100
+        with patch.object(self.fetch, "validate_fetch_url", return_value=True), \
+             patch.object(self.fetch, "_safe_local_fetch", return_value=""), \
+             patch.object(self.fetch, "FETCH_REMOTE_EXTRACT", True), \
+             patch.object(self.fetch, "_try_jina", return_value=None), \
+             patch.object(self.fetch, "_try_deepseek_fetch", return_value=ds_text), \
+             patch("tg_bot.tools.search._tavily_request") as tavily:
+            result = self.fetch.execute_fetch_content(url)
+        tavily.assert_not_called()
+        self.assertEqual(result, ds_text)
+
+    def test_try_deepseek_fetch_requires_more_than_300_chars(self):
+        url = "https://example.test/article"
+        with patch.object(self.fetch, "ds_fetch", return_value="短" * 10):
+            self.assertIsNone(self.fetch._try_deepseek_fetch(url))
+        with patch.object(self.fetch, "ds_fetch", return_value="正" * 400):
+            result = self.fetch._try_deepseek_fetch(url)
+        self.assertTrue(result.startswith("[正文来源（DeepSeek）：https://example.test/article]"))
 
 
 class BotUtilsTests(unittest.TestCase):

@@ -12,6 +12,7 @@ from tg_bot.config import (
     SOURCES_DIR,
     _ctx,
 )
+from tg_bot.deepseek_search import ds_fetch, default_post as ds_post
 from tg_bot.storage import load_today_index, update_today_index
 
 log = logging.getLogger(__name__)
@@ -236,6 +237,25 @@ def _try_jina(url):
         return None
 
 
+_DS_FETCH_MIN_CHARS = 300  # 与 Jina 的有效正文判断一致
+
+
+def _try_deepseek_fetch(url):
+    """DeepSeek 官方 Fetch 抓取 Markdown 正文;失败或正文过短返回 None。
+
+    限速(同进程相邻请求至少间隔 0.25 秒)由 deepseek_search 模块统一处理。
+    """
+    try:
+        text = (ds_fetch(url, post=ds_post) or "").strip()
+        if len(text) <= _DS_FETCH_MIN_CHARS:
+            return None
+        log.info(f"✅ DeepSeek Fetch 获取 {len(text)} 字符：{url[:60]}")
+        return f"[正文来源（DeepSeek）：{url}]\n\n{text[:8000]}"
+    except Exception as e:
+        log.debug(f"DeepSeek Fetch 失败: {e}")
+        return None
+
+
 def execute_fetch_content(url):
     """
     本地抓取正文，并校验每次重定向的目标。
@@ -272,6 +292,9 @@ def execute_fetch_content(url):
         jina_text = _try_jina(url)
         if jina_text:
             return jina_text
+        ds_text = _try_deepseek_fetch(url)
+        if ds_text:
+            return ds_text
         from tg_bot.tools.search import _tavily_request
         try:
             d = _tavily_request("https://api.tavily.com/extract", {"urls": [url]})

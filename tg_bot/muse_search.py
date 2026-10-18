@@ -556,6 +556,9 @@ def _default_dep(name):
     if name == "free":
         from tg_bot.free_sources import free_rows, default_get
         return lambda query, time_range: free_rows(query, time_range, get=default_get)
+    if name == "ds":
+        from tg_bot.deepseek_search import ds_search_rows, default_post as ds_post
+        return lambda query, time_range: ds_search_rows(query, time_range, post=ds_post)
     if name == "web":
         from tg_bot.tools.search import web_candidates_all
         return web_candidates_all
@@ -636,6 +639,7 @@ ENOUGH_SITES = 6
 LAST_SEARCH_CALLS = 0
 LAST_GNEWS_CALLS = 0
 LAST_FREE_CALLS = 0
+LAST_DS_CALLS = 0
 _GNEWS_CACHE = {}
 REINFORCE_MAX_AGE_SECONDS = 30 * 86400
 REINFORCE_BUDGET_SECONDS = 100
@@ -722,9 +726,10 @@ def reinforce_claim(claim, quotes, sources, pages, *, search, fetch, extract, ve
 
 def run_query(q, *, deps=None, now=None):
     """执行完整查询流程并返回 Markdown；任何内部错误降级为"没有找到"，不抛出。"""
-    global LAST_SEARCH_CALLS, LAST_GNEWS_CALLS, LAST_FREE_CALLS
+    global LAST_SEARCH_CALLS, LAST_GNEWS_CALLS, LAST_FREE_CALLS, LAST_DS_CALLS
     LAST_GNEWS_CALLS = 0
     LAST_FREE_CALLS = 0
+    LAST_DS_CALLS = 0
     if now is None:
         now = datetime.now(timezone.utc)
     stamp = now.isoformat(timespec="seconds")
@@ -798,6 +803,18 @@ def run_query(q, *, deps=None, now=None):
                 free_ran = True
                 LAST_FREE_CALLS = fcount
 
+            # 阶段 0c:DeepSeek 官方搜索,按次计费但不计入付费 search_calls;足够时付费阶段跳过
+            ds_ok = deps is None or "ds" in injected
+            dsfn = dep("ds") if ds_ok else None
+            ds_ran = False
+            if dsfn is not None:
+                djobs = variants[:2]
+                dscount = len(djobs)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    merge(list(pool.map(lambda v: _safe_call(dsfn, v, time_range), djobs)))
+                ds_ran = True
+                LAST_DS_CALLS = dscount
+
             # 额度保护:某提供方本月用量 >= 80% 时按需查询不再使用它
             quota_fn = injected.get("quota")
             if quota_fn is None:
@@ -844,7 +861,7 @@ def run_query(q, *, deps=None, now=None):
             if allowed.get("tavily", True) and variants:
                 stages.append([(dep("web_tavily"), variants[0])])
             for index, jobs in enumerate(stages):
-                if (index > 0 or gnews_ran or free_ran) and enough():
+                if (index > 0 or gnews_ran or free_ran or ds_ran) and enough():
                     break
                 run_stage(jobs)
         LAST_SEARCH_CALLS = search_calls
@@ -1162,7 +1179,8 @@ def main(argv=None, *, stdin_bytes=None, runner=None, env=None):
         _audit(log_path, "ok", q, started, len(result),
                extra={"search_calls": LAST_SEARCH_CALLS,
                       "gnews_calls": LAST_GNEWS_CALLS,
-                      "free_calls": LAST_FREE_CALLS})
+                      "free_calls": LAST_FREE_CALLS,
+                      "ds_calls": LAST_DS_CALLS})
         return 0
     finally:
         if slot is not None:

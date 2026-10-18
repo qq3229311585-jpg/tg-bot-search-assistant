@@ -196,6 +196,33 @@ def _news_from_gnews(query, time_range="day"):
         return [], [f"gnews: provider_error:{type(exc).__name__}"]
 
 
+def _news_from_deepseek(query, time_range="day"):
+    """Return DeepSeek official search rows; no key or any failure degrades to []."""
+    from tg_bot.deepseek_search import ds_available, ds_search_rows, default_post as ds_post
+
+    if not ds_available():
+        return [], ["deepseek: unavailable"]
+    try:
+        raw_rows = ds_search_rows(query, time_range, post=ds_post, count=8)
+        rows = [
+            {
+                "title": row.get("title", ""),
+                "summary": row.get("snippet", ""),
+                "url": row.get("url", ""),
+                "published_at": row.get("published_at"),
+                "relevance": None,
+                "source": "deepseek",
+            }
+            for row in raw_rows
+            if row.get("title") and row.get("url")
+        ]
+        if rows:
+            return rows, []
+        return [], ["deepseek: empty"]
+    except Exception as exc:
+        return [], [f"deepseek: provider_error:{type(exc).__name__}"]
+
+
 def _news_from_brave(query):
     """Return structured Brave news rows and provider-local diagnostics."""
     from tg_bot.tools.fetch import http_get
@@ -369,6 +396,7 @@ def execute_news_candidates_all(query, providers=None):
     if use_default:
         providers = (
             ("gnews", _news_from_gnews),
+            ("deepseek", _news_from_deepseek),
             ("brave", _news_from_brave),
             ("tavily", _news_from_tavily),
             ("serper", _news_from_serper),
@@ -400,6 +428,32 @@ def execute_news_candidates_all(query, providers=None):
             diagnostics.append("gnews: enough_skip_paid")
             break
     return merged, diagnostics
+
+
+def _web_from_deepseek(query):
+    """返回 DeepSeek 通用网页搜索的结构化结果;无 key 或失败返回 []。"""
+    from tg_bot.deepseek_search import ds_available, ds_search_rows, default_post as ds_post
+
+    if not ds_available():
+        return [], ["deepseek: unavailable"]
+    try:
+        raw_rows = ds_search_rows(query, "any", post=ds_post, count=10)
+        rows = [
+            {
+                "title": row.get("title", ""),
+                "summary": row.get("snippet", ""),
+                "url": row.get("url", ""),
+                "published_at": row.get("published_at"),
+                "source": "deepseek",
+            }
+            for row in raw_rows
+            if row.get("title") and row.get("url")
+        ]
+        if rows:
+            return rows, []
+        return [], ["deepseek: empty"]
+    except Exception as exc:
+        return [], [f"deepseek: provider_error:{type(exc).__name__}"]
 
 
 def _web_from_brave(query):
@@ -518,6 +572,7 @@ def web_candidates_all(query, providers=None):
     """聚合通用网页搜索的多个提供方，结果顺序稳定、按 URL 去重。"""
     if providers is None:
         providers = (
+            ("deepseek", _web_from_deepseek),
             ("brave", _web_from_brave),
             ("tavily", _web_from_tavily),
             ("serper", _web_from_serper),

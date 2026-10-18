@@ -1332,3 +1332,80 @@ class FreeStageTests(unittest.TestCase):
         self.assertTrue(any(name == "brave" for name, _ in paid_log))
         self.assertEqual(ms.LAST_SEARCH_CALLS, len(paid_log))
         self.assertGreaterEqual(ms.LAST_FREE_CALLS, 1)
+
+
+class DeepseekStageTests(unittest.TestCase):
+    def _run(self, *, ds, pages, quotes, paid_log, claims=CLAIMS_OK, time_range="any"):
+        def paid(name):
+            def call(q):
+                paid_log.append((name, q))
+                return ([], {})
+            return call
+
+        deps = {"model": _gmodel(quotes, claims, time_range),
+                "fetch": lambda url: pages.get(url, "正文抓取失败:无数据"),
+                "canon": lambda url: url,
+                "ds": ds,
+                "web_brave": paid("brave"), "news_brave": paid("news_brave"),
+                "web_serper": paid("serper"), "web_tavily": paid("tavily")}
+        return ms.run_query("新项目什么时候投产", deps=deps, now=NOW)
+
+    def test_ds_rows_enter_candidates_and_do_not_count_as_paid(self):
+        rows, pages, quotes = _many_sites(6)
+        paid_log = []
+        out = self._run(ds=lambda q, tr: list(rows), pages=pages, quotes=quotes,
+                        paid_log=paid_log)
+        self.assertIn(rows[0]["url"], out)
+        self.assertIn(rows[1]["url"], out)
+        self.assertEqual(paid_log, [])
+        self.assertEqual(ms.LAST_SEARCH_CALLS, 0)
+        self.assertGreaterEqual(ms.LAST_DS_CALLS, 1)
+
+    def test_ds_empty_falls_back_to_paid_and_counts_only_paid(self):
+        rows, pages, quotes = _many_sites(6)
+        paid_log = []
+        self._run(ds=lambda q, tr: [], pages=pages, quotes=quotes, paid_log=paid_log)
+        self.assertTrue(any(name == "brave" for name, _ in paid_log))
+        self.assertEqual(ms.LAST_SEARCH_CALLS, len(paid_log))
+        self.assertGreaterEqual(ms.LAST_DS_CALLS, 1)
+
+    def test_ds_exception_falls_back_to_paid(self):
+        rows, pages, quotes = _many_sites(6)
+        paid_log = []
+
+        def boom(q, tr):
+            raise RuntimeError("deepseek down")
+
+        self._run(ds=boom, pages=pages, quotes=quotes, paid_log=paid_log)
+        self.assertTrue(any(name == "brave" for name, _ in paid_log))
+
+    def test_ds_not_run_when_not_injected(self):
+        rows, pages, quotes = _many_sites(6)
+        paid_log = []
+        deps = {"model": _gmodel(quotes, CLAIMS_OK, "any"),
+                "fetch": lambda url: pages.get(url, "正文抓取失败:无数据"),
+                "canon": lambda url: url,
+                "web_brave": lambda q: paid_log.append(("brave", q)) or ([], {})}
+        ms.run_query("新项目什么时候投产", deps=deps, now=NOW)
+        self.assertEqual(ms.LAST_DS_CALLS, 0)
+
+    def test_audit_extra_contains_ds_calls(self):
+        import contextlib
+        import io
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"MUSE_SEARCH_DISABLED_FILE": os.path.join(tmp, "disabled"),
+                   "MUSE_SEARCH_LOCK_DIR": os.path.join(tmp, "locks"),
+                   "MUSE_SEARCH_LOG": os.path.join(tmp, "audit.log"),
+                   "MUSE_SEARCH_TIMEOUT": "10"}
+
+            def runner(q):
+                ms.LAST_DS_CALLS = 2
+                return "RESULT"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                ms.main(stdin_bytes=b'{"q":"ab"}', runner=runner, env=env)
+            with open(env["MUSE_SEARCH_LOG"], encoding="utf-8") as fh:
+                rec = json.loads(fh.read().splitlines()[0])
+            self.assertEqual(rec["ds_calls"], 2)
