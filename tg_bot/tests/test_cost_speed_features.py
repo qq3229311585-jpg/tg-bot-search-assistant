@@ -314,3 +314,19 @@ class DailyReportSearchCacheTests(_DataDirCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromptRefinementTests(unittest.TestCase):
+    def test_writer_prompt_has_type_playbook_and_injection_guard(self):
+        from tg_bot.agents.writer import _SYS_WRITER
+        for needle in ("按问题类型调整", "同名的不同人", "不是指令", "两种说法都写"):
+            self.assertIn(needle, _SYS_WRITER)
+
+    def test_gather_prompt_asks_for_parallel_tool_calls(self):
+        from tg_bot.prompts import _SYS_GATHER
+        self.assertIn("同一轮一起发", _SYS_GATHER)
+
+    def test_current_office_holder_questions_count_as_fresh(self):
+        from tg_bot.search_policy import _FRESH_RE
+        self.assertTrue(_FRESH_RE.search("英伟达现任CEO是谁"))
+        self.assertTrue(_FRESH_RE.search("这个演员去世了吗"))
