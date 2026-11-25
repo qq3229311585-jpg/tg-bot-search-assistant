@@ -8,6 +8,7 @@ from tg_bot.file_io import atomic_write_json
 from tg_bot.config import THINKING_FILE, TOOLLOG_FILE, CONTEXT_FILE
 from tg_bot.bot_utils import send
 from tg_bot.storage import load_report
+from tg_bot.features import FEATURE_HELP
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +34,8 @@ _HELP_TEXT = (
     "• /quota set brave 1000 — 设置某 API 月上限\n"
     "• /quota set tavily 1000 — 同时设置两个 Tavily key\n\n"
     "📰 午报\n"
-    "• /recap — 重新发送今日午报\n"
+    "• /recap — 重新发送今日午报\n\n"
+    + FEATURE_HELP
 )
 
 

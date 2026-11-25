@@ -123,6 +123,27 @@ ASK_API_TRUST_PROXY=false      # 仅在可信反向代理后开启
 
 # OpenHuman 记忆集成（可选）
 OPENHUMAN_RPC_TOKEN=...
+
+# 降本 / 提速（都有默认值，不填即可）
+PIPELINE_CRITIC_MODE=smart       # smart：规则核查通过就不调模型核查（高风险问题照常模型核查）；always：每次都模型核查
+PIPELINE_DEFERRED_CRITIC=true    # 规则核查有疑点时先发回复、后台核查，发现硬伤再补发更正
+GATHER_MAX_ROUNDS=8              # 采集循环最多轮数（原 14）
+GATHER_THINKING_BUDGET=600       # 采集每轮思考预算（原 2000）
+GATHER_TOOL_RESULT_CHARS=3000    # 放进采集对话的工具结果长度上限；完整正文仍交给写作环节
+GATHER_MAX_WEB_SEARCH=6          # 采集配额（原 10 / 4 / 3）
+GATHER_MAX_FETCH=3
+GATHER_MAX_SERPER=2
+CONTEXT_SUMMARY_LLM=false        # true 时恢复用模型做每轮上下文摘要
+DAILY_REPORT_SEARCH_CACHE_HOURS=6  # 日报同一查询 N 小时内复用搜索结果，0 关闭
+
+# 花费账本（/cost）
+LLM_USAGE_LEDGER=true            # 每次模型调用写入 $TG_BOT_DATA_DIR/llm_usage/YYYY-MM-DD.jsonl
+LLM_PRICE_INPUT_HIT=0.2          # 元/百万 token，按你的账单实价修改
+LLM_PRICE_INPUT_MISS=2
+LLM_PRICE_OUTPUT=3
+
+# 新功能
+WATCH_INTERVAL_HOURS=12          # /watch 每个话题多久检索一次
 ```
 
 ---

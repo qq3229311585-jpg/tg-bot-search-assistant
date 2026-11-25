@@ -55,6 +55,9 @@ from tg_bot.ask_server import (
     _load_or_create_ask_token, _run_ask_server, ASK_TOKEN_FILE,
 )
 from tg_bot.search_policy import decide_search_policy
+import tg_bot.features as _features
+import tg_bot.features.scheduler as _features_scheduler
+from tg_bot.features.cost import check_budget_alert
 import tg_bot.ask_server as _ask_server_mod
 import tg_bot.config as _cfg
 
@@ -94,14 +97,31 @@ def _send_reply_with_progress(progress, send_func, chat_id, text):
     return delivered
 
 
-def _build_fast_system_prompt(parts):
-    """Keep the original fast-chat behavior honest about not using search."""
-    reminder = (
-        "【当前回答路径】你现在直接使用自己的知识回答，没有调用任何搜索工具，"
-        "没有查询外部网络。回答时不要出现「根据搜索结果」「据我查询」"
-        "「刚才搜索到」等措辞；如涉及可能变化的信息，要明确说明没有实时核验。"
-    )
-    return "\n".join(list(parts or []) + [reminder])
+def _build_fast_system_prompt(parts, dynamic_parts=None):
+    """Static prefix first (cache friendly), honesty reminder, then dynamic tail."""
+    from tg_bot.chat_prompt import FAST_PATH_REMINDER
+    return "\n\n".join(list(parts or []) + [FAST_PATH_REMINDER] + list(dynamic_parts or []))
+
+
+def _start_deferred_review(chat_id, user_text, job, sent_reply):
+    """先发后审：回复已发出，后台跑模型核查；发现硬伤才补发一条更正。"""
+    def _worker():
+        try:
+            from tg_bot.core.pipeline import run_deferred_critic
+            from tg_bot.usage import llm_request
+            with llm_request("deferred_critic"):
+                fixed, status = run_deferred_critic(job)
+            log.info(f"🕵️ 后台核查完成: {status}")
+            if not status.startswith(("patched", "rewrite")):
+                return
+            fixed_display = clean_reply_for_user(fixed or "")
+            if not fixed_display.strip() or fixed_display.strip() == (sent_reply or "").strip():
+                return
+            send(chat_id, "✏️ 后台核查发现上一条回答有需要更正的地方，以这一版为准：\n\n" + fixed_display)
+        except Exception as exc:
+            log.warning(f"后台核查失败（不影响已发送回复）: {exc}")
+
+    threading.Thread(target=_worker, daemon=True, name="deferred-critic").start()
 
 
 _BLOCKED_SOURCE_DOMAINS = {"baike.baidu.com", "www.baike.baidu.com"}
@@ -416,140 +436,26 @@ def handle(chat_id, text, http_mode=False, brief=False):
     except Exception:
         _features_block = ""
 
-    parts = [
-        "══════════════════════════════════════\n"
-        "【角色定位】\n"
-        "你是用户的专属信息助手「小助」，只对用户一个人说话。\n"
-        "你的回复只给用户看，不是写给任何 AI 或系统看的。\n"
-        "系统里有一个「监管 AI」会在你回复后做质量检查，但那是它的事：\n"
-        "  · 你不需要理会它、不需要回应它、不需要向它解释任何事\n"
-        "  · 但如果用户问起监管AI/核查/审核相关问题，\n"
-        "    你应该如实说明：走了快速路径时没有经过核查，走了搜索路径时经过了核查。\n"
-        "    不要搧塞用户的合理追问。\n"
-        "  · 如果你收到标注了【系统指令】或【审核退回】的消息，那是系统给你的修改要求，\n"
-        "    照着改就行，改完之后直接把修改版发给用户，不需要提及审核过程\n"
-        "══════════════════════════════════════\n\n"
-        "【最高指令·优先级高于一切】\n"
-        "不确定的事情，不说。\n"
-        "模糊的概念和细节，先用工具搜，搜到再说。\n"
-        "完全没把握的直接说不知道。\n"
-        "宁可说'我不知道'，绝不输出没有把握的内容。\n"
-        "══════════════════════════════════════\n\n"
-        f"【当前时间】今天是 {bj_str} {bj_week}。训练数据可能滞后，以此处时间为准。\n"
-        "  → 用户问'几点了'/'现在几点'/'现在几时'/'当前时间'等，直接说出上面的时间，\n"
-        "    不要说'我没有获取系统时间的能力'——那是错的，时间就在上面。\n\n"
-        "你叫小助，只有用户主动问身份时才说；平时不主动提及。\n"
-        "用中文回答，像朋友聊天，信息密度高，不废话。不涉及政治宗教民族敏感话题。\n\n"
-        "【回复效率】\n"
-        "· 先给结论，再给细节——不要铺垫、不要重复用户的问题\n"
-        "· 回复开头不说'好的''当然''让我来帮你'等无意义起手式\n"
-        "· 每个独立的要点单独成段，段间留空行，让眼睛好读\n"
-        "· 列举 3 条以上时用短横线「-」或数字分行，不要挤成一坨\n"
-        "· 能用一句话说清的不写两句，能用具体数字的不写'一些/很多'\n"
-        "· 最后不加'希望对你有帮助''如有疑问欢迎继续问'之类的结尾废话\n\n"
-        "【格式】\n"
-        "纯文本 + emoji（适度），不用任何 Markdown（不加粗、不斜体、不用#标题、不用---）。\n\n"
-        "【工具使用流程】\n"
-        "▶ 知识/概念/定义/历史/科学/人物等可核查的问题：\n"
-        "  先调 wikipedia_lookup → 有结果直接用，不再调 web_search。\n"
-        "  Wikipedia 无结果 → 转入 web_search 流程。\n\n"
-        "▶ 新闻/动态/数字/最新事件，或 Wikipedia 无结果时：\n"
-        "  用 web_search（最多10次）+ fetch_content（最多4次）+ serper_search（最多3次）。\n"
-        "  搜索要求：\n"
-        "  ① 至少换3种不同关键词/角度（原词→拆词/同义→英文→上位概念），不能第一轮没结果就放弃。\n"
-        "  ② 搜完摘要后必须调 fetch_content 抓至少一篇原文；失败立即换下一个 URL，直到成功。\n"
-        "  ③ 没有成功抓到原文之前，不允许输出最终答案。\n\n"
-        "▶ 实用技巧/生活方法/操作建议类（'怎么办''咋做''有什么方法'等）：\n"
-        "  必须先搜再答，不能直接凭经验回答。搜索结果里有什么就说什么，没有的不补充。\n"
-        "▶ 纯闲聊/主观感受/数学/代码：不需要搜索，直接回答。\n"
-        "▶ 用户只是自然使用了某个词，没有问它的意思：不解释，不查。\n\n"
-        "【常识直接放行】\n"
-        "以下情况不需要搜索，可以直接回答：\n"
-        "  · 被反复验证的自然规律（水100℃沸腾、光速约30万km/s等）\n"
-        "  · 确定无误的数学/逻辑事实\n"
-        "  · 极为广为人知、从未有争议的历史事件（如二战结束年份）\n"
-        "  · 纯粹的主观/创意/闲聊/计算类问题\n"
-        "判断标准：'这件事在任何教科书里都一样，不可能有争议' → 放行。\n"
-        "只要有一丝'我不确定这是不是准确的'，就不算常识，必须搜索。\n\n"
-        "【搜索全部失败后的三档兜底】\n"
-        "（仅在 Wikipedia + web_search + serper 全部无结果时启用）\n\n"
-        "给自己打把握分（0-100），代表对这条知识公认正确的确信程度：\n"
-        "▸ ≥ 80分：可以用知识库回答，但开头声明一句：\n"
-        "  '搜索没找到相关内容，以下是我自己知道的，把握较高，供参考。'\n"
-        "  然后正常回答，不要在正文里打任何标签。\n"
-        "▸ 50-79分：先补救搜索一轮（换宽泛词/英文/上位概念）；\n"
-        "  补救搜到 → 基于结果回答；\n"
-        "  补救仍无结果 → 直接说不知道，不要凭印象猜。\n"
-        "▸ < 50分：先判断这是不是一个客观事实问题——\n"
-        "  是事实问题但就是没找到 → 只说'没找到相关信息，不知道。'\n"
-        "  不是事实问题（主观/创意/计算等）→ 直接回答。\n\n"
-        "【回复格式】\n"
-        "正文里不写任何来源标签，不写（推测）（估计值）（经验补充）（Wiki）等括号注释。\n"
-        "来源信息只在你自己心里记着，用于被追问时如实说明，不出现在正文里。\n"
-        "如果整体把握不足，只在开头整体声明一句，其余正文正常写。\n\n"
-        "【严格忠于搜索原文】\n"
-        "有搜索结果时，只按原始表述叙述，不夸大、不推断、不添加细节。\n\n"
-        "【禁止伪造来源】\n"
-        "绝对不能在正文里编一个看起来像网站的名字（如'KitchenToolsTips'等）当作来源出处。\n"
-        "来源只记在心里，被问时再说，不主动写进回复。\n\n"
-        "【配置修改请求】\n"
-        "如果用户要求修改 API 上限、配额参数等 bot 配置（如'把 Brave 上限改成 1000'），\n"
-        "如实告知：我没有权限在运行时修改自身配置，这类修改需要改代码。\n"
-        "可以告诉用户：预警阈值可以用 /quota set <数字> 调整；其他上限需要让开发者改代码。\n\n"
-        "【来源诚实】\n"
-        "没调工具就答的，说'我印象里'，不能暗示有过搜索行为。\n"
-        "被追问'查了没/哪来的'，必须对照下方【近期工具记录】如实说明，不能自行猜测或编造。\n"
-        "  · 记录里有搜索工具 → 说'搜过了'\n"
-        "  · 记录里工具列表为空 → 说'那条没有搜索，是我自己的理解'\n"
-        "  · 记录里显示超时/采集异常 → 如实说'当时搜索了但没采集到有效结果'\n\n"
-        "【禁止捏造】\n"
-        "举例打比方用'比如/举个例子/就好比'引出，绝不把自己编的内容安在用户头上。\n"
-        "引用用户的话只能引用对话记录里真实出现的原文。\n\n",
-        _features_block,
-        "\n【对话记忆（仅用于保持连续性）】\n"
-        + memory_context
-        + "\n如果记忆中有相关记录，优先利用记录回答，不要声称自己完全没有记忆；"
-        "没有相关记录时，再如实说明只能查看已保存的日志或摘要。",
-        "\n【午报说明】\n"
-        "每天北京时间 13:00 自动生成并推送一份「午报」给用户。\n"
-        "午报固定包含以下板块：\n"
-        "  🌤 天气预报（安阳，含早/午/晚/夜四段）\n"
-        "  💱 汇率（USD/CNY 及近期走势分析）\n"
-        "  📈 行情速览（BTC / ETH 等）\n"
-        "  📰 中国要闻 / 全球要闻（当天重要事件）\n"
-        "  🤖 AI 速报（当日 AI 领域重要新闻，含点评）\n"
-        "  🔒 代理圈动态（sing-box / Xray-core 等工具更新）\n"
-        "  🗣️ 圈子在聊（HackerNews 热议话题）\n"
-        "  🛠 GitHub 热榜（当日 star 增长最快的仓库）\n"
-        "  🎮 Steam 降价优惠（游戏折扣与促销）\n"
-        "  ⚡ 今日冷知识（科学/历史趣味小知识）\n"
-        "用户问'午报几点发/什么时候发'→ 回答：每天北京时间 13:00。\n"
-        "用户问'今天午报有什么/回顾午报/午报里的XX'→ 调用 read_today_report 工具读取全文后回答。\n"
-        "如果午报还没生成（当天 13:00 前被问到）→ 告知'今天的午报还没发，每天 13:00 推送'。\n",
-    ]
+    from tg_bot.chat_prompt import build_static_parts, build_dynamic_parts
+    parts = build_static_parts(_features_block)
 
-    # 注入近 5 轮工具使用记录，供「查了没」类追问如实回答
+    # 近 3 轮工具使用记录，供「查了没」类追问如实回答（动态内容，放提示词末尾）
+    _tl_lines = []
     try:
         _tl = json.loads(open(TOOLLOG_FILE, encoding="utf-8").read())
-        _recent = _tl[-5:] if len(_tl) >= 5 else _tl
+        _recent = _tl[-3:]
         if _recent:
-            _tl_lines = [
-                "【近期工具记录】",
-                "（仅供被问到「查了没/用了什么工具/哪来的」时如实回答，平时不要主动提及，",
-                " 记录里有工具 ≠ 做错了，没工具 ≠ 做错了，如实描述即可）",
-            ]
+            _tl_lines = ["【近期工具记录】（仅在被问「查了没/哪来的」时使用，平时不提）"]
             for _e in _recent:
                 _tools = _e.get("model_tools") or []
                 _tool_str = "、".join(_tools[:6]) if _tools else "（无工具调用）"
-                _rp = _e.get("reply_preview", "")[:40]
                 _tl_lines.append(
-                    f"  [{_e.get('ts','')}] 问：{_e.get('user','')[:30]}"
-                    f"\n    工具：{_tool_str}"
-                    f"\n    回复预览：{_rp}"
+                    f"  [{_e.get('ts','')}] 问：{_e.get('user','')[:30]} | 工具：{_tool_str}"
+                    f" | 回复：{_e.get('reply_preview', '')[:40]}"
                 )
-            parts.append("\n" + "\n".join(_tl_lines))
     except Exception:
         pass
+    dynamic_parts = build_dynamic_parts(f"{bj_str} {bj_week}", memory_context, _tl_lines)
 
     # ══ 第一层：意图消歧 ══════════════════════════════════════════════
     _ctx_turns = memory_turns
@@ -751,14 +657,14 @@ def handle(chat_id, text, http_mode=False, brief=False):
         evidence_flags = []
         _fast_messages = [
             {"role": m.get("role"), "content": m.get("content", "")}
-            for m in history[-8:]
+            for m in history[:-1][-8:]   # history[-1] 是本轮用户消息，下面单独追加
             if m.get("role") in ("user", "assistant")
         ]
         _fast_messages.append({"role": "user", "content": text})
         progress.stage("writer", "start", "")
         reply = fast_chat(
             _fast_messages,
-            system=_build_fast_system_prompt(parts),
+            system=_build_fast_system_prompt(parts, dynamic_parts),
             max_tokens=900,
             temp=0.6,
         )
@@ -767,10 +673,9 @@ def handle(chat_id, text, http_mode=False, brief=False):
         display_reply = _render_display_reply(reply, meta=meta, mode="answer")
         progress.stage("writer", "done", str(len(display_reply)))
 
-        history.append({"role": "user", "content": text, "ts": _now_ts()})
+        # 本轮用户消息在进入分支前已写入 history / daily log，这里只追加助手回复
         history.append({"role": "assistant", "content": display_reply, "ts": _now_ts()})
         if not http_mode:
-            append_daily_log("user", text)
             append_daily_log("assistant", display_reply)
 
         save_worklog_entry({
@@ -829,12 +734,12 @@ def handle(chat_id, text, http_mode=False, brief=False):
             save_history(history[-MAX_HISTORY:])
         else:
             save_history(history)
-        save_context(text, summarize_for_context(display_reply))
         clear_focus()
         for w in list(_cfg._quota_warnings):
             send(chat_id, w)
         _cfg._quota_warnings.clear()
         _send_reply_with_progress(progress, send, chat_id, display_reply)
+        save_context(text, summarize_for_context(display_reply))
         sync_to_openhuman_memory(
             user_text=text, reply_text=display_reply, source="telegram",
             tools_used=[],
@@ -951,6 +856,8 @@ def handle(chat_id, text, http_mode=False, brief=False):
             prev_searches=_prev_searches,
             focus_task=_focus_task,
             suggested_length=(pre or {}).get("suggested_length", ""),
+            query_variants=(pre or {}).get("search_queries") or None,
+            allow_deferred_critic=not http_mode,
         )
         meta = meta or {}
         source_index_result = meta.get("source_index", []) or []
@@ -1158,6 +1065,20 @@ def handle(chat_id, text, http_mode=False, brief=False):
     # http_mode：跳过 history 写入和 Telegram 发送，直接返回 reply
     if http_mode:
         return display_reply
+    # 保存本轮对话摘要到上下文（供下轮消歧使用；默认规则摘要，不调模型）
+    _ctx_summary = summarize_for_context(display_reply)
+    save_context(text, _ctx_summary)
+    clear_focus()  # 任务执行完毕，清空焦点
+    # 发送 API 配额预警（如有）
+    for w in list(_cfg._quota_warnings):
+        send(chat_id, w)
+    _cfg._quota_warnings.clear()
+    # 先把回复发出去，再做历史压缩等收尾工作，用户不用等这些调用
+    _send_reply_with_progress(progress, send, chat_id, display_reply)
+
+    if meta.get("deferred_critic"):
+        _start_deferred_review(chat_id, text, meta["deferred_critic"], display_reply)
+
     # 超出限制时总结旧消息
     if len(history) > MAX_HISTORY:
         cutoff    = len(history) - MAX_HISTORY
@@ -1172,17 +1093,7 @@ def handle(chat_id, text, http_mode=False, brief=False):
             )
         save_summary(combined)
         history = history[cutoff:]
-
     save_history(history)
-    # 保存本轮对话摘要到上下文（供下轮消歧使用）
-    _ctx_summary = summarize_for_context(display_reply)
-    save_context(text, _ctx_summary)
-    clear_focus()  # 任务执行完毕，清空焦点
-    # 发送 API 配额预警（如有）
-    for w in list(_cfg._quota_warnings):
-        send(chat_id, w)
-    _cfg._quota_warnings.clear()
-    _send_reply_with_progress(progress, send, chat_id, display_reply)
 
     # 同步到 OpenHuman 记忆（来自 Telegram 渠道）
     sync_to_openhuman_memory(
@@ -1229,6 +1140,8 @@ def main():
         log.info("🔑 /ask 使用 ASK_API_TOKEN 环境变量")
     else:
         log.info("🔑 /ask token 已保存到 %s", ASK_TOKEN_FILE)
+
+    _features_scheduler.start(ALLOWED_CHAT, send)
 
     _cleanup_counter = 0
     offset = _load_offset()
@@ -1291,8 +1204,15 @@ def main():
                     handle_quota_set(chat_id, text)
                 elif text.startswith("/ask "):
                     handle_ask(chat_id, text, handle)
+                elif _features.dispatch(chat_id, text, send):
+                    pass
                 else:
-                    handle(chat_id, text)
+                    from tg_bot.usage import llm_request
+                    with llm_request("chat"):
+                        handle(chat_id, text)
+                _alert = check_budget_alert()
+                if _alert:
+                    send(chat_id, _alert)
 
         except KeyboardInterrupt:
             log.info("停止。")

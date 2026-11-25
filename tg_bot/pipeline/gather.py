@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pipeline/gather.py — 采集层（gather_ai）+ 核心 AI 调用（ds_chat）+ 辅助函数"""
 
-import json, logging
+import json, logging, os, re
 from datetime import datetime, timezone, timedelta
 
 from tg_bot.config import (
@@ -28,6 +28,25 @@ from tg_bot.workers.gather_fallback import (
 from tg_bot.workers.source_backfill import complete_source_index
 
 log = logging.getLogger(__name__)
+
+
+def _env_int(key, default):
+    try:
+        return max(int(os.getenv(key, str(default))), 0)
+    except ValueError:
+        return default
+
+
+def _clip_tool_result(result, limit):
+    """采集 AI 只需要判断素材够不够，不需要整篇正文。
+
+    完整正文已经存进 source_index 交给写作 AI，这里只把前 limit 字放进对话历史，
+    否则每一轮都要把几篇 8000 字的正文重新发一遍。
+    """
+    result = result or ""
+    if limit <= 0 or len(result) <= limit:
+        return result
+    return result[:limit] + f"\n…（以下 {len(result) - limit} 字已存档给写作环节，无需重复抓取）"
 
 
 def _clean_assistant_msg_for_history(msg):
@@ -181,6 +200,9 @@ def summarize_for_context(reply: str) -> str:
     import tg_bot.config as _cfg
     if not reply:
         return ""
+    # 默认用规则摘要：省一次模型调用，也省掉回复发送前最长 15 秒的阻塞。
+    if os.getenv("CONTEXT_SUMMARY_LLM", "false").strip().lower() not in ("1", "true", "yes", "on"):
+        return rule_summary(reply)
     try:
         resp = http_post(
             "https://api.deepseek.com/chat/completions",
@@ -203,7 +225,24 @@ def summarize_for_context(reply: str) -> str:
                 return summary[:60]
     except Exception as e:
         log.warning(f"summarize_for_context 失败: {e}")
-    return reply[:40]   # 降级：直接截取
+    return rule_summary(reply)   # 降级：规则摘要
+
+
+def rule_summary(reply: str, limit: int = 60) -> str:
+    """不调模型的上下文摘要：去掉标记和 emoji 后，取开头的完整句子。"""
+    text = re.sub(r"\[来源\d+\]|（AI-no references）", "", reply or "")
+    text = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    out = ""
+    for sent in re.split(r"(?<=[。！？!?；;])", text):
+        if not sent.strip():
+            continue
+        if out and len(out) + len(sent) > limit:
+            break
+        out += sent
+    return (out or text[:limit]).strip()[:limit]
 
 
 # Source/cache matching helpers live in tg_bot.workers.source_utils.
@@ -305,14 +344,20 @@ def gather_ai(user_text, keywords, chat_id=None, pre_results=None, history_ctx=N
 
     _bj_now = datetime.now(timezone(timedelta(hours=8)))
     _bj_date = _bj_now.strftime("%Y年%m月%d日")
-    _bj_time = _bj_now.strftime("%H:%M")
-    _sys_gather_with_date = _SYS_GATHER + f"\n\n【当前日期时间】今天是 {_bj_date} {_bj_time}（北京时间），判断历史记录距今多久请以此为准。搜索关键词中如需年份也请以此为准。"
+    # 只写日期不写分钟：系统提示词一天内不变，跨请求也能命中 DeepSeek 前缀缓存
+    _sys_gather_with_date = _SYS_GATHER + f"\n\n【当前日期】今天是 {_bj_date}（北京时间），判断历史记录距今多久请以此为准。搜索关键词中如需年份也请以此为准。"
     msgs = [
         {"role": "system", "content": _sys_gather_with_date},
         {"role": "user",   "content": init_msg},
     ]
-    quota = {"web_search": 10, "fetch_content": 4, "serper_search": 3, "read_today_cache": 99}
+    quota = {
+        "web_search": _env_int("GATHER_MAX_WEB_SEARCH", 6),
+        "fetch_content": _env_int("GATHER_MAX_FETCH", 3),
+        "serper_search": _env_int("GATHER_MAX_SERPER", 2),
+        "read_today_cache": 99,
+    }
     used  = {"web_search": 0, "fetch_content": 0, "serper_search": 0, "read_today_cache": 0}
+    _tool_result_chars = _env_int("GATHER_TOOL_RESULT_CHARS", 3000)
     _url_to_entry = {}   # URL → source_index 条目，用于 fetch_content 回填 full_content
     meta  = {"rounds": [], "tool_calls_summary": [], "tool_results": [], "fetched_pages": [], "failed_urls": []}
     fetch_success = 0
@@ -323,7 +368,7 @@ def gather_ai(user_text, keywords, chat_id=None, pre_results=None, history_ctx=N
             if _entry.get("url"):
                 _url_to_entry[_entry["url"]] = source_index[-1]
 
-    for round_ in range(14):
+    for round_ in range(_env_int("GATHER_MAX_ROUNDS", 8)):
         resp = http_post(
             "https://api.deepseek.com/chat/completions",
             {"model": "deepseek-v4-flash",
@@ -331,8 +376,8 @@ def gather_ai(user_text, keywords, chat_id=None, pre_results=None, history_ctx=N
              "tools": TOOLS,
              "tool_choice": "auto",
              "temperature": 0.3,
-             "max_tokens": 6000,
-             "thinking": {"type": "enabled", "budget_tokens": 2000}},
+             "max_tokens": 2500,
+             "thinking": {"type": "enabled", "budget_tokens": _env_int("GATHER_THINKING_BUDGET", 600)}},
             headers={"Authorization": f"Bearer {_cfg.DEEPSEEK_KEY}"},
             timeout=120,
         )
@@ -423,7 +468,7 @@ def gather_ai(user_text, keywords, chat_id=None, pre_results=None, history_ctx=N
                 snippet_limit = 1200 if fn in _DIRECT_API_TOOLS else 500
                 meta["tool_results"].append({"tool": fn,
                     "query": q_disp[:40], "snippet": result[:snippet_limit]})
-            msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+            msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": _clip_tool_result(result, _tool_result_chars)})
 
     source_index = complete_source_index(
         source_index,

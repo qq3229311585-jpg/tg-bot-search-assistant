@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import contextlib
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 from dataclasses import replace
 import http.client
 import importlib
@@ -1775,7 +1776,8 @@ class DailyReportCollectionTests(unittest.TestCase):
                 "source": "fixture",
             }], [])
 
-        with patch("tg_bot.tools.search.execute_news_candidates", side_effect=fake_search):
+        with patch("tg_bot.tools.search.execute_news_candidates", side_effect=fake_search), \
+             patch.dict(os.environ, {"DAILY_REPORT_SEARCH_CACHE_HOURS": "0"}):
             candidates, diagnostics = module.collect_candidates(("china", "global", "ai_tech"))
         self.assertEqual([item.category for item in candidates], ["china", "global", "ai_tech"])
         self.assertEqual(diagnostics, [])
@@ -1794,7 +1796,8 @@ class DailyReportCollectionTests(unittest.TestCase):
                 "source": "fixture",
             }], [])
 
-        with patch("tg_bot.tools.search.execute_news_candidates", side_effect=fake_search):
+        with patch("tg_bot.tools.search.execute_news_candidates", side_effect=fake_search), \
+             patch.dict(os.environ, {"DAILY_REPORT_SEARCH_CACHE_HOURS": "0"}):
             candidates, diagnostics = module.collect_candidates(("china", "global"))
         self.assertEqual([item.category for item in candidates], ["china"])
         self.assertEqual(diagnostics, ["global: provider_error:TimeoutError"])
@@ -1845,7 +1848,7 @@ class DailyReportCollectionTests(unittest.TestCase):
                     summary="summary",
                     url="https://example.com/stable",
                     domain="example.com",
-                    published_at="2026-07-14T10:00:00+00:00",
+                    published_at=(_dt.now(_tz.utc) - _td(hours=2)).isoformat(),
                     relevance=0.9,
                     source="fixture",
                 )

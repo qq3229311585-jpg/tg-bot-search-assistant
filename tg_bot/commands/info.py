@@ -73,6 +73,8 @@ def _format_thinking_digest(th, tool_log=None, *, max_chars=2600):
         "reject": "退回",
         "no_sources": "素材不足",
         "skip_no_tools_warned": "未搜索核查",
+        "local_pass": "规则核查通过",
+        "deferred": "先发后审（后台核查）",
     }.get(verify_status)
     if not verdict_label:
         if verify_status.startswith("patched"):
@@ -174,6 +176,8 @@ def _format_toollog_for_user(items, *, n=10, max_chars=3600):
         "unknown": "未知",
         "no_sources": "素材不足",
         "skip_no_tools_warned": "未搜索核查",
+        "local_pass": "规则核查通过",
+        "deferred": "先发后审（后台核查）",
     }
     blocks = []
     for index, item in enumerate(items, 1):

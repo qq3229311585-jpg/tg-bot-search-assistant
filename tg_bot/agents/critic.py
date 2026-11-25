@@ -100,9 +100,11 @@ def critique(
                     {"role": "system", "content": _SYS_CRITIC},
                     {"role": "user", "content": user_msg},
                 ],
-                "max_tokens": 3000,
+                "max_tokens": 2000,
                 "temperature": 0.1,
-                "thinking": {"type": "enabled", "budget_tokens": 800},
+                # 强制 JSON 输出，基本消除“格式坏了再调一次修复器”的额外花费
+                "response_format": {"type": "json_object"},
+                "thinking": {"type": "enabled", "budget_tokens": 600},
             },
             headers={"Authorization": f"Bearer {_cfg.DEEPSEEK_VERIFY_KEY}"},
             timeout=60,

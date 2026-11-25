@@ -29,6 +29,17 @@ def _load_features_brief():
         return ""
 
 
+def _clean_queries(value):
+    """消歧顺带产出的搜索查询（替代单独的 QueryFixer 调用）。"""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if isinstance(item, str) and item.strip() and item.strip() not in out:
+            out.append(item.strip()[:80])
+    return out[:3]
+
+
 def _pre_check(text, ctx=None, focus=None):
     """
     第一层：意图消歧。
@@ -153,7 +164,8 @@ def _pre_check(text, ctx=None, focus=None):
                  {"role": "system", "content": _SYS_DISAMBIG + _features_note + f"\n\n【当前日期】今天是 {datetime.now(timezone(timedelta(hours=8))).strftime('%Y年%m月%d日')}，提取关键词时如需年份请用此日期。"},
                  {"role": "user",   "content": user_content}
              ],
-             "max_tokens": 200,
+             "max_tokens": 420,
+             "response_format": {"type": "json_object"},
              "thinking": {"type": "disabled"}},  # 固定 JSON，对错一眼看出
             headers={"Authorization": f"Bearer {_cfg.DEEPSEEK_KEY}"},
             timeout=20
@@ -190,6 +202,7 @@ def _pre_check(text, ctx=None, focus=None):
             "user_deferred":    bool(data.get("user_deferred", False)),
             "topic_anchor":     data.get("topic_anchor") or [],
             "suggested_tool":   str(data.get("suggested_tool", "")),
+            "search_queries":   _clean_queries(data.get("search_queries")),
         }
         log.info(f"🔍 意图消歧: clear={result['clear']} type={result['query_type']} "
                  f"speech={result.get('speech_act','')} external={result.get('needs_external_evidence')} "
