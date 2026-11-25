@@ -34,7 +34,11 @@ def http_post(url, payload, headers=None, timeout=50):
     if headers: h.update(headers)
     try:
         with urlopen(Request(url, data=body, headers=h), context=_ctx, timeout=timeout) as r:
-            return json.loads(r.read())
+            data = json.loads(r.read())
+        if "api.deepseek.com" in url and isinstance(data, dict):
+            from tg_bot.usage import record_llm_usage
+            record_llm_usage(payload, data)
+        return data
     except HTTPError as e:
         try:
             err_body = e.read().decode("utf-8", errors="replace")[:800]

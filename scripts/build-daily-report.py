@@ -70,11 +70,60 @@ def _parse_search_output(result: str, category: str, source: str) -> list[NewsCa
     return candidates
 
 
+def _search_cache_hours():
+    try:
+        return max(float(os.getenv("DAILY_REPORT_SEARCH_CACHE_HOURS", "6")), 0.0)
+    except ValueError:
+        return 6.0
+
+
+def _search_cache_path():
+    from tg_bot.config import DATA_DIR
+    return os.path.join(DATA_DIR, "daily_report_search_cache.json")
+
+
+def _cached_news_search(query, execute_news_candidates):
+    """同一查询 N 小时内复用结果：补跑、推送失败重试时不再重复花搜索额度。"""
+    ttl = _search_cache_hours()
+    if ttl <= 0:
+        return execute_news_candidates(query)
+    now = datetime.now(timezone.utc)
+    path = _search_cache_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except Exception:
+        cache = {}
+    entry = cache.get(query) if isinstance(cache, dict) else None
+    if isinstance(entry, dict) and entry.get("items"):
+        try:
+            age = now - datetime.fromisoformat(entry["at"])
+            if age <= timedelta(hours=ttl):
+                return entry["items"], ["search_cache: hit"]
+        except Exception:
+            pass
+    items, diagnostics = execute_news_candidates(query)
+    if items:
+        try:
+            from tg_bot.file_io import atomic_write_json
+            fresh = {
+                key: value for key, value in (cache.items() if isinstance(cache, dict) else [])
+                if isinstance(value, dict)
+                and now - datetime.fromisoformat(value.get("at", "1970-01-01T00:00:00+00:00")) <= timedelta(hours=ttl)
+            }
+            fresh[query] = {"at": now.isoformat(), "items": items}
+            atomic_write_json(path, fresh)
+        except Exception:
+            pass
+    return items, diagnostics
+
+
 def _collect_one_category(category, execute_news_candidates):
     """Collect one event lane in isolation for bounded parallel execution."""
     query = _CATEGORY_QUERIES.get(category, f"{category} 今日 新闻")
     try:
-        raw_items, provider_diagnostics = execute_news_candidates(query)
+        raw_items, provider_diagnostics = _cached_news_search(query, execute_news_candidates)
+        provider_diagnostics = [d for d in provider_diagnostics if d != "search_cache: hit"]
         found = [
             normalize_candidate(item, category, item.get("source", "news"))
             for item in raw_items

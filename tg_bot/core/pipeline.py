@@ -104,6 +104,119 @@ def _critic_budget(user_text: str, write_req: WriteRequest, cfg: PipelineConfig)
     }
 
 
+def _run_critic_loop(reply, write_req, user_text, cfg, budget, _prog, meta):
+    """模型核查 + 修补循环。返回 (reply, verify_status)。"""
+    from tg_bot.agents.writer import write
+    from tg_bot.agents.critic import critique
+    from tg_bot.agents.patcher import patch
+
+    verify_status = "skip"
+    fix_cycles = 0
+    attempt = 0
+    while True:
+        _prog("critic", "start", str(attempt))
+        report = critique(reply, write_req.sources, user_text, attempt)
+
+        if report.verdict == "pass":
+            verify_status = "pass"
+            _prog("critic", "done", "pass")
+            log.info(f"✅ Critic 通过（attempt={attempt}）")
+            break
+
+        if report.verdict == "unknown":
+            verify_status = "unknown"
+            _prog("critic", "done", "unknown")
+            log.warning("⚠️ Critic 状态 unknown，保留 Writer 草稿并记录，不触发重写")
+            break
+
+        if fix_cycles >= budget["max_fix_cycles"]:
+            verify_status = f"limit_{report.verdict}"
+            _prog("critic", "done", verify_status)
+            log.warning(
+                "⚠️ Critic 修正预算已用尽: level=%s verdict=%s fixes=%s",
+                budget["level"], report.verdict, fix_cycles,
+            )
+            break
+
+        if report.verdict == "patch" and cfg.patcher:
+            # 小问题：Patcher 直接改
+            _prog("critic", "done", "patch")
+            _prog("patcher", "start", "")
+            reply = patch(reply, report, write_req.sources, user_text)
+            reply = _enforce_short_length(reply, user_text, write_req.target_words)
+            fix_cycles += 1
+            verify_status = f"patched_once" if fix_cycles == 1 else f"patched_{fix_cycles}"
+            _prog("patcher", "done", str(len(reply)))
+            if not budget["reaudit_after_fix"]:
+                log.info("🧪 短回答已 patch 一次，跳过二次 Critic")
+                break
+            attempt += 1
+            continue
+
+        if report.verdict == "rewrite":
+            if not budget["allow_rewrite"]:
+                if cfg.patcher and report.issues:
+                    reply = patch(reply, report, write_req.sources, user_text)
+                    reply = _enforce_short_length(reply, user_text, write_req.target_words)
+                    fix_cycles += 1
+                    verify_status = "patched_instead_of_rewrite"
+                else:
+                    verify_status = "rewrite_blocked_short"
+                _prog("critic", "done", verify_status)
+                log.info("🧪 短回答禁止整篇 rewrite，已走最小处理")
+                break
+            # 大问题：Writer 重写
+            feedback = "\n".join(
+                f"[{iss.severity}] {iss.sentence[:80]} | {iss.reason}"
+                + (f" | 建议：{iss.suggested_fix}" if iss.suggested_fix else "")
+                for iss in report.issues
+            )
+            write_req.reject_feedback = feedback
+            write_req.verifier_checks = [
+                {"status": iss.severity, "sentence": iss.sentence,
+                 "reason": iss.reason, "suggested_fix": iss.suggested_fix,
+                 "evidence_excerpt": iss.evidence_excerpt}
+                for iss in report.issues
+            ]
+            reply, reasoning = write(write_req)
+            meta["write_reasoning"] = reasoning or meta.get("write_reasoning", "")
+            reply = _enforce_short_length(reply, user_text, write_req.target_words)
+            fix_cycles += 1
+            verify_status = f"rewrite_once" if fix_cycles == 1 else f"rewrite_{fix_cycles}"
+            if not budget["reaudit_after_fix"]:
+                break
+            attempt += 1
+            continue
+
+        verify_status = f"unhandled_{report.verdict}"
+        _prog("critic", "done", verify_status)
+        break
+
+    return reply, verify_status
+
+
+def _critic_mode() -> str:
+    import os
+    mode = os.environ.get("PIPELINE_CRITIC_MODE", "smart").strip().lower()
+    return mode if mode in ("smart", "always") else "smart"
+
+
+def _deferred_enabled() -> bool:
+    import os
+    return os.environ.get("PIPELINE_DEFERRED_CRITIC", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def run_deferred_critic(job: dict) -> tuple[str, str]:
+    """先发后审：回复已经发出后，在后台跑模型核查。返回 (修正后的回复, verify_status)。"""
+    cfg = job["cfg"]
+    budget = dict(job["budget"])
+    budget["reaudit_after_fix"] = False
+    return _run_critic_loop(
+        job["reply"], job["write_req"], job["user_text"], cfg, budget,
+        lambda *a, **k: None, job.setdefault("meta", {}),
+    )
+
+
 def run_search_pipeline(
     user_text: str,
     keywords: list[str],
@@ -117,6 +230,8 @@ def run_search_pipeline(
     focus_task: Optional[dict] = None,
     suggested_length: str = "",
     progress_cb=None,
+    query_variants: Optional[list[str]] = None,
+    allow_deferred_critic: bool = False,
 ) -> tuple[str, str, dict]:
     """
     执行完整搜索 pipeline，返回 (reply, verify_status, meta)。
@@ -153,7 +268,11 @@ def run_search_pipeline(
 
     # ── Step 0: QueryFixer（可选）────────────────────────────────────
     _prog("query_fixer", "start", "")
-    if cfg.query_fixer:
+    if query_variants:
+        # 消歧层已经顺带给出搜索查询，省掉一次 QueryFixer 调用
+        query_variants = list(query_variants)[:3]
+        log.info(f"🔧 QueryFixer 跳过，复用消歧查询: {query_variants}")
+    elif cfg.query_fixer:
         query_variants = fix_query(user_text, keywords)
         log.info(f"🔧 QueryFixer: {query_variants}")
     else:
@@ -273,7 +392,7 @@ def run_search_pipeline(
     reply = _enforce_short_length(reply, user_text, write_req.target_words)
     _prog("writer", "done", str(len(reply)))
 
-    # ── Step 4: Critic + Patcher 循环（可选）──────────────────────────
+    # ── Step 4: 核查（规则核查优先，模型核查兜底）─────────────────────
     verify_status = "skip"
     if cfg.critic:
         budget = _critic_budget(user_text, write_req, cfg)
@@ -282,86 +401,28 @@ def run_search_pipeline(
             budget["level"], budget["max_fix_cycles"],
             budget["reaudit_after_fix"], budget["allow_rewrite"],
         )
-        fix_cycles = 0
-        attempt = 0
-        while True:
-            _prog("critic", "start", str(attempt))
-            report = critique(reply, write_req.sources, user_text, attempt)
-
-            if report.verdict == "pass":
-                verify_status = "pass"
-                _prog("critic", "done", "pass")
-                log.info(f"✅ Critic 通过（attempt={attempt}）")
-                break
-
-            if report.verdict == "unknown":
-                verify_status = "unknown"
-                _prog("critic", "done", "unknown")
-                log.warning("⚠️ Critic 状态 unknown，保留 Writer 草稿并记录，不触发重写")
-                break
-
-            if fix_cycles >= budget["max_fix_cycles"]:
-                verify_status = f"limit_{report.verdict}"
-                _prog("critic", "done", verify_status)
-                log.warning(
-                    "⚠️ Critic 修正预算已用尽: level=%s verdict=%s fixes=%s",
-                    budget["level"], report.verdict, fix_cycles,
-                )
-                break
-
-            if report.verdict == "patch" and cfg.patcher:
-                # 小问题：Patcher 直接改
-                _prog("critic", "done", "patch")
-                _prog("patcher", "start", "")
-                reply = patch(reply, report, write_req.sources, user_text)
-                reply = _enforce_short_length(reply, user_text, write_req.target_words)
-                fix_cycles += 1
-                verify_status = f"patched_once" if fix_cycles == 1 else f"patched_{fix_cycles}"
-                _prog("patcher", "done", str(len(reply)))
-                if not budget["reaudit_after_fix"]:
-                    log.info("🧪 短回答已 patch 一次，跳过二次 Critic")
-                    break
-                attempt += 1
-                continue
-
-            if report.verdict == "rewrite":
-                if not budget["allow_rewrite"]:
-                    if cfg.patcher and report.issues:
-                        reply = patch(reply, report, write_req.sources, user_text)
-                        reply = _enforce_short_length(reply, user_text, write_req.target_words)
-                        fix_cycles += 1
-                        verify_status = "patched_instead_of_rewrite"
-                    else:
-                        verify_status = "rewrite_blocked_short"
-                    _prog("critic", "done", verify_status)
-                    log.info("🧪 短回答禁止整篇 rewrite，已走最小处理")
-                    break
-                # 大问题：Writer 重写
-                feedback = "\n".join(
-                    f"[{iss.severity}] {iss.sentence[:80]} | {iss.reason}"
-                    + (f" | 建议：{iss.suggested_fix}" if iss.suggested_fix else "")
-                    for iss in report.issues
-                )
-                write_req.reject_feedback = feedback
-                write_req.verifier_checks = [
-                    {"status": iss.severity, "sentence": iss.sentence,
-                     "reason": iss.reason, "suggested_fix": iss.suggested_fix,
-                     "evidence_excerpt": iss.evidence_excerpt}
-                    for iss in report.issues
-                ]
-                reply, reasoning = write(write_req)
-                meta["write_reasoning"] = reasoning or meta.get("write_reasoning", "")
-                reply = _enforce_short_length(reply, user_text, write_req.target_words)
-                fix_cycles += 1
-                verify_status = f"rewrite_once" if fix_cycles == 1 else f"rewrite_{fix_cycles}"
-                if not budget["reaudit_after_fix"]:
-                    break
-                attempt += 1
-                continue
-
-            verify_status = f"unhandled_{report.verdict}"
-            _prog("critic", "done", verify_status)
-            break
+        need_model = True
+        if _critic_mode() == "smart" and budget["level"] != "high_risk":
+            from tg_bot.agents.local_check import local_fact_check
+            _prog("critic", "start", "local")
+            local = local_fact_check(reply, write_req.sources)
+            meta["local_check"] = {"ok": local.ok, "issues": local.issues[:5], "summary": local.summary}
+            if local.ok:
+                need_model = False
+                verify_status = "local_pass"
+                _prog("critic", "done", "local_pass")
+                log.info(f"✅ {local.summary}，跳过模型核查")
+            elif allow_deferred_critic and _deferred_enabled():
+                need_model = False
+                verify_status = "deferred"
+                meta["deferred_critic"] = {
+                    "reply": reply, "write_req": write_req, "user_text": user_text,
+                    "cfg": cfg, "budget": budget,
+                }
+                _prog("critic", "done", "deferred")
+                log.info(f"⏩ 规则核查有疑点（{local.summary}），先发后审")
+        if need_model:
+            reply, verify_status = _run_critic_loop(reply, write_req, user_text, cfg, budget, _prog, meta)
 
     reply = _enforce_short_length(reply, user_text, write_req.target_words)
 
